@@ -45,7 +45,7 @@
 ALU_BOTH(DECL_RR) ALU_BOTH(DECL_RI) ALU_RR(DECL_RR) ALU_RI(DECL_RI)
 DECL(li) DECL(pcrel) DECL(fence) DECL(jalr) DECL(jalr_lookup) DECL(lookup)
 DECL(call) DECL(call_exit)
-DECL(lb) DECL(lbu) DECL(lh) DECL(lhu) DECL(lw) DECL(lwu) DECL(ld)
+DECL(lb) DECL(lbu) DECL(lh) DECL(lhu) DECL(lw) DECL(lwu) DECL(ld) DECL(flw)
 DECL(sb) DECL(sh) DECL(sw) DECL(sd)
 DECL(beq) DECL(bne) DECL(blt) DECL(bge) DECL(bltu) DECL(bgeu)
 
@@ -201,13 +201,111 @@ void aok_rv_helper_csr(CPURISCVState *env, uint64_t pc, uint64_t insn)
     env->pc = pc + 4;
 }
 
+/*
+ * F and D arithmetic, in C for now: what trans_rvf.c.inc and trans_rvd.c.inc
+ * generate, with the same softfloat helpers in the same order, for a TB
+ * whose mstatus.FS is already dirty. The translator has checked the
+ * encoding is one of these.
+ */
+static inline uint64_t aok_check_nanbox_s(uint64_t f)
+{
+    return f >= 0xffffffff00000000ull ? f : 0xffffffff7fc00000ull;
+}
+
+void aok_rv_helper_fp(CPURISCVState *env, uint64_t pc, uint64_t insn);
+void aok_rv_helper_fp(CPURISCVState *env, uint64_t pc, uint64_t insn)
+{
+    unsigned rd = (insn >> 7) & 31, rs1 = (insn >> 15) & 31;
+    unsigned rs2 = (insn >> 20) & 31, rs3 = insn >> 27;
+    unsigned rm = (insn >> 12) & 7, f7 = insn >> 25;
+    bool d = f7 & 1;
+    uint64_t *f = env->fpr;
+    uint64_t a = f[rs1], b = f[rs2], x = rs1 ? env->gpr[rs1] : 0, r;
+
+#define FD(name, ...) (d ? helper_##name##_d(env, __VA_ARGS__) \
+                         : helper_##name##_s(env, __VA_ARGS__))
+#define TO_GPR(v) do { if (rd) { env->gpr[rd] = (v); } } while (0)
+
+    aok_rv_sync(env, pc, insn);
+
+    switch (insn & 0x7f) {
+    case 0x43: helper_set_rounding_mode(env, rm); f[rd] = FD(fmadd, a, b, f[rs3]); return;
+    case 0x47: helper_set_rounding_mode(env, rm); f[rd] = FD(fmsub, a, b, f[rs3]); return;
+    case 0x4b: helper_set_rounding_mode(env, rm); f[rd] = FD(fnmsub, a, b, f[rs3]); return;
+    case 0x4f: helper_set_rounding_mode(env, rm); f[rd] = FD(fnmadd, a, b, f[rs3]); return;
+    }
+
+    switch (f7 >> 2) {
+    case 0x00: helper_set_rounding_mode(env, rm); f[rd] = FD(fadd, a, b); break;
+    case 0x01: helper_set_rounding_mode(env, rm); f[rd] = FD(fsub, a, b); break;
+    case 0x02: helper_set_rounding_mode(env, rm); f[rd] = FD(fmul, a, b); break;
+    case 0x03: helper_set_rounding_mode(env, rm); f[rd] = FD(fdiv, a, b); break;
+    case 0x0b: helper_set_rounding_mode(env, rm); f[rd] = FD(fsqrt, a); break;
+    case 0x04: { /* fsgnj, fsgnjn, fsgnjx: S keeps rs1's box, checked */
+        uint64_t sign = d ? 1ull << 63 : 1ull << 31;
+
+        if (!d) {
+            a = aok_check_nanbox_s(a);
+            b = aok_check_nanbox_s(b);
+        }
+        f[rd] = rm == 0 ? ((a & ~sign) | (b & sign)) :
+                rm == 1 ? ((a & ~sign) | (~b & sign)) : (a ^ (b & sign));
+        break;
+    }
+    case 0x05: f[rd] = rm == 0 ? FD(fmin, a, b) : FD(fmax, a, b); break;
+    case 0x08: /* fcvt.s.d, fcvt.d.s */
+        helper_set_rounding_mode(env, rm);
+        f[rd] = d ? helper_fcvt_d_s(env, a) : helper_fcvt_s_d(env, a);
+        break;
+    case 0x14:
+        r = rm == 0 ? FD(fle, a, b) : rm == 1 ? FD(flt, a, b) : FD(feq, a, b);
+        TO_GPR(r);
+        break;
+    case 0x18: /* float to integer */
+        helper_set_rounding_mode(env, rm);
+        r = rs2 == 0 ? FD(fcvt_w, a) : rs2 == 1 ? FD(fcvt_wu, a) :
+            rs2 == 2 ? FD(fcvt_l, a) : FD(fcvt_lu, a);
+        TO_GPR(r);
+        break;
+    case 0x1a: /* integer to float */
+        helper_set_rounding_mode(env, rm);
+        if (d) {
+            f[rd] = rs2 == 0 ? helper_fcvt_d_w(env, x) :
+                    rs2 == 1 ? helper_fcvt_d_wu(env, x) :
+                    rs2 == 2 ? helper_fcvt_d_l(env, x) :
+                               helper_fcvt_d_lu(env, x);
+        } else {
+            f[rd] = rs2 == 0 ? helper_fcvt_s_w(env, x) :
+                    rs2 == 1 ? helper_fcvt_s_wu(env, x) :
+                    rs2 == 2 ? helper_fcvt_s_l(env, x) :
+                               helper_fcvt_s_lu(env, x);
+        }
+        break;
+    case 0x1c:
+        if (rm == 0) { /* fmv.x.d, fmv.x.w */
+            TO_GPR(d ? a : (uint64_t)(int32_t)a);
+        } else { /* fclass */
+            r = d ? helper_fclass_d(a) : helper_fclass_s(env, a);
+            TO_GPR(r);
+        }
+        break;
+    case 0x1e: /* fmv.d.x, fmv.w.x */
+        f[rd] = d ? x : x | 0xffffffff00000000ull;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+#undef FD
+#undef TO_GPR
+}
+
 typedef struct Ctx {
     AokGen g;
     unsigned page_off;      /* of the TB's first insn in its page */
     unsigned off;           /* of the current insn from the TB's first */
     unsigned len;           /* of the current insn */
     uint32_t insn;
-    bool has_m, has_mul, has_a, has_zba, has_zbb, has_zbs, has_zicond;
+    bool has_m, has_mul, has_a, has_fd, has_zba, has_zbb, has_zbs, has_zicond;
     bool no_goto_ptr, no_csr;
 } Ctx;
 
@@ -272,10 +370,28 @@ static int addi(Ctx *c, unsigned rd, unsigned rs1, int64_t imm)
 }
 
 /* A load is done even into x0: it can fault, or read a device. */
-static int load(Ctx *c, Gadget gadget, unsigned rd, unsigned rs1, int64_t imm)
+static int load_to(Ctx *c, Gadget gadget, uint64_t reg_off, unsigned rs1,
+                   int64_t imm)
 {
     aok_emit_gadget(&c->g, gadget);
-    aok_emit(&c->g, rd_off(rd));
+    aok_emit(&c->g, reg_off);
+    aok_emit(&c->g, rs_off(rs1));
+    aok_emit(&c->g, imm);
+    aok_emit(&c->g, c->off);
+    aok_emit(&c->g, c->insn);
+    return NEXT;
+}
+
+static int load(Ctx *c, Gadget gadget, unsigned rd, unsigned rs1, int64_t imm)
+{
+    return load_to(c, gadget, rd_off(rd), rs1, imm);
+}
+
+static int store_from(Ctx *c, Gadget gadget, uint64_t reg_off, unsigned rs1,
+                      int64_t imm)
+{
+    aok_emit_gadget(&c->g, gadget);
+    aok_emit(&c->g, reg_off);
     aok_emit(&c->g, rs_off(rs1));
     aok_emit(&c->g, imm);
     aok_emit(&c->g, c->off);
@@ -286,13 +402,29 @@ static int load(Ctx *c, Gadget gadget, unsigned rd, unsigned rs1, int64_t imm)
 static int store(Ctx *c, Gadget gadget, unsigned rs2, unsigned rs1,
                  int64_t imm)
 {
-    aok_emit_gadget(&c->g, gadget);
-    aok_emit(&c->g, rs_off(rs2));
-    aok_emit(&c->g, rs_off(rs1));
-    aok_emit(&c->g, imm);
-    aok_emit(&c->g, c->off);
-    aok_emit(&c->g, c->insn);
-    return NEXT;
+    return store_from(c, gadget, rs_off(rs2), rs1, imm);
+}
+
+static inline uint64_t fpr_off(unsigned r)
+{
+    return offsetof(CPURISCVState, fpr[r]);
+}
+
+/* fld, fsd, flw, fsw: the integer loads and stores, on an FP register. */
+static int fp_load(Ctx *c, bool d, unsigned rd, unsigned rs1, int64_t imm)
+{
+    if (!c->has_fd) {
+        return UNKNOWN;
+    }
+    return load_to(c, d ? G(ld) : G(flw), fpr_off(rd), rs1, imm);
+}
+
+static int fp_store(Ctx *c, bool d, unsigned rs2, unsigned rs1, int64_t imm)
+{
+    if (!c->has_fd) {
+        return UNKNOWN;
+    }
+    return store_from(c, d ? G(sd) : G(sw), fpr_off(rs2), rs1, imm);
 }
 
 /*
@@ -383,6 +515,37 @@ static int atomic(Ctx *c, uint32_t insn)
         return call(c, G(call), aok_rv_helper_atomic);
     }
     return UNKNOWN;
+}
+
+/* OP-FP and the fused multiply-adds: exactly what aok_rv_helper_fp knows. */
+static int fp(Ctx *c, uint32_t insn)
+{
+    unsigned rs2 = (insn >> 20) & 31, rm = (insn >> 12) & 7, f7 = insn >> 25;
+    bool ok;
+
+    if (!c->has_fd) {
+        return UNKNOWN;
+    }
+    if ((insn & 0x7f) != 0x53) {
+        ok = ((insn >> 25) & 3) < 2;
+    } else {
+        switch (f7 >> 2) {
+        case 0x00: case 0x01: case 0x02: case 0x03:
+            ok = true;
+            break;
+        case 0x0b: ok = rs2 == 0; break;
+        case 0x04: ok = rm < 3; break;
+        case 0x05: ok = rm < 2; break;
+        case 0x08: ok = rs2 == (f7 == 0x20 ? 1 : 0); break;
+        case 0x14: ok = rm < 3; break;
+        case 0x18: case 0x1a: ok = rs2 < 4; break;
+        case 0x1c: ok = rs2 == 0 && rm < 2; break;
+        case 0x1e: ok = rs2 == 0 && rm == 0; break;
+        default: ok = false;
+        }
+        ok = ok && (f7 & 3) < 2;
+    }
+    return ok ? call(c, G(call), aok_rv_helper_fp) : UNKNOWN;
 }
 
 static int op_imm(Ctx *c, uint32_t insn)
@@ -654,6 +817,16 @@ static int insn32(Ctx *c, uint32_t insn)
         return op_32(c, insn);
     case 0x2f:
         return atomic(c, insn);
+    case 0x07: /* flw, fld */
+        return f3 == 2 || f3 == 3 ? fp_load(c, f3 == 3, rd, rs1,
+                                            sext(insn >> 20, 12)) : UNKNOWN;
+    case 0x27: /* fsw, fsd */
+        return f3 == 2 || f3 == 3 ? fp_store(c, f3 == 3, rs2, rs1,
+                                             sext(((insn >> 25) << 5) |
+                                                  ((insn >> 7) & 31), 12))
+                                  : UNKNOWN;
+    case 0x43: case 0x47: case 0x4b: case 0x4f: case 0x53:
+        return fp(c, insn);
     case 0x73:
         /* The CSR accesses; ecall, sret and the rest of f3 == 0 are TCG's. */
         if ((f3 & 3) == 0 || c->no_csr) {
@@ -698,6 +871,11 @@ static int insn16(Ctx *c, uint32_t insn)
             imm = (((insn >> 10) & 7) << 3) | (((insn >> 5) & 3) << 6);
             return f3 == 3 ? load(c, G(ld), rdp, rs1p, imm)
                            : store(c, G(sd), rdp, rs1p, imm);
+        case 1: /* c.fld */
+        case 5: /* c.fsd */
+            imm = (((insn >> 10) & 7) << 3) | (((insn >> 5) & 3) << 6);
+            return f3 == 1 ? fp_load(c, true, rdp, rs1p, imm)
+                           : fp_store(c, true, rdp, rs1p, imm);
         }
         return UNKNOWN;
     case 1:
@@ -764,6 +942,13 @@ static int insn16(Ctx *c, uint32_t insn)
             imm = (b12 << 5) | (((insn >> 5) & 3) << 3) |
                   (((insn >> 2) & 7) << 6);
             return rd ? load(c, G(ld), rd, 2, imm) : UNKNOWN;
+        case 1: /* c.fldsp */
+            imm = (b12 << 5) | (((insn >> 5) & 3) << 3) |
+                  (((insn >> 2) & 7) << 6);
+            return fp_load(c, true, rd, 2, imm);
+        case 5: /* c.fsdsp */
+            imm = (((insn >> 10) & 7) << 3) | (((insn >> 7) & 7) << 6);
+            return fp_store(c, true, rs2, 2, imm);
         case 4:
             if (!b12) {
                 if (rs2) { /* c.mv */
@@ -825,6 +1010,10 @@ int riscv_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     c.has_m = misa & RVM;
     c.has_mul = c.has_m || cfg->ext_zmmul;
     c.has_a = (misa & RVA) && !getenv("QEMU_AOK_NO_ATOMIC");
+    /* F and D as registers of their own, and already dirty in mstatus. */
+    c.has_fd = (misa & RVF) && (misa & RVD) && !cfg->ext_zfinx &&
+               FIELD_EX32(flags, TB_FLAGS, FS) == EXT_STATUS_DIRTY &&
+               !getenv("QEMU_AOK_NO_FP");
     c.no_csr = getenv("QEMU_AOK_NO_CSR");
     c.has_zba = cfg->ext_zba;
     c.has_zbb = cfg->ext_zbb;

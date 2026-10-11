@@ -476,6 +476,38 @@ rv_load lw,  0xfffffffffffff003, ldrsw x11
 rv_load lwu, 0xfffffffffffff003, ldr w11
 rv_load ld,  0xfffffffffffff007, ldr x11
 
+/*
+ * flw: the 32 bits go into the 64-bit register NaN-boxed, the upper half all
+ * ones. Stream as the loads above, the register offset an fpr's.
+ */
+.gadget rv_flw
+    ldp x9, x10, [_ip]
+    ldr x11, [_ip, #16]
+    ldr x10, [_cpu, x10]
+    ldp x12, x13, [_tlb]
+    add x7, x10, x11
+    eor x14, x7, x7, lsr #TLB_FOLD
+    and x12, x12, x14, lsr #TLB_SHIFT
+    add x13, x13, x12
+    ldr x14, [x13, #TLBE_READ]
+    ldr x15, [x13, #TLBE_ADDEND]
+    and x16, x7, #0xfffffffffffff003
+    cmp x14, x16
+    b.ne 1f
+    ldr w11, [x7, x15]
+    orr x11, x11, #0xffffffff00000000
+    str x11, [_cpu, x9]
+    gret 5
+1:  ldp x2, x3, [_ip, #24]
+    mov x0, _cpu
+    mov x1, x7
+    add x2, _pc, x2
+    bl SYM(aok_rv_helper_lwu)
+    ldr x9, [_ip]
+    orr x0, x0, #0xffffffff00000000
+    str x0, [_cpu, x9]
+    gret 5
+
 .macro rv_store name, tagmask, insn:vararg
 .gadget rv_\name
     ldp x9, x10, [_ip]          /* rs2 offset, rs1 offset */

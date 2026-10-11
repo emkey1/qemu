@@ -282,6 +282,7 @@ const TCGCPUOps riscv_tcg_ops = {
 #if defined(CONFIG_AOK_GADGETS) && !defined(CONFIG_USER_ONLY)
     .aok_translate_code = riscv_aok_translate_code,
     .aok_pc_offset = offsetof(CPURISCVState, pc),
+    .aok_fold_fpsr = riscv_aok_fold_fpsr,
 #endif
     .get_tb_cpu_state = riscv_get_tb_cpu_state,
     .synchronize_from_tb = riscv_cpu_synchronize_from_tb,

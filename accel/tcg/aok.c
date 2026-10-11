@@ -133,7 +133,9 @@ int aok_gen_finish(AokGen *g, unsigned guest_size)
 
     for (int n = 0; n < 2; n++) {
         if (tb->jmp_reset_offset[n] != TB_JMP_OFFSET_INVALID) {
-            tb->jmp_reset_offset[n] = (g->p - g->base) * sizeof(uint64_t);
+            /* What tb_reset_jump puts in the slot: see AOK_ENTER_BYTES. */
+            tb->jmp_reset_offset[n] = (g->p - g->base) * sizeof(uint64_t)
+                                      - AOK_ENTER_BYTES;
             aok_emit_gadget(g, aok_gadget_exit_tb);
             aok_emit(g, tb_rx | n);
         }
@@ -150,7 +152,7 @@ int aok_gen_finish(AokGen *g, unsigned guest_size)
             aok_emit_lookup_operands(g);
         }
         holder = g->rx + (g->p - g->base);
-        aok_emit(g, (uintptr_t)stub);
+        aok_emit(g, (uintptr_t)stub - AOK_ENTER_BYTES);
     }
     if (g->overflow) {
         return -1;

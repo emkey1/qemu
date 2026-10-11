@@ -476,12 +476,14 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
             .pc = (void *)env + cpu->cc->tcg_ops->aok_pc_offset,
             .tb_jmp_cache = cpu->tb_jmp_cache,
             .breakpoints = &cpu->breakpoints,
+            .host_fpsr = &cpu->aok_host_fpsr,
         };
 
         if (unlikely(aok_stats_enabled)) {
             aok_stats.enter_aok++;
         }
         ret = aok_tb_exec(env, tb_ptr, &aok);
+        aok_fold_fpsr(cpu);
     } else
 #endif
     {
@@ -489,6 +491,8 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
         if (unlikely(aok_stats_enabled)) {
             aok_stats.enter_tcg++;
         }
+        /* Flags from a stream that an exception left by longjmp. */
+        aok_fold_fpsr(cpu);
 #endif
         ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
     }

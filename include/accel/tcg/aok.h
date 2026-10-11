@@ -19,6 +19,8 @@
 
 #include "exec/translation-block.h"
 #include "exec/vaddr.h"
+#include "hw/core/cpu.h"
+#include "accel/tcg/cpu-ops.h"
 
 #ifdef CONFIG_AOK_GADGETS
 
@@ -34,8 +36,17 @@
  *   x23  &cpu->neg.tlb.f[mmu_idx], the softmmu fast table of this TB
  *   x24  cpu->tb_jmp_cache
  *   x25  &cpu->breakpoints: a lookup done in a gadget must see it empty
+ *   x26  for a front end's FP gadgets: whether they may run on the host
+ *   x27  whether the host FPSR holds the stream's FP flags (aok-asm.h)
  *   x0-x17  scratch (x18 is never touched: the platform register on Darwin)
  */
+
+/*
+ * A stream starts with the enter gadget and its two operands. A jump from
+ * another stream skips them (aok-entry.S), so the address it is given for a
+ * gadget anywhere else is this many bytes before that gadget.
+ */
+#define AOK_ENTER_BYTES (3 * sizeof(uint64_t))
 
 /* Whether aok_translate_code is consulted at all; QEMU_AOK=0 turns it off. */
 extern bool aok_enabled;
@@ -46,7 +57,25 @@ typedef struct AokCPU {
     uint64_t *pc;
     void *tb_jmp_cache;
     void *breakpoints;
+    /* &cpu->aok_host_fpsr: host FP flags a stream raised, not yet folded. */
+    uint32_t *host_fpsr;
 } AokCPU;
+
+/*
+ * Give the front end the host FP flags a stream left in cpu->aok_host_fpsr
+ * (TCGCPUOps.aok_fold_fpsr), so that its own FP status has them before
+ * anything reads it. The main loop does this around every TB; a front end's
+ * helpers do it when a stream calls them.
+ */
+static inline void aok_fold_fpsr(CPUState *cpu)
+{
+    if (unlikely(cpu->aok_host_fpsr)) {
+        uint32_t fpsr = cpu->aok_host_fpsr;
+
+        cpu->aok_host_fpsr = 0;
+        cpu->cc->tcg_ops->aok_fold_fpsr(cpu, fpsr);
+    }
+}
 
 /* Enter a stream. Returns what tcg_qemu_tb_exec returns: (TB | exit index). */
 uintptr_t aok_tb_exec(CPUArchState *env, const void *stream,

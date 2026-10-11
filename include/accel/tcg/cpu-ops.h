@@ -77,6 +77,12 @@ struct TCGCPUOps {
                               int *max_insns, vaddr pc, void *host_pc);
     /* Offset of the guest program counter from CPUArchState. */
     size_t aok_pc_offset;
+    /*
+     * @aok_fold_fpsr: Add the host FP exception flags in @fpsr (AArch64
+     * FPSR bits), raised by FP gadgets, to the guest's FP status. Needed
+     * only by a front end whose gadgets compute on the host's FP unit.
+     */
+    void (*aok_fold_fpsr)(CPUState *cpu, uint32_t fpsr);
 #endif
     void (*translate_code)(CPUState *cpu, TranslationBlock *tb,
                            int *max_insns, vaddr pc, void *host_pc);

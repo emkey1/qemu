@@ -20,6 +20,7 @@
 #include "accel/tcg/aok.h"
 #include "accel/tcg/cpu-ldst-common.h"
 #include "exec/helper-proto.h"
+#include "fpu/softfloat.h"
 #include "aok-riscv.h"
 
 #define G(name) aok_gadget_rv_##name
@@ -45,6 +46,13 @@
 ALU_BOTH(DECL_RR) ALU_BOTH(DECL_RI) ALU_RR(DECL_RR) ALU_RI(DECL_RI)
 DECL(li) DECL(pcrel) DECL(fence) DECL(jalr) DECL(jalr_lookup) DECL(lookup)
 DECL(call) DECL(call_exit)
+DECL(fadd_d) DECL(fsub_d) DECL(fmul_d) DECL(fdiv_d) DECL(fsqrt_d)
+DECL(fmadd_d) DECL(fmsub_d) DECL(fnmsub_d) DECL(fnmadd_d)
+DECL(feq_d) DECL(flt_d) DECL(fle_d)
+DECL(fcvt_w_d_rtz) DECL(fcvt_wu_d_rtz) DECL(fcvt_l_d_rtz) DECL(fcvt_lu_d_rtz)
+DECL(fcvt_w_d_dyn) DECL(fcvt_wu_d_dyn) DECL(fcvt_l_d_dyn) DECL(fcvt_lu_d_dyn)
+DECL(fcvt_d_w) DECL(fcvt_d_wu) DECL(fcvt_d_l) DECL(fcvt_d_lu)
+DECL(fsgnj_d) DECL(fsgnjn_d) DECL(fsgnjx_d)
 DECL(lb) DECL(lbu) DECL(lh) DECL(lhu) DECL(lw) DECL(lwu) DECL(ld) DECL(flw)
 DECL(sb) DECL(sh) DECL(sw) DECL(sd)
 DECL(beq) DECL(bne) DECL(blt) DECL(bge) DECL(bltu) DECL(bgeu)
@@ -65,6 +73,8 @@ QEMU_BUILD_BUG_ON(TARGET_PAGE_BITS != 12);
 
 static inline void aok_rv_sync(CPURISCVState *env, uint64_t pc, uint64_t insn)
 {
+    /* The flags of FP gadgets this stream ran, before anything reads them. */
+    aok_fold_fpsr(env_cpu(env));
     aok_no_retaddr();
     env->pc = pc;
     env->bins = insn;
@@ -299,6 +309,40 @@ void aok_rv_helper_fp(CPURISCVState *env, uint64_t pc, uint64_t insn)
 #undef TO_GPR
 }
 
+/*
+ * A stream is about to compute on the host's FP unit (gadgets.S). From here
+ * to the stream's next aok_fp_end the host's FPSR is the guest's flags.
+ * Returns whether the host rounds the way the guest's frm asks: QEMU leaves
+ * the host's FPCR as it found it, to nearest even and nothing else, and if
+ * something has not, the gadgets are told to use softfloat.
+ */
+uint64_t aok_rv_fp_begin(CPURISCVState *env);
+uint64_t aok_rv_fp_begin(CPURISCVState *env)
+{
+    uint64_t fpcr;
+
+    __asm__ volatile("mrs %0, fpcr\n\tmsr fpsr, xzr" : "=r"(fpcr));
+    /* RMode, FZ, DN, AHP, FZ16, and the trap enables. */
+    return env->frm == RISCV_FRM_RNE && !(fpcr & 0x07f89f00);
+}
+
+/* TCGCPUOps.aok_fold_fpsr: AArch64's cumulative flags to softfloat's. */
+void riscv_aok_fold_fpsr(CPUState *cs, uint32_t fpsr)
+{
+    CPURISCVState *env = cpu_env(cs);
+    int flags = 0;
+
+    flags |= fpsr & 0x01 ? float_flag_invalid : 0;      /* IOC */
+    flags |= fpsr & 0x02 ? float_flag_divbyzero : 0;    /* DZC */
+    flags |= fpsr & 0x04 ? float_flag_overflow : 0;     /* OFC */
+    flags |= fpsr & 0x10 ? float_flag_inexact : 0;      /* IXC */
+    /* Not UFC: see gadgets.S on underflow. */
+    if (flags) {
+        set_float_exception_flags(get_float_exception_flags(&env->fp_status)
+                                  | flags, &env->fp_status);
+    }
+}
+
 typedef struct Ctx {
     AokGen g;
     unsigned page_off;      /* of the TB's first insn in its page */
@@ -306,7 +350,7 @@ typedef struct Ctx {
     unsigned len;           /* of the current insn */
     uint32_t insn;
     bool has_m, has_mul, has_a, has_fd, has_zba, has_zbb, has_zbs, has_zicond;
-    bool no_goto_ptr, no_csr;
+    bool no_goto_ptr, no_csr, fp_native;
 } Ctx;
 
 /* What translating one insn came to. */
@@ -340,6 +384,16 @@ static int alu_rr(Ctx *c, Gadget gadget, unsigned rd, unsigned rs1,
         aok_emit(&c->g, rs_off(rs2));
     }
     return NEXT;
+}
+
+/* [gadget][a][b][c]: the ALU gadgets' stream, on any three operands. */
+static void alu_ri_off(Ctx *c, Gadget gadget, uint64_t rd, uint64_t rs1,
+                       uint64_t third)
+{
+    aok_emit_gadget(&c->g, gadget);
+    aok_emit(&c->g, rd);
+    aok_emit(&c->g, rs1);
+    aok_emit(&c->g, third);
 }
 
 static int alu_ri(Ctx *c, Gadget gadget, unsigned rd, unsigned rs1,
@@ -517,6 +571,98 @@ static int atomic(Ctx *c, uint32_t insn)
     return UNKNOWN;
 }
 
+/* A host-FP gadget's stream; @n register offsets, then the pc and insn. */
+static bool fp_emit(Ctx *c, Gadget gadget, int n, uint64_t o0, uint64_t o1,
+                    uint64_t o2, uint64_t o3)
+{
+    uint64_t o[4] = { o0, o1, o2, o3 };
+
+    aok_emit_gadget(&c->g, gadget);
+    for (int i = 0; i < n; i++) {
+        aok_emit(&c->g, o[i]);
+    }
+    aok_emit(&c->g, c->off);
+    aok_emit(&c->g, c->insn);
+    return true;
+}
+
+/*
+ * The double-precision insns that have a gadget on the host's FP unit, for
+ * the rounding modes it has one for. The rest of F and D is C's.
+ */
+static bool fp_native(Ctx *c, uint32_t insn)
+{
+    static const Gadget arith[4] = {
+        G(fadd_d), G(fsub_d), G(fmul_d), G(fdiv_d),
+    };
+    static const Gadget toint[2][4] = {
+        { G(fcvt_w_d_rtz), G(fcvt_wu_d_rtz), G(fcvt_l_d_rtz), G(fcvt_lu_d_rtz) },
+        { G(fcvt_w_d_dyn), G(fcvt_wu_d_dyn), G(fcvt_l_d_dyn), G(fcvt_lu_d_dyn) },
+    };
+    static const Gadget fromint[4] = {
+        G(fcvt_d_w), G(fcvt_d_wu), G(fcvt_d_l), G(fcvt_d_lu),
+    };
+    unsigned rd = (insn >> 7) & 31, rs1 = (insn >> 15) & 31;
+    unsigned rs2 = (insn >> 20) & 31, rs3 = insn >> 27;
+    unsigned rm = (insn >> 12) & 7, f7 = insn >> 25;
+    uint64_t fd = fpr_off(rd), fa = fpr_off(rs1), fb = fpr_off(rs2);
+    bool nearest = rm == 7 || rm == 0;  /* the gadgets test frm for both */
+
+    if ((insn & 0x7f) != 0x53) {
+        static const Gadget fma[4] = {
+            G(fmadd_d), G(fmsub_d), G(fnmsub_d), G(fnmadd_d),
+        };
+
+        if (((insn >> 25) & 3) != 1 || !nearest) {
+            return false;
+        }
+        return fp_emit(c, fma[((insn & 0x7f) - 0x43) >> 2], 4,
+                       fd, fa, fb, fpr_off(rs3));
+    }
+    if (!(f7 & 1)) {
+        return false;
+    }
+    switch (f7 >> 2) {
+    case 0x00: case 0x01: case 0x02: case 0x03:
+        return nearest && fp_emit(c, arith[f7 >> 2], 3, fd, fa, fb, 0);
+    case 0x0b:
+        return nearest && fp_emit(c, G(fsqrt_d), 3, fd, fa, fa, 0);
+    case 0x04:
+        if (rs1 == rs2) { /* fmv.d, fneg.d, fabs.d */
+            alu_ri_off(c, rm == 0 ? G(add_ri) : rm == 1 ? G(xor_ri) : G(and_ri),
+                       fd, fa, rm == 0 ? 0 : rm == 1 ? INT64_MIN : INT64_MAX);
+        } else {
+            alu_ri_off(c, rm == 0 ? G(fsgnj_d) : rm == 1 ? G(fsgnjn_d)
+                                                         : G(fsgnjx_d),
+                       fd, fa, fb);
+        }
+        return true;
+    case 0x14: /* fle, flt, feq */
+        return fp_emit(c, rm == 0 ? G(fle_d) : rm == 1 ? G(flt_d) : G(feq_d),
+                       3, rd_off(rd), fa, fb, 0);
+    case 0x18:
+        if (rm != 1 && rm != 7) {
+            return false;
+        }
+        return fp_emit(c, toint[rm == 7][rs2], 3, rd_off(rd), fa, fa, 0);
+    case 0x1a:
+        return rm == 7 &&
+               fp_emit(c, fromint[rs2], 3, fd, rs_off(rs1), rs_off(rs1), 0);
+    case 0x1c:
+        if (rm == 0) { /* fmv.x.d */
+            if (rd) {
+                alu_ri_off(c, G(add_ri), rd_off(rd), fa, 0);
+            }
+            return true;
+        }
+        return false;
+    case 0x1e: /* fmv.d.x */
+        alu_ri_off(c, G(add_ri), fd, rs_off(rs1), 0);
+        return true;
+    }
+    return false;
+}
+
 /* OP-FP and the fused multiply-adds: exactly what aok_rv_helper_fp knows. */
 static int fp(Ctx *c, uint32_t insn)
 {
@@ -545,7 +691,13 @@ static int fp(Ctx *c, uint32_t insn)
         }
         ok = ok && (f7 & 3) < 2;
     }
-    return ok ? call(c, G(call), aok_rv_helper_fp) : UNKNOWN;
+    if (!ok) {
+        return UNKNOWN;
+    }
+    if (c->fp_native && fp_native(c, insn)) {
+        return NEXT;
+    }
+    return call(c, G(call), aok_rv_helper_fp);
 }
 
 static int op_imm(Ctx *c, uint32_t insn)
@@ -1015,6 +1167,7 @@ int riscv_aok_translate_code(CPUState *cs, TranslationBlock *tb,
                FIELD_EX32(flags, TB_FLAGS, FS) == EXT_STATUS_DIRTY &&
                !getenv("QEMU_AOK_NO_FP");
     c.no_csr = getenv("QEMU_AOK_NO_CSR");
+    c.fp_native = !getenv("QEMU_AOK_NO_FPNATIVE");
     c.has_zba = cfg->ext_zba;
     c.has_zbb = cfg->ext_zbb;
     c.has_zbs = cfg->ext_zbs;

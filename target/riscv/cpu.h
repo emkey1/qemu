@@ -252,6 +252,14 @@ typedef struct PMUFixedCtrState {
 struct CPUArchState {
     uint64_t gpr[32];
     uint64_t gprh[32]; /* 64 top bits of the 128-bit registers */
+#ifdef CONFIG_AOK_GADGETS
+    /*
+     * x0 for a gadget stream (target/riscv/tcg/aok): where a source reads
+     * its zero and where a destination's value is thrown away.
+     */
+    uint64_t aok_zero;
+    uint64_t aok_sink;
+#endif
 
     /* vector coprocessor state. */
     uint64_t vreg[32 * RV_VLEN_MAX / 64] QEMU_ALIGNED(16);

@@ -18,6 +18,13 @@ riscv_ss.add(files(
   'zce_helper.c'))
 
 
+if get_option('aok_gadgets')
+  riscv_system_ss.add(files(
+    'aok/gadgets.S',
+    'aok/translate.c',
+  ))
+endif
+
 riscv_system_ss.add(files(
   'debug.c',
   'mips_csr.c',

@@ -2552,6 +2552,12 @@ if have_tcg
   config_host_data.set('CONFIG_TCG_THREADED_INTERPRETER',
                        tcg_arch.endswith('-tcti') or get_option('tcg_hybrid') == 'tcti')
   config_host_data.set('CONFIG_TCG_HYBRID', tcg_arch.endswith('-hybrid'))
+  if get_option('aok_gadgets')
+    if cpu != 'aarch64'
+      error('--enable-aok-gadgets needs an AArch64 host')
+    endif
+    config_host_data.set('CONFIG_AOK_GADGETS', 1)
+  endif
   # Both backends, the one to use chosen at startup: neither of the above.
   config_host_data.set('CONFIG_TCG_HYBRID_RUNTIME', get_option('tcg_hybrid') == 'runtime')
 endif

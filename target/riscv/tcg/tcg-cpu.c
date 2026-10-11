@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "exec/translation-block.h"
 #include "tcg-cpu.h"
+#include "aok/aok-riscv.h"
 #include "cpu.h"
 #include "exec/target_page.h"
 #include "internals.h"
@@ -278,6 +279,10 @@ const TCGCPUOps riscv_tcg_ops = {
 
     .initialize = riscv_translate_init,
     .translate_code = riscv_translate_code,
+#if defined(CONFIG_AOK_GADGETS) && !defined(CONFIG_USER_ONLY)
+    .aok_translate_code = riscv_aok_translate_code,
+    .aok_pc_offset = offsetof(CPURISCVState, pc),
+#endif
     .get_tb_cpu_state = riscv_get_tb_cpu_state,
     .synchronize_from_tb = riscv_cpu_synchronize_from_tb,
     .restore_state_to_opc = riscv_restore_state_to_opc,

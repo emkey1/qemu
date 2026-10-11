@@ -75,6 +75,7 @@ static inline TCGTBCPUState tb_cpu_state(CPUState *cpu)
 #if !defined(CONFIG_USER_ONLY)
 #include "accel/tcg/iommu.h"
 #endif
+#include "accel/tcg/aok.h"
 
 /* -icount align implementation. */
 
@@ -423,7 +424,8 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
     }
 
     tb = tb_lookup(cpu, s);
-    if (tb == NULL) {
+    if (tb == NULL || tb->aok) {
+        /* A gadget stream is not entered from TCG's code: see aok.h. */
         return tcg_code_gen_epilogue;
     }
 
@@ -466,6 +468,14 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     }
 
     qemu_thread_jit_execute();
+#ifdef CONFIG_AOK_GADGETS
+    if (itb->aok) {
+        CPUArchState *env = cpu_env(cpu);
+
+        ret = aok_tb_exec(env, tb_ptr, &cpu->neg.icount_decr.u32,
+                          (void *)env + cpu->cc->tcg_ops->aok_pc_offset);
+    } else
+#endif
     ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
     cpu->neg.can_do_io = true;
     qemu_plugin_disable_mem_helpers(cpu);
@@ -641,9 +651,44 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
     uintptr_t jmp_rx = (uintptr_t)tb->tc.ptr + offset;
     uintptr_t jmp_rw = jmp_rx - tcg_splitwx_diff;
 
+    if (tb->aok) {
+        /* An AOK stream's jump is this word, read by aok_gadget_goto. */
+        qatomic_set(&tb->jmp_target_addr[n], addr);
+        return;
+    }
     tb->jmp_target_addr[n] = addr;
     tb_target_set_jmp_target(c_tb, n, jmp_rx, jmp_rw);
 }
+
+#ifdef CONFIG_AOK_GADGETS
+/*
+ * helper_lookup_tb_ptr for a gadget stream: the stream to continue in, or
+ * NULL to return to the main loop. Only another stream will do.
+ */
+const void *aok_lookup_tb_ptr(CPUArchState *env)
+{
+    CPUState *cpu = env_cpu(env);
+    TranslationBlock *tb;
+
+    cpu->neg.can_do_io = true;
+
+    TCGTBCPUState s = tb_cpu_state(cpu);
+    s.cflags = curr_cflags(cpu);
+
+    if (check_for_breakpoints(cpu, s.pc, &s.cflags)) {
+        cpu_loop_exit(cpu);
+    }
+
+    tb = tb_lookup(cpu, s);
+    if (tb == NULL || !tb->aok) {
+        return NULL;
+    }
+    if (qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
+        log_cpu_exec(s.pc, cpu, tb);
+    }
+    return tb->tc.ptr;
+}
+#endif
 
 static inline void tb_add_jump(TranslationBlock *tb, int n,
                                TranslationBlock *tb_next)
@@ -1018,8 +1063,11 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 last_tb = NULL;
             }
 #endif
-            /* See if we can patch the calling TB. */
-            if (last_tb) {
+            /*
+             * See if we can patch the calling TB. A TCG TB and an AOK
+             * gadget stream cannot jump into each other.
+             */
+            if (last_tb && last_tb->aok == tb->aok) {
                 tb_add_jump(last_tb, tb_exit, tb);
             }
 

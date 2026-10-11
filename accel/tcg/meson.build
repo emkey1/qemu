@@ -25,6 +25,10 @@ system_ss.add_all(tcg_ss)
 # tb_cpu_state() in cpu-exec.c.
 specific_ss.add(files('cpu-exec.c'))
 
+if get_option('aok_gadgets')
+  system_ss.add(files('aok.c', 'aok-entry.S'))
+endif
+
 user_ss.add(files(
   'user-exec.c',
   'user-exec-stub.c',

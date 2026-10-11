@@ -12,6 +12,7 @@
 #include "accel/tcg/aok.h"
 
 bool aok_enabled = true;
+bool aok_stats_enabled;
 AokStats aok_stats;
 
 static void aok_print_stats(void)
@@ -23,6 +24,18 @@ static void aok_print_stats(void)
             "%" PRIu64 " because of their first insn\n",
             aok_stats.tb_aok, tbs, tbs ? 100.0 * aok_stats.tb_aok / tbs : 0.0,
             aok_stats.insns_aok, aok_stats.tb_tcg, aok_stats.declined_first);
+    fprintf(stderr, "aok: main loop entered streams %" PRIu64 " times and "
+            "TCG's code %" PRIu64 " times; lookups in C found a stream %"
+            PRIu64 ", TCG's TB %" PRIu64 ", nothing %" PRIu64 "\n",
+            aok_stats.enter_aok, aok_stats.enter_tcg, aok_stats.lookup_aok,
+            aok_stats.lookup_tcg, aok_stats.lookup_none);
+    fprintf(stderr, "aok: first insns left to TCG, by major opcode:");
+    for (int i = 0; i < 128; i++) {
+        if (aok_stats.declined_op[i]) {
+            fprintf(stderr, " %#x:%" PRIu64, i, aok_stats.declined_op[i]);
+        }
+    }
+    fprintf(stderr, " compressed:%" PRIu64 "\n", aok_stats.declined_c);
 }
 
 static void __attribute__((constructor)) aok_init(void)
@@ -33,6 +46,7 @@ static void __attribute__((constructor)) aok_init(void)
         aok_enabled = false;
     }
     if (getenv("QEMU_AOK_STATS")) {
+        aok_stats_enabled = true;
         atexit(aok_print_stats);
     }
 }
@@ -132,7 +146,8 @@ int aok_gen_finish(AokGen *g, unsigned guest_size)
             aok_emit_gadget(g, aok_gadget_exit_tb);
             aok_emit(g, 0);
         } else {
-            aok_emit_gadget(g, aok_gadget_lookup);
+            aok_emit_gadget(g, g->lookup ? g->lookup : aok_gadget_lookup);
+            aok_emit_lookup_operands(g);
         }
         holder = g->rx + (g->p - g->base);
         aok_emit(g, (uintptr_t)stub);

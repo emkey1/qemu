@@ -387,6 +387,32 @@ rv_ri ror, ror x10, x10, x11
     str x10, [_cpu, x9]
     gret 2
 
+/*
+ * [function][pc delta][insn] -- an insn done in C: function(env, pc, insn).
+ * It finds its operands in the insn and env, and may raise an exception.
+ */
+.gadget rv_call
+    ldp x9, x1, [_ip]
+    ldr x2, [_ip, #16]
+    mov x0, _cpu
+    add x1, _pc, x1
+    blr x9
+    gret 3
+
+/*
+ * The same, for an insn after which the TB must end in the main loop (a CSR
+ * access: interrupts may now be enabled, the TB flags different). The
+ * function has set env->pc.
+ */
+.gadget rv_call_exit
+    ldp x9, x1, [_ip]
+    ldr x2, [_ip, #16]
+    mov x0, _cpu
+    add x1, _pc, x1
+    blr x9
+    mov x0, #0
+    b SYM(aok_exit)
+
 /* fence: a full barrier, as TCG's tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC) */
 .gadget rv_fence
     dmb ish
@@ -511,9 +537,9 @@ rv_branch geu, hs
 /*
  * jalr: [rd offset][rs1 offset][imm][link delta]. The target is computed
  * from rs1 before the link is written, since rd may be rs1. Leaves env->pc
- * set; the stream goes on to find the TB there.
+ * set, and the target in x10.
  */
-.gadget rv_jalr
+.macro rv_jalr_body
     ldp x9, x10, [_ip]
     ldp x11, x12, [_ip, #16]
     ldr x10, [_cpu, x10]
@@ -522,4 +548,57 @@ rv_branch geu, hs
     bic x10, x10, #1
     str x12, [_cpu, x9]
     str x10, [_pcp]
+.endm
+
+/* For a TB that may not look its successor up: the stream exits next. */
+.gadget rv_jalr
+    rv_jalr_body
     gret 4
+
+/* [rd offset][rs1 offset][imm][link delta][flags | cflags << 32][cs_base] */
+.gadget rv_jalr_lookup
+    rv_jalr_body
+    add _ip, _ip, #32
+    b 0f
+
+/*
+ * [flags | cflags << 32][cs_base] -- aok_gadget_lookup with tb_lookup()'s
+ * first step done here: the TB for env->pc is usually in cpu->tb_jmp_cache,
+ * in the entry tb_jmp_cache_hash_func(pc) names or in its partner. It is the
+ * next TB if it is for this pc, has this TB's cs_base, flags and cflags
+ * (which nothing a stream executes can have changed, and which an
+ * invalidated TB no longer has), and is a stream. Anything else, and any
+ * breakpoint at all, is aok_lookup_tb_ptr's to sort out.
+ *
+ * The constants are tb-hash.h's for a 4 KiB page and a 2^14-entry cache;
+ * cpu-exec.c holds the build-time checks of the layout.
+ */
+.gadget rv_lookup
+    ldr x10, [_pcp]
+0:  ldr x11, [_bps]
+    eor x12, x10, x10, lsr #5
+    cbnz x11, 3f
+    lsr x13, x12, #5
+    and x12, x12, #0x7f
+    and x13, x13, #0x3f80
+    orr x12, x12, x13               /* the hash */
+    add x13, _jc, x12, lsl #4
+    ldp x14, x15, [x13, #16]        /* tb, pc */
+    cmp x15, x10
+    b.ne 2f
+1:  cbz x14, 3f
+    ldp x15, x16, [x14, #8]         /* cs_base, flags | cflags << 32 */
+    ldp x11, x12, [_ip]
+    ldrb w17, [x14, #28]            /* aok */
+    cmp x16, x11
+    ccmp x15, x12, #0, eq
+    b.ne 3f
+    cbz w17, 3f
+    ldr _ip, [x14, #32]             /* tc.ptr */
+    gret
+2:  eor x12, x12, #1                /* the other way */
+    add x13, _jc, x12, lsl #4
+    ldp x14, x15, [x13, #16]
+    cmp x15, x10
+    b.eq 1b
+3:  b SYM(aok_lookup_slow)

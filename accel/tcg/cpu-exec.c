@@ -471,12 +471,27 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
 #ifdef CONFIG_AOK_GADGETS
     if (itb->aok) {
         CPUArchState *env = cpu_env(cpu);
+        const AokCPU aok = {
+            .exit_request = &cpu->neg.icount_decr.u32,
+            .pc = (void *)env + cpu->cc->tcg_ops->aok_pc_offset,
+            .tb_jmp_cache = cpu->tb_jmp_cache,
+            .breakpoints = &cpu->breakpoints,
+        };
 
-        ret = aok_tb_exec(env, tb_ptr, &cpu->neg.icount_decr.u32,
-                          (void *)env + cpu->cc->tcg_ops->aok_pc_offset);
+        if (unlikely(aok_stats_enabled)) {
+            aok_stats.enter_aok++;
+        }
+        ret = aok_tb_exec(env, tb_ptr, &aok);
     } else
 #endif
-    ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
+    {
+#ifdef CONFIG_AOK_GADGETS
+        if (unlikely(aok_stats_enabled)) {
+            aok_stats.enter_tcg++;
+        }
+#endif
+        ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
+    }
     cpu->neg.can_do_io = true;
     qemu_plugin_disable_mem_helpers(cpu);
     /*
@@ -662,6 +677,25 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
 
 #ifdef CONFIG_AOK_GADGETS
 /*
+ * A front end's lookup gadget does tb_lookup()'s first step itself: it
+ * hashes the pc as tb_jmp_cache_hash_func does, reads both ways of
+ * cpu->tb_jmp_cache, and compares the TB's cs_base, flags and cflags with
+ * its own TB's. It is written against this layout.
+ */
+QEMU_BUILD_BUG_ON(TB_JMP_CACHE_BITS != 14);
+QEMU_BUILD_BUG_ON(offsetof(CPUJumpCache, array) != 16);
+QEMU_BUILD_BUG_ON(sizeof(((CPUJumpCache *)0)->array[0]) != 16);
+QEMU_BUILD_BUG_ON(offsetof(CPUJumpCache, array[0].tb) != 16);
+QEMU_BUILD_BUG_ON(offsetof(CPUJumpCache, array[0].pc) != 24);
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, cs_base) != 8);
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, flags) != 16);
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, cflags) != 20);
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, aok) != 28);
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, tc.ptr) != 32);
+QEMU_BUILD_BUG_ON(offsetof(CPUState, breakpoints.tqh_first)
+                  != offsetof(CPUState, breakpoints));
+
+/*
  * helper_lookup_tb_ptr for a gadget stream: the stream to continue in, or
  * NULL to return to the main loop. Only another stream will do.
  */
@@ -680,6 +714,10 @@ const void *aok_lookup_tb_ptr(CPUArchState *env)
     }
 
     tb = tb_lookup(cpu, s);
+    if (unlikely(aok_stats_enabled)) {
+        *(tb == NULL ? &aok_stats.lookup_none :
+          tb->aok ? &aok_stats.lookup_aok : &aok_stats.lookup_tcg) += 1;
+    }
     if (tb == NULL || !tb->aok) {
         return NULL;
     }

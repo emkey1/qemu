@@ -19,6 +19,8 @@ _cpu     .req x20
 _exitreq .req x21
 _pcp     .req x22
 _tlb     .req x23
+_jc      .req x24
+_bps     .req x25
 _ip      .req x28
 
 /*

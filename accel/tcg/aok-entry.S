@@ -11,7 +11,7 @@
 
 /*
  * uintptr_t aok_tb_exec(CPUArchState *env, const void *stream,
- *                       uint32_t *exit_request, uint64_t *pc);
+ *                       const AokCPU *cpu);
  */
     .balign 16
     .globl SYM(aok_tb_exec)
@@ -25,8 +25,8 @@ SYM(aok_tb_exec):
     stp x27, x28, [sp, #80]
     mov _cpu, x0
     mov _ip, x1
-    mov _exitreq, x2
-    mov _pcp, x3
+    ldp _exitreq, _pcp, [x2]
+    ldp _jc, _bps, [x2, #16]
     gret
 
 /* Leave the stream: x0 is aok_tb_exec's return value. */
@@ -79,14 +79,15 @@ SYM(aok_goto_tail):
     gret
 
 /*
- * env->pc is set and the next TB is not known at translation time: an
- * indirect jump, or a direct one that may not be linked. Continue in that TB
- * if it exists and is one of ours, else return to the main loop, which will
- * find or make it.
+ * [flags | cflags << 32][cs_base] -- env->pc is set and the next TB is not
+ * known at translation time: an indirect jump, or a direct one that may not
+ * be linked. Continue in that TB if it exists and is one of ours, else return
+ * to the main loop, which will find or make it. The operands are for a front
+ * end's own lookup gadget, which falls back to aok_lookup_slow.
  */
 .gadget lookup
-    .globl SYM(aok_lookup_tail)
-SYM(aok_lookup_tail):
+    .globl SYM(aok_lookup_slow)
+SYM(aok_lookup_slow):
     mov x0, _cpu
     bl SYM(aok_lookup_tb_ptr)
     cbz x0, 1f

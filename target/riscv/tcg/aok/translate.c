@@ -19,6 +19,7 @@
 #include "exec/translation-block.h"
 #include "accel/tcg/aok.h"
 #include "accel/tcg/cpu-ldst-common.h"
+#include "exec/helper-proto.h"
 #include "aok-riscv.h"
 
 #define G(name) aok_gadget_rv_##name
@@ -42,12 +43,16 @@
 #define DECL_RR(n) DECL(n##_rr)
 #define DECL_RI(n) DECL(n##_ri)
 ALU_BOTH(DECL_RR) ALU_BOTH(DECL_RI) ALU_RR(DECL_RR) ALU_RI(DECL_RI)
-DECL(li) DECL(pcrel) DECL(fence) DECL(jalr)
+DECL(li) DECL(pcrel) DECL(fence) DECL(jalr) DECL(jalr_lookup) DECL(lookup)
+DECL(call) DECL(call_exit)
 DECL(lb) DECL(lbu) DECL(lh) DECL(lhu) DECL(lw) DECL(lwu) DECL(ld)
 DECL(sb) DECL(sh) DECL(sw) DECL(sd)
 DECL(beq) DECL(bne) DECL(blt) DECL(bge) DECL(bltu) DECL(bgeu)
 
 typedef void (*Gadget)(void);
+
+/* gadgets.S: the tag masks of the loads and stores, and rv_lookup's hash. */
+QEMU_BUILD_BUG_ON(TARGET_PAGE_BITS != 12);
 
 /*
  * The softmmu slow paths of the load and store gadgets. Called with the
@@ -60,6 +65,7 @@ typedef void (*Gadget)(void);
 
 static inline void aok_rv_sync(CPURISCVState *env, uint64_t pc, uint64_t insn)
 {
+    aok_no_retaddr();
     env->pc = pc;
     env->bins = insn;
     env->excp_uw2 = 0;
@@ -96,14 +102,113 @@ STORE_HELPER(sh, cpu_stw_mmu, MO_LEUW)
 STORE_HELPER(sw, cpu_stl_mmu, MO_LEUL)
 STORE_HELPER(sd, cpu_stq_mmu, MO_LEUQ)
 
+/*
+ * The A extension, in C for now: one call does the whole insn. These are
+ * what trans_rva.c.inc generates, on cputlb's atomic helpers, which are
+ * atomic whether or not the TB is CF_PARALLEL.
+ */
+void aok_rv_helper_atomic(CPURISCVState *env, uint64_t pc, uint64_t insn);
+void aok_rv_helper_atomic(CPURISCVState *env, uint64_t pc, uint64_t insn)
+{
+    unsigned rd = (insn >> 7) & 31, rs1 = (insn >> 15) & 31;
+    unsigned rs2 = (insn >> 20) & 31;
+    bool d = ((insn >> 12) & 7) == 3;
+    uint64_t addr = rs1 ? env->gpr[rs1] : 0;
+    uint64_t src = rs2 ? env->gpr[rs2] : 0;
+    MemOpIdx oi = OI(env, (d ? MO_LEUQ : MO_LEUL) | MO_ALIGN);
+    uint64_t old;
+
+    aok_rv_sync(env, pc, insn);
+
+#define AMO(op)                                                             \
+    old = d ? cpu_atomic_##op##q_le_mmu(env, addr, src, oi, 0)              \
+            : (uint64_t)(int32_t)cpu_atomic_##op##l_le_mmu(env, addr, src, oi, 0)
+
+    switch (insn >> 27) {
+    case 0x02: /* lr */
+        smp_mb();
+        old = d ? cpu_ldq_mmu(env, addr, oi, 0)
+                : (uint64_t)(int32_t)cpu_ldl_mmu(env, addr, oi, 0);
+        smp_mb();
+        env->load_val = old;
+        env->load_res = addr;
+        break;
+    case 0x03: /* sc */
+        if (env->load_res == addr) {
+            old = d ? cpu_atomic_cmpxchgq_le_mmu(env, addr, env->load_val,
+                                                 src, oi, 0)
+                    : (uint64_t)(int32_t)cpu_atomic_cmpxchgl_le_mmu(
+                          env, addr, env->load_val, src, oi, 0);
+            old = old != env->load_val;
+        } else {
+            smp_mb();
+            old = 1;
+        }
+        env->load_res = -1;
+        break;
+    case 0x01: AMO(xchg); break;
+    case 0x00: AMO(fetch_add); break;
+    case 0x04: AMO(fetch_xor); break;
+    case 0x0c: AMO(fetch_and); break;
+    case 0x08: AMO(fetch_or); break;
+    case 0x10: AMO(fetch_smin); break;
+    case 0x14: AMO(fetch_smax); break;
+    case 0x18: AMO(fetch_umin); break;
+    case 0x1c: AMO(fetch_umax); break;
+    default:
+        g_assert_not_reached();
+    }
+#undef AMO
+    if (rd) {
+        env->gpr[rd] = old;
+    }
+}
+
+/*
+ * Zicsr, as trans_csr* in trans_rvi.c.inc: the same helpers with the same
+ * arguments. The TB ends after it, in the main loop.
+ */
+void aok_rv_helper_csr(CPURISCVState *env, uint64_t pc, uint64_t insn);
+void aok_rv_helper_csr(CPURISCVState *env, uint64_t pc, uint64_t insn)
+{
+    unsigned rd = (insn >> 7) & 31, rs1 = (insn >> 15) & 31;
+    unsigned f3 = (insn >> 12) & 7;
+    int csr = insn >> 20;
+    uint64_t src = (f3 & 4) ? rs1 : rs1 ? env->gpr[rs1] : 0;
+    uint64_t val = 0;
+
+    aok_rv_sync(env, pc, insn);
+    switch (f3 & 3) {
+    case 1: /* csrrw, csrrwi: with rd == x0 the csr is not read */
+        if (rd == 0) {
+            helper_csrw(env, csr, src);
+        } else {
+            val = helper_csrrw(env, csr, src, -1);
+        }
+        break;
+    case 2: /* csrrs, csrrsi: with rs1 == x0 (or a zero imm) it is not written */
+        val = rs1 ? helper_csrrw(env, csr, -1, src) : helper_csrr(env, csr);
+        break;
+    case 3: /* csrrc, csrrci */
+        val = rs1 ? helper_csrrw(env, csr, 0, src) : helper_csrr(env, csr);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    if (rd) {
+        env->gpr[rd] = val;
+    }
+    env->pc = pc + 4;
+}
+
 typedef struct Ctx {
     AokGen g;
     unsigned page_off;      /* of the TB's first insn in its page */
     unsigned off;           /* of the current insn from the TB's first */
     unsigned len;           /* of the current insn */
     uint32_t insn;
-    bool has_m, has_mul, has_zba, has_zbb, has_zbs, has_zicond;
-    bool no_goto_ptr;
+    bool has_m, has_mul, has_a, has_zba, has_zbb, has_zbs, has_zicond;
+    bool no_goto_ptr, no_csr;
 } Ctx;
 
 /* What translating one insn came to. */
@@ -237,7 +342,7 @@ static int jal(Ctx *c, unsigned rd, int64_t imm)
 
 static int jalr(Ctx *c, unsigned rd, unsigned rs1, int64_t imm)
 {
-    aok_emit_gadget(&c->g, G(jalr));
+    aok_emit_gadget(&c->g, c->no_goto_ptr ? G(jalr) : G(jalr_lookup));
     aok_emit(&c->g, rd_off(rd));
     aok_emit(&c->g, rs_off(rs1));
     aok_emit(&c->g, imm);
@@ -246,9 +351,38 @@ static int jalr(Ctx *c, unsigned rd, unsigned rs1, int64_t imm)
         aok_emit_gadget(&c->g, aok_gadget_exit_tb);
         aok_emit(&c->g, 0);
     } else {
-        aok_emit_gadget(&c->g, aok_gadget_lookup);
+        aok_emit_lookup_operands(&c->g);
     }
     return END;
+}
+
+static int call(Ctx *c, Gadget gadget, void *fn)
+{
+    aok_emit_gadget(&c->g, gadget);
+    aok_emit(&c->g, (uintptr_t)fn);
+    aok_emit(&c->g, c->off);
+    aok_emit(&c->g, c->insn);
+    return gadget == G(call) ? NEXT : END;
+}
+
+static int atomic(Ctx *c, uint32_t insn)
+{
+    unsigned f3 = (insn >> 12) & 7, rs2 = (insn >> 20) & 31;
+
+    if (!c->has_a || (f3 != 2 && f3 != 3)) {
+        return UNKNOWN;
+    }
+    switch (insn >> 27) {
+    case 0x02:
+        if (rs2) {
+            return UNKNOWN;
+        }
+        /* fall through */
+    case 0x03: case 0x01: case 0x00: case 0x04: case 0x0c: case 0x08:
+    case 0x10: case 0x14: case 0x18: case 0x1c:
+        return call(c, G(call), aok_rv_helper_atomic);
+    }
+    return UNKNOWN;
 }
 
 static int op_imm(Ctx *c, uint32_t insn)
@@ -518,6 +652,14 @@ static int insn32(Ctx *c, uint32_t insn)
         return op(c, insn);
     case 0x3b:
         return op_32(c, insn);
+    case 0x2f:
+        return atomic(c, insn);
+    case 0x73:
+        /* The CSR accesses; ecall, sret and the rest of f3 == 0 are TCG's. */
+        if ((f3 & 3) == 0 || c->no_csr) {
+            return UNKNOWN;
+        }
+        return call(c, G(call_exit), aok_rv_helper_csr);
     case 0x0f:
         if (f3 == 0) { /* fence; fence.i is TCG's */
             aok_emit_gadget(&c->g, G(fence));
@@ -653,7 +795,7 @@ int riscv_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     uint32_t flags = tb->flags, cflags = tb_cflags(tb);
     uint32_t misa = FIELD_EX64(tb->cs_base, EXT_TB_FLAGS, MISA_EXT);
     const uint8_t *code = host_pc;
-    Ctx c;
+    Ctx c = { .len = 4 };
     int r = NEXT;
 
     /*
@@ -682,12 +824,15 @@ int riscv_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     c.off = 0;
     c.has_m = misa & RVM;
     c.has_mul = c.has_m || cfg->ext_zmmul;
+    c.has_a = (misa & RVA) && !getenv("QEMU_AOK_NO_ATOMIC");
+    c.no_csr = getenv("QEMU_AOK_NO_CSR");
     c.has_zba = cfg->ext_zba;
     c.has_zbb = cfg->ext_zbb;
     c.has_zbs = cfg->ext_zbs;
     c.has_zicond = cfg->ext_zicond;
     c.no_goto_ptr = cflags & CF_NO_GOTO_PTR;
     aok_gen_begin(&c.g, cs, tb, *max_insns, FIELD_EX32(flags, TB_FLAGS, MEM_IDX));
+    c.g.lookup = G(lookup);
 
     /* A TB stays in its page: an insn that would straddle the end is TCG's. */
     while (aok_gen_room(&c.g, 12)) {
@@ -720,6 +865,11 @@ int riscv_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     }
     if (c.g.n_insns == 0) {
         aok_stats.declined_first++;
+        if (c.len == 4) {
+            aok_stats.declined_op[c.insn & 0x7f]++;
+        } else {
+            aok_stats.declined_c++;
+        }
         return 0;
     }
     if (r != END) {

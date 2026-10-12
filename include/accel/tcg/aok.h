@@ -122,7 +122,41 @@ typedef struct AokGen {
     /* aok_slot_unlinked operands, filled in by aok_gen_finish. */
     int n_fix;
     struct { uint64_t *word; } fix[8];
+    /* aok_gen_pair: where the last step that was not fused began. */
+    uint64_t *pair_prev;
 } AokGen;
+
+/*
+ * Fused pairs. Two gadgets that follow one another can be one gadget that
+ * does both and dispatches once: iSH-AOK's scheme (its jit/gen.c,
+ * jit_pair_fuse, and jit/guest-arm64/frag.h for the reasoning), and for the
+ * gadgets a front end shares with iSH-AOK also its list of pairs. The fused
+ * gadget takes the first gadget's place in the stream and the second's word
+ * goes: [fused][first's operands][second's operands].
+ *
+ * Where the second takes as an operand the register the first has just
+ * written, a variant of the pair hands the value over in a host register
+ * (fused_fw[k], for the second's k-th forwardable operand): op[k] says which
+ * of the second's operand words names that register.
+ */
+enum { AOK_PAIR_OP_NONE, AOK_PAIR_OP_SLOT };
+typedef struct AokPair {
+    void (*a)(void), (*b)(void), (*fused)(void);
+    void (*fused_fw[2])(void);
+    unsigned a_words;           /* the first gadget and its operands */
+    struct { uint8_t index, kind; } op[2];
+} AokPair;
+#define AOK_PAIR_HASH 4096
+typedef struct AokPairSet {
+    const AokPair *pairs;
+    unsigned n;
+    bool forward;
+    uint16_t hash[AOK_PAIR_HASH];   /* index + 1; 0 is empty */
+} AokPairSet;
+
+void aok_pair_set_init(AokPairSet *set);
+/* After each step of a translator: FROM is where the step put its first word. */
+void aok_gen_pair(AokGen *g, uint64_t *from, const AokPairSet *set);
 
 void aok_gen_begin(AokGen *g, CPUState *cpu, TranslationBlock *tb,
                    int max_insns, int mmu_idx);
@@ -190,6 +224,8 @@ typedef struct AokStats {
     uint64_t lookup_aok, lookup_tcg, lookup_none;
     /* TBs left to TCG, by the major opcode of their first insn. */
     uint64_t declined_op[128], declined_c;
+    /* Pairs fused, and how many of them forward a register. */
+    uint64_t pairs, pairs_fw;
 } AokStats;
 extern AokStats aok_stats;
 extern bool aok_stats_enabled;

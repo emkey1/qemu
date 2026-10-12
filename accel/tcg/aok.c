@@ -36,6 +36,9 @@ static void aok_print_stats(void)
         }
     }
     fprintf(stderr, " compressed:%" PRIu64 "\n", aok_stats.declined_c);
+    fprintf(stderr, "aok: %" PRIu64 " pairs fused, %" PRIu64
+            " of them forwarding a register\n",
+            aok_stats.pairs, aok_stats.pairs_fw);
 }
 
 static void __attribute__((constructor)) aok_init(void)
@@ -84,6 +87,80 @@ void aok_gen_begin(AokGen *g, CPUState *cpu, TranslationBlock *tb,
     aok_emit_gadget(g, aok_gadget_enter);
     aok_emit(g, (uintptr_t)tcg_splitwx_to_rx(tb));
     aok_emit(g, tlb_ofs);
+}
+
+static unsigned aok_pair_slot(uintptr_t a, uintptr_t b)
+{
+    uint64_t h = (uint64_t)a * 0x9e3779b97f4a7c15ull ^
+                 (uint64_t)b * 0xc2b2ae3d27d4eb4full;
+
+    return (h >> 40) & (AOK_PAIR_HASH - 1);
+}
+
+void aok_pair_set_init(AokPairSet *set)
+{
+    assert(set->n * 3 < AOK_PAIR_HASH);
+    for (unsigned i = 0; i < set->n; i++) {
+        unsigned slot = aok_pair_slot((uintptr_t)set->pairs[i].a,
+                                      (uintptr_t)set->pairs[i].b);
+
+        while (set->hash[slot]) {
+            slot = (slot + 1) & (AOK_PAIR_HASH - 1);
+        }
+        set->hash[slot] = i + 1;
+    }
+}
+
+void aok_gen_pair(AokGen *g, uint64_t *from, const AokPairSet *set)
+{
+    uint64_t *prev = g->pair_prev;
+    unsigned slot;
+
+    g->pair_prev = NULL;
+    if (g->p == from || g->overflow) {
+        return;
+    }
+    if (!prev) {
+        g->pair_prev = from;
+        return;
+    }
+    slot = aok_pair_slot(prev[0], from[0]);
+    for (unsigned i; (i = set->hash[slot]); slot = (slot + 1) & (AOK_PAIR_HASH - 1)) {
+        const AokPair *p = &set->pairs[i - 1];
+        void (*fused)(void) = p->fused;
+
+        if ((uintptr_t)p->a != prev[0] || (uintptr_t)p->b != from[0]) {
+            continue;
+        }
+        /*
+         * The step before must have been that one gadget and nothing after
+         * it, or what follows its operands is not this step.
+         */
+        if (from - prev != p->a_words) {
+            break;
+        }
+        /* The first's result goes to the register its first operand names. */
+        for (unsigned k = 0; set->forward && k < 2 && p->fused_fw[k]; k++) {
+            if (p->op[k].kind == AOK_PAIR_OP_SLOT &&
+                from[1 + p->op[k].index] == prev[1]) {
+                fused = p->fused_fw[k];
+                aok_stats.pairs_fw++;
+                break;
+            }
+        }
+        prev[0] = (uintptr_t)fused;
+        memmove(from, from + 1, (g->p - from - 1) * sizeof(*from));
+        g->p--;
+        /* Words this step asked aok_gen_finish to fill in moved with it. */
+        for (int j = 0; j < g->n_fix; j++) {
+            if (g->fix[j].word > from) {
+                g->fix[j].word--;
+            }
+        }
+        aok_stats.pairs++;
+        return;                 /* a pair is not the head of another */
+    }
+    g->pair_prev = from;
 }
 
 void aok_gen_insn_end(AokGen *g, uint64_t pc_page_offset, uint64_t insn)

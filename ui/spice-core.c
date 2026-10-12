@@ -518,6 +518,11 @@ static QemuOptsList qemu_spice_opts = {
         },{
             .name = "rendernode",
             .type = QEMU_OPT_STRING,
+#else
+        },{
+            /* So that a front end can say gl=off whatever the build has. */
+            .name = "gl",
+            .type = QEMU_OPT_BOOL,
 #endif
         },
         { /* end of list */ }
@@ -850,6 +855,12 @@ static void qemu_spice_init(void)
     g_free(x509_cacert_file);
     g_free(password);
 
+#ifndef HAVE_SPICE_GL
+    if (qemu_opt_get_bool(opts, "gl", 0)) {
+        error_report("SPICE GL support is not built in");
+        exit(1);
+    }
+#endif
 #ifdef HAVE_SPICE_GL
     if (qemu_opt_get_bool(opts, "gl", 0)) {
         if ((port != 0) || (tls_port != 0)) {

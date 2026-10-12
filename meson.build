@@ -1412,7 +1412,8 @@ if get_option('spice') \
              .require(pixman.found(),
                       error_message: 'cannot enable SPICE if pixman is not available') \
              .allowed()
-  spice = dependency('spice-server', version: '>=0.15.0',
+  # 0.14.3 is what UTM's sysroot carries; see SPICE_HAS_ATTACHED_WORKER.
+  spice = dependency('spice-server', version: '>=0.14.3',
                      required: get_option('spice'),
                      method: 'pkg-config')
 endif

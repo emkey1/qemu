@@ -35,6 +35,13 @@ bool qemu_spice_have_display_interface(QemuConsole *con);
 int qemu_spice_add_display_interface(QXLInstance *qxlin, QemuConsole *con);
 int qemu_spice_migrate_info(const char *hostname, int port, int tls_port,
                             const char *subject);
+
+/* Before 0.15.0 the QXL interface's callback was attache_worker(sin, worker). */
+#if SPICE_SERVER_VERSION >= 0x000f00 /* release 0.15.0 */
+#define SPICE_HAS_ATTACHED_WORKER 1
+#else
+#define SPICE_HAS_ATTACHED_WORKER 0
+#endif
 #endif /* CONFIG_SPICE */
 
 static inline bool qemu_using_spice(Error **errp)

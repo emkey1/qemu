@@ -407,6 +407,22 @@ SRST
 ERST
 
     {
+        .name       = "console_resize",
+        .args_type  = "id:s,cols:i,rows:i",
+        .params     = "id cols rows",
+        .help       = "set the size of the virtconsole 'id'",
+        .cmd        = hmp_console_resize,
+    },
+
+SRST
+``console_resize`` *id* *cols* *rows*
+  tctiSH: set the size of the virtconsole with ID *id* to *cols* columns by
+  *rows* rows, for the terminal on the host that shows it. The guest makes it
+  the size of the console's tty. Needs ``console-size=on`` on its
+  virtio-serial bus; kept while the VM is stopped, and sent once it runs.
+ERST
+
+    {
         .name       = "delvm",
         .args_type  = "name:s",
         .params     = "tag",

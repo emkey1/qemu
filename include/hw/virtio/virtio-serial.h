@@ -23,6 +23,11 @@
 struct virtio_serial_conf {
     /* Max. number of ports we can have for a virtio-serial device */
     uint32_t max_virtserial_ports;
+    /*
+     * tctiSH: offer VIRTIO_CONSOLE_F_SIZE, and tell the guest each console
+     * port's size as console_resize sets it.
+     */
+    bool console_size;
 };
 
 #define TYPE_VIRTIO_SERIAL_PORT "virtio-serial-port"
@@ -145,6 +150,15 @@ struct VirtIOSerialPort {
     bool host_connected;
     /* Do apps not want to receive data? */
     bool throttled;
+
+    /*
+     * tctiSH: a console port's size, as console_resize last set it, or zero
+     * before then. Kept so that it can be sent again whenever the guest might
+     * not have it: when its driver sets the port up, and when the VM starts
+     * running after a stop or a snapshot load.
+     */
+    uint16_t cols;
+    uint16_t rows;
 };
 
 /* The virtio-serial bus on top of which the ports will ride as devices */
@@ -184,6 +198,13 @@ struct VirtIOSerial {
     uint32_t *ports_map;
 
     struct VirtIOSerialPostLoad *post_load;
+
+    /*
+     * tctiSH: sends every console port's size again once the VM is running,
+     * scheduled when it starts.
+     */
+    QEMUBH *console_size_bh;
+    VMChangeStateEntry *vmstate_change;
 
     virtio_serial_conf serial;
 };

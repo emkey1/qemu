@@ -80,156 +80,15 @@
     dmb ish
     gret
 
-/* ---- Loads and stores ----------------------------------------------------
+/* ---- Loads, stores and branches -------------------------------------------
  *
- * Stream: [gadget][reg offset][rs1 offset][imm][pc delta][insn]
- *
- * The softmmu fast path, as TCG's own backends inline it: index this TB's
- * fast table by the page number (folded, CPU_TLB_INDEX_FOLD), compare the
- * entry's tag with the address, and on a match the entry's addend turns the
- * guest address into a host one. The tag is compared with the address's page
- * AND its low alignment bits, so only an aligned access to a page with no
- * flags set hits; a misaligned one, MMIO, a watched or not-yet-dirty page
- * and a real miss all leave by the slow path, which is cputlb's.
- *
- * The slow path may raise a guest exception and not return. It is told the
- * insn's pc and opcode, which it stores first, so the CPU state is exact
- * there with nothing to unwind: the last two operands are read only then.
+ * Not here either: their bodies are iSH-AOK's too (gadgets-shared.S), and
+ * what is this front end's about them -- the softmmu fast path and its slow
+ * path, how a TB is left -- is the set of macros that file gives those
+ * bodies.
  */
-#define TLB_FOLD        8       /* CPU_TLB_INDEX_FOLD */
-#define TLB_SHIFT       7       /* TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS */
-#define TLBE_READ       0
-#define TLBE_WRITE      8
-#define TLBE_ADDEND     24
 
-.macro rv_load name, tagmask, insn:vararg
-.gadget rv_\name
-    ldp x9, x10, [_ip]          /* rd offset, rs1 offset */
-    ldr x11, [_ip, #16]         /* imm */
-    ldr x10, [_cpu, x10]
-    ldp x12, x13, [_tlb]        /* mask, table */
-    add x7, x10, x11            /* guest address */
-    eor x14, x7, x7, lsr #TLB_FOLD
-    and x12, x12, x14, lsr #TLB_SHIFT
-    add x13, x13, x12
-    ldr x14, [x13, #TLBE_READ]
-    ldr x15, [x13, #TLBE_ADDEND]
-    and x16, x7, #\tagmask
-    cmp x14, x16
-    b.ne 1f
-    \insn, [x7, x15]
-    str x11, [_cpu, x9]
-    gret 5
-1:  aok_fp_end
-    ldp x2, x3, [_ip, #24]      /* pc delta, insn */
-    mov x0, _cpu
-    mov x1, x7
-    add x2, _pc, x2
-    bl SYM(aok_rv_helper_\name)
-    ldr x9, [_ip]
-    str x0, [_cpu, x9]
-    gret 5
-.endm
-
-rv_load lb,  0xfffffffffffff000, ldrsb x11
-rv_load lbu, 0xfffffffffffff000, ldrb w11
-rv_load lh,  0xfffffffffffff001, ldrsh x11
-rv_load lhu, 0xfffffffffffff001, ldrh w11
-rv_load lw,  0xfffffffffffff003, ldrsw x11
-rv_load lwu, 0xfffffffffffff003, ldr w11
-rv_load ld,  0xfffffffffffff007, ldr x11
-
-/*
- * flw: the 32 bits go into the 64-bit register NaN-boxed, the upper half all
- * ones. Stream as the loads above, the register offset an fpr's.
- */
-.gadget rv_flw
-    ldp x9, x10, [_ip]
-    ldr x11, [_ip, #16]
-    ldr x10, [_cpu, x10]
-    ldp x12, x13, [_tlb]
-    add x7, x10, x11
-    eor x14, x7, x7, lsr #TLB_FOLD
-    and x12, x12, x14, lsr #TLB_SHIFT
-    add x13, x13, x12
-    ldr x14, [x13, #TLBE_READ]
-    ldr x15, [x13, #TLBE_ADDEND]
-    and x16, x7, #0xfffffffffffff003
-    cmp x14, x16
-    b.ne 1f
-    ldr w11, [x7, x15]
-    orr x11, x11, #0xffffffff00000000
-    str x11, [_cpu, x9]
-    gret 5
-1:  aok_fp_end
-    ldp x2, x3, [_ip, #24]
-    mov x0, _cpu
-    mov x1, x7
-    add x2, _pc, x2
-    bl SYM(aok_rv_helper_lwu)
-    ldr x9, [_ip]
-    orr x0, x0, #0xffffffff00000000
-    str x0, [_cpu, x9]
-    gret 5
-
-.macro rv_store name, tagmask, insn:vararg
-.gadget rv_\name
-    ldp x9, x10, [_ip]          /* rs2 offset, rs1 offset */
-    ldr x11, [_ip, #16]         /* imm */
-    ldr x10, [_cpu, x10]
-    ldp x12, x13, [_tlb]
-    add x7, x10, x11
-    ldr x11, [_cpu, x9]         /* the value */
-    eor x14, x7, x7, lsr #TLB_FOLD
-    and x12, x12, x14, lsr #TLB_SHIFT
-    add x13, x13, x12
-    ldr x14, [x13, #TLBE_WRITE]
-    ldr x15, [x13, #TLBE_ADDEND]
-    and x16, x7, #\tagmask
-    cmp x14, x16
-    b.ne 1f
-    \insn, [x7, x15]
-    gret 5
-1:  aok_fp_end
-    ldp x3, x4, [_ip, #24]      /* pc delta, insn */
-    mov x0, _cpu
-    mov x1, x7
-    mov x2, x11
-    add x3, _pc, x3
-    bl SYM(aok_rv_helper_\name)
-    gret 5
-.endm
-
-rv_store sb, 0xfffffffffffff000, strb w11
-rv_store sh, 0xfffffffffffff001, strh w11
-rv_store sw, 0xfffffffffffff003, str w11
-rv_store sd, 0xfffffffffffff007, str x11
-
-/* ---- Control flow --------------------------------------------------------
- *
- * A conditional branch ends its TB and leaves it by one of two jumps:
- * [gadget][rs1 offset][rs2 offset][taken delta][taken slot][fall delta][fall slot]
- * See aok_gadget_goto for what a delta and a slot are.
- */
-.macro rv_branch name, cond
-.gadget rv_b\name
-    ldp x9, x10, [_ip]
-    ldr x9, [_cpu, x9]
-    ldr x10, [_cpu, x10]
-    cmp x9, x10
-    b.\cond 1f
-    ldp x9, x10, [_ip, #32]
-    b SYM(aok_goto_tail)
-1:  ldp x9, x10, [_ip, #16]
-    b SYM(aok_goto_tail)
-.endm
-
-rv_branch eq, eq
-rv_branch ne, ne
-rv_branch lt, lt
-rv_branch ge, ge
-rv_branch ltu, lo
-rv_branch geu, hs
+/* ---- Indirect jumps ------------------------------------------------------ */
 
 /*
  * jalr: [rd offset][rs1 offset][imm][link delta]. The target is computed
@@ -252,11 +111,10 @@ rv_branch geu, hs
     rv_jalr_body
     gret 4
 
-/* [rd offset][rs1 offset][imm][link delta][flags | cflags << 32][cs_base] */
-.gadget rv_jalr_lookup
-    rv_jalr_body
-    add _ip, _ip, #32
-    b 0f
+/*
+ * The jalr that looks its target up is gadgets-shared.S's jalr_cached (the
+ * name iSH-AOK's pairs know it by): it ends at aok_rv_lookup_pc below.
+ */
 
 /*
  * [flags | cflags << 32][cs_base] -- aok_gadget_lookup with tb_lookup()'s
@@ -272,7 +130,10 @@ rv_branch geu, hs
  */
 .gadget rv_lookup
     ldr x10, [_pcp]
-0:  ldr x11, [_bps]
+    /* (entered here with env->pc in x10 and _ip at the two operands) */
+    .globl SYM(aok_rv_lookup_pc)
+SYM(aok_rv_lookup_pc):
+    ldr x11, [_bps]
     eor x12, x10, x10, lsr #5
     cbnz x11, 3f
     lsr x13, x12, #5

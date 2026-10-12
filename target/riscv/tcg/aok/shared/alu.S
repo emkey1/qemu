@@ -238,10 +238,11 @@ f_gadget mulw_rr
 1:  sxtw x10, w10
     alu_tail
 
-#ifndef RV_GADGET_HOST   // AOK's own: how a block ends, chains and returns
 // ---- Conditional branches (fused compare+branch, the ISA's own shape) ----
-// Code stream: [gadget][rs1_off][rs2_off][taken][fallthrough]; both target
-// words use the tagged-chainable scheme (riscv64_branch_dispatch).
+// Code stream: [gadget][rs1_off][rs2_off][taken][fallthrough]; the last two
+// are ways out of the block, the host's (frag.h's branch_leave), F_WAY_WORDS
+// words each. AOK's is one word, in the tagged-chainable scheme
+// (riscv64_branch_dispatch).
 //
 // Each branch comes in two layouts, and gen picks by direction (the "btfn"
 // fuse bit): b<name> keeps the fallthrough straight-line for forward branches
@@ -253,16 +254,12 @@ f_gadget mulw_rr
 .macro branch_tail cond, taken_off, fall_off, bk
 .ifc \bk, bk
     b.\cond 1f
-    ldr _ip, [_ip, #\taken_off]
-    branch_dispatch
-1:  ldr _ip, [_ip, #\fall_off]
-    branch_dispatch
+    branch_leave \taken_off
+1:  branch_leave \fall_off
 .else
     b.\cond 1f
-    ldr _ip, [_ip, #\fall_off]
-    branch_dispatch
-1:  ldr _ip, [_ip, #\taken_off]
-    branch_dispatch
+    branch_leave \fall_off
+1:  branch_leave \taken_off
 .endif
 .endm
 
@@ -275,7 +272,7 @@ f_gadget mulw_rr
     f_src 9, x9, \fn
     f_src 10, x10, \fm
     cmp x9, x10
-    branch_tail \cond, 16, 24, fw
+    branch_tail \cond, 16, (16+8*F_WAY_WORDS), fw
 .endm
 f_nostub b\name
 f_gadget b\name
@@ -285,7 +282,7 @@ f_gadget b\name
     f_src 9, x9, \fn
     f_src 10, x10, \fm
     cmp x9, x10
-    branch_tail \ncond, 16, 24, bk
+    branch_tail \ncond, 16, (16+8*F_WAY_WORDS), bk
 .endm
 f_nostub b\name\()_bk
 f_gadget b\name\()_bk
@@ -313,7 +310,7 @@ branch_op geu, hs, lo
 .else
     cmp x11, x10
 .endif
-    branch_tail \cond, 24, 32, \bk
+    branch_tail \cond, 24, (24+8*F_WAY_WORDS), \bk
 .endm
 .macro branch_const name, cond, ncond, order
 .macro f_b\name\()_\order\()_body id, last, fn=_, fm=_, res=0
@@ -345,7 +342,7 @@ branch_const geu, hs, lo, ir
     f_src 10, x10, \fn
     ands x10, x10, x11
     str x10, [_cpu, x9]
-    branch_tail \cond, 24, 32, \bk
+    branch_tail \cond, 24, (24+8*F_WAY_WORDS), \bk
 .endm
 .macro andi_branch name, cond, ncond
 .macro f_andi_\name\()_body id, last, fn=_, fm=_, res=0
@@ -384,13 +381,14 @@ andi_branch bnez, ne, eq
 .macro f_jal_link_body id, last, fn=_, fm=_, res=0
     ldr x9, [_ip]             // rd_off
     ldr x10, [_ip, #8]        // link value (pc + insn length)
+    pc_param x10
     str x10, [_cpu, x9]
-    ldr _ip, [_ip, #16]       // tagged target word
-    branch_dispatch
+    branch_leave 16           // the target
 .endm
 f_nostub jal_link
 f_gadget jal_link
 
+#ifndef RV_GADGET_HOST   // AOK's own: an indirect jump, by its block cache
 // JALR: indirect jump, target = (rs1 + imm) & ~1. No chaining (target is
 // runtime-computed). Target computed from rs1 BEFORE the link write, because rd may alias
 // rs1 (jalr ra, 0(ra)): the spec reads the base first. Code stream:

@@ -511,12 +511,17 @@ static QemuOptsList qemu_spice_opts = {
         },{
             .name = "head",
             .type = QEMU_OPT_NUMBER,
-#ifdef HAVE_SPICE_GL
+#if defined(HAVE_SPICE_GL) && defined(CONFIG_GBM)
         },{
             .name = "gl",
             .type = QEMU_OPT_BOOL,
         },{
             .name = "rendernode",
+            .type = QEMU_OPT_STRING,
+#elif defined(HAVE_SPICE_GL)
+        },{
+            /* on, off, or which GL: es, core (qemu_spice_display_early_init) */
+            .name = "gl",
             .type = QEMU_OPT_STRING,
 #else
         },{
@@ -861,7 +866,10 @@ static void qemu_spice_init(void)
         exit(1);
     }
 #endif
-#ifdef HAVE_SPICE_GL
+#if defined(HAVE_SPICE_GL) && !defined(CONFIG_GBM)
+    qemu_spice_display_early_init();
+#endif
+#if defined(HAVE_SPICE_GL) && defined(CONFIG_GBM)
     if (qemu_opt_get_bool(opts, "gl", 0)) {
         if ((port != 0) || (tls_port != 0)) {
 #if SPICE_SERVER_VERSION >= 0x000f03 /* release 0.15.3 */

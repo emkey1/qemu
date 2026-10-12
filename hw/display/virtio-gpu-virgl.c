@@ -594,7 +594,11 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
             info.flags & VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP,
             info.width, info.height,
             ss.r.x, ss.r.y, ss.r.width, ss.r.height,
-            d3d_tex2d);
+            d3d_tex2d ? (ScanoutTextureNative){
+                            .type = SCANOUT_TEXTURE_NATIVE_TYPE_D3D,
+                            .handle = d3d_tex2d,
+                        } : NO_NATIVE_TEXTURE,
+            NULL);
     } else {
         qemu_console_set_surface(g->parent_obj.scanout[ss.scanout_id].con, NULL);
         qemu_console_gl_scanout_disable(g->parent_obj.scanout[ss.scanout_id].con);
@@ -1454,7 +1458,7 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
     }
 #endif
 #ifdef VIRGL_RENDERER_D3D11_SHARE_TEXTURE
-    if (qemu_egl_angle_d3d) {
+    if (qemu_egl_angle_native_device) {
         flags |= VIRGL_RENDERER_D3D11_SHARE_TEXTURE;
     }
 #endif

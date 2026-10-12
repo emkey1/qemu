@@ -28,6 +28,7 @@
 
 void qemu_spice_input_init(void);
 void qemu_spice_input_cleanup(void);
+void qemu_spice_display_early_init(void);
 void qemu_spice_display_init(void);
 void qemu_spice_display_cleanup(void);
 void qemu_spice_display_init_done(void);

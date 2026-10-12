@@ -120,6 +120,12 @@ if config_all_devices.has_key('CONFIG_VIRTIO_GPU') and config_all_devices.has_ke
   virtio_ramfb_ss.add(when: ['CONFIG_VIRTIO_GPU', 'CONFIG_VIRTIO_PCI', 'CONFIG_FW_CFG_DMA'],
                       if_true: [files('virtio-ramfb.c'), pixman])
   hw_display_modules += {'virtio-ramfb': virtio_ramfb_ss}
+  if virgl.found() and opengl.found()
+    virtio_ramfb_gl_ss = ss.source_set()
+    virtio_ramfb_gl_ss.add(when: ['CONFIG_VIRTIO_GPU', 'CONFIG_VIRTIO_PCI', 'CONFIG_FW_CFG_DMA', virgl, opengl],
+                           if_true: [files('virtio-ramfb-gl.c'), pixman])
+    hw_display_modules += {'virtio-ramfb-gl': virtio_ramfb_gl_ss}
+  endif
 endif
 
 if config_all_devices.has_key('CONFIG_VIRTIO_VGA')

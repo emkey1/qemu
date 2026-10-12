@@ -27,7 +27,12 @@
 #include "ui/qemu-pixman.h"
 #include "ui/console.h"
 
-#if defined(CONFIG_OPENGL) && defined(CONFIG_GBM)
+#if defined(CONFIG_IOSURFACE)
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOSurface/IOSurfaceRef.h>
+#endif
+
+#if defined(CONFIG_OPENGL)
 #  define HAVE_SPICE_GL 1
 #  include "ui/egl-helpers.h"
 #  include "ui/egl-context.h"
@@ -72,6 +77,13 @@ typedef struct QXLCookie {
             QXLRect area;
             int redraw;
         } render;
+        struct {
+            QXLInstance *qxl;
+            uint32_t x;
+            uint32_t y;
+            uint32_t w;
+            uint32_t h;
+        } gl_draw;
         void *data;
     } u;
 } QXLCookie;
@@ -81,6 +93,7 @@ QXLCookie *qxl_cookie_new(int type, uint64_t io);
 typedef struct SimpleSpiceDisplay SimpleSpiceDisplay;
 typedef struct SimpleSpiceUpdate SimpleSpiceUpdate;
 typedef struct SimpleSpiceCursor SimpleSpiceCursor;
+typedef void *SpiceDisplayMetalContext;
 
 struct SimpleSpiceDisplay {
     DisplaySurface *ds;
@@ -126,8 +139,30 @@ struct SimpleSpiceDisplay {
     bool have_scanout;
     bool have_surface;
 
+#if defined(CONFIG_GBM)
     QemuDmaBuf *guest_dmabuf;
     bool guest_dmabuf_refresh;
+#endif
+#if defined(CONFIG_IOSURFACE)
+    IOSurfaceRef iosurface;
+    /* IOSurface pixel format ('BGRA'/'RGBA') the surface was created with;
+     * a guest scanout in a different channel order forces a recreate. */
+    uint32_t iosurface_fourcc;
+    int surface_send_fd;
+    /* last geometry sent via spice_qxl_gl_scanout/monitor_config so we can
+     * skip re-sending the scanout for pure back-buffer flips */
+    uint32_t scanout_last_x, scanout_last_y, scanout_last_w, scanout_last_h;
+    bool scanout_last_y0top;
+#if defined(CONFIG_METAL)
+    SpiceDisplayMetalContext metal_context;
+#endif
+#endif
+#if defined(CONFIG_EGL)
+    EGLSurface esurface;
+    egl_fb iosurface_fb;
+#endif
+    GLuint tex_id;
+    bool y_0_top;
     bool render_cursor;
 
     egl_fb guest_fb;
@@ -154,7 +189,7 @@ struct SimpleSpiceCursor {
     QXLCursor cursor;
 };
 
-extern bool spice_opengl;
+extern DisplayGLMode spice_opengl;
 extern bool spice_remote_client;
 extern int spice_max_refresh_rate;
 
@@ -187,5 +222,26 @@ void qemu_spice_wakeup(SimpleSpiceDisplay *ssd);
 void qemu_spice_display_start(void);
 void qemu_spice_display_stop(void);
 int qemu_spice_display_is_running(SimpleSpiceDisplay *ssd);
+
+#if defined(CONFIG_METAL) && defined(CONFIG_IOSURFACE)
+typedef void *MTLTexture_id;
+typedef void (*SpiceDisplayMetalCompletion)(void *data);
+
+SpiceDisplayMetalContext qemu_spice_display_metal_create_context(IOSurfaceRef surface,
+                                                                 uint32_t width,
+                                                                 uint32_t height);
+void qemu_spice_display_metal_destroy_context(SpiceDisplayMetalContext ctx);
+/* IOSurface pixel format matching a scanout MTLTexture, 0 if unsupported. */
+uint32_t qemu_spice_display_metal_texture_fourcc(void *texture);
+void qemu_spice_display_metal_scanout_texture(SpiceDisplayMetalContext ctx,
+                                              MTLTexture_id tex, uint32_t x, uint32_t y,
+                                              uint32_t w, uint32_t h);
+void qemu_spice_display_metal_scanout_disable(SpiceDisplayMetalContext ctx);
+bool qemu_spice_display_metal_has_scanout(SpiceDisplayMetalContext ctx);
+void qemu_spice_display_metal_draw_frame(SpiceDisplayMetalContext ctx,
+                                         uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                                         SpiceDisplayMetalCompletion completion,
+                                         void *data);
+#endif
 
 #endif

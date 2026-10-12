@@ -12,7 +12,7 @@
 extern EGLDisplay *qemu_egl_display;
 extern EGLConfig qemu_egl_config;
 extern DisplayGLMode qemu_egl_mode;
-extern bool qemu_egl_angle_d3d;
+extern void *qemu_egl_angle_native_device;
 
 typedef struct egl_fb {
     int width;
@@ -20,6 +20,7 @@ typedef struct egl_fb {
     int x;
     int y;
     GLuint texture;
+    GLenum texture_target;
     GLuint framebuffer;
     bool delete_texture;
     QemuDmaBuf *dmabuf;
@@ -29,8 +30,11 @@ typedef struct egl_fb {
 
 void egl_fb_destroy(egl_fb *fb);
 void egl_fb_setup_default(egl_fb *fb, int width, int height, int x, int y);
+void egl_fb_setup_for_tex_target(egl_fb *fb, int width, int height,
+                                 GLuint texture, GLenum target, bool delete);
 void egl_fb_setup_for_tex(egl_fb *fb, int width, int height,
                           GLuint texture, bool delete);
+void egl_fb_setup_new_tex_target(egl_fb *fb, int width, int height, GLenum target);
 void egl_fb_setup_new_tex(egl_fb *fb, int width, int height);
 void egl_fb_blit(egl_fb *dst, egl_fb *src, bool flip);
 void egl_fb_read(DisplaySurface *dst, egl_fb *src);
@@ -59,7 +63,12 @@ void egl_dmabuf_create_fence(QemuDmaBuf *dmabuf);
 
 #endif
 
-EGLSurface qemu_egl_init_surface_x11(EGLContext ectx, EGLNativeWindowType win);
+EGLSurface qemu_egl_init_surface(EGLContext ectx, EGLNativeWindowType win);
+EGLSurface qemu_egl_init_buffer_surface(EGLContext ectx, EGLenum buftype,
+                                        EGLClientBuffer buffer, const EGLint *attrib_list);
+bool qemu_egl_destroy_surface(EGLSurface surface);
+
+int qemu_egl_init_dpy_cocoa(DisplayGLMode mode);
 
 #if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32)
 EGLDisplay qemu_egl_get_display(EGLNativeDisplayType native,

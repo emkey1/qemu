@@ -124,6 +124,25 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
         return;
     }
 
+#ifdef CONFIG_IOSURFACE
+    /*
+     * UTM's front end asks for Vulkan (venus), Direct3D (neptune) and the
+     * blob resources they need whenever its settings allow them. Those rest
+     * on parts of UTM's QEMU fork that this tree does not have yet: its
+     * in-process render server and Metal-backed host memory. OpenGL through
+     * virgl needs none of them, so run with that rather than refuse to start.
+     */
+    if (virtio_gpu_venus_enabled(b->conf) || virtio_gpu_neptune_enabled(b->conf) ||
+        virtio_gpu_blob_enabled(b->conf)) {
+        warn_report("virtio-gpu: venus, neptune and blob resources are not "
+                    "available in this build; continuing with OpenGL only");
+        b->conf.flags &= ~((1 << VIRTIO_GPU_FLAG_VENUS_ENABLED) |
+                           (1 << VIRTIO_GPU_FLAG_NEPTUNE_ENABLED) |
+                           (1 << VIRTIO_GPU_FLAG_BLOB_ENABLED));
+        b->conf.hostmem = 0;
+    }
+#endif
+
     if (!display_opengl) {
         error_setg(errp,
                    "The display backend does not have OpenGL support enabled");
@@ -170,6 +189,9 @@ static const Property virtio_gpu_gl_properties[] = {
                     VIRTIO_GPU_FLAG_VENUS_ENABLED, false),
     DEFINE_PROP_BIT("drm_native_context", VirtIOGPU, parent_obj.conf.flags,
                     VIRTIO_GPU_FLAG_DRM_ENABLED, false),
+    /* UTM's fork: Direct3D contexts through virglrenderer. Accepted, see realize. */
+    DEFINE_PROP_BIT("neptune", VirtIOGPU, parent_obj.conf.flags,
+                    VIRTIO_GPU_FLAG_NEPTUNE_ENABLED, false),
 };
 
 static void virtio_gpu_gl_device_unrealize(DeviceState *qdev)

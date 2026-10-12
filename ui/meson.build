@@ -103,14 +103,16 @@ if opengl.found()
   opengl_ss = ss.source_set()
   opengl_ss.add(gbm, pixman)
   opengl_ss.add(when: [opengl],
-               if_true: files('shader.c', 'console-gl.c', 'egl-helpers.c', 'egl-context.c'))
+               if_true: files('shader.c', 'console-gl.c'))
+  opengl_ss.add(when: [egl, opengl],
+               if_true: files('egl-helpers.c', 'egl-context.c'))
   ui_modules += {'opengl' : opengl_ss}
 endif
 
 if opengl.found()
   egl_headless_ss = ss.source_set()
-  egl_headless_ss.add(when: [opengl, pixman],
-                      if_true: [files('egl-headless.c'), gbm])
+  egl_headless_ss.add(when: [egl, opengl, gbm, pixman],
+                      if_true: files('egl-headless.c'))
   ui_modules += {'egl-headless' : egl_headless_ss}
 endif
 
@@ -156,8 +158,8 @@ if gtk.found()
   gtk_ss.add(gtk, vte, pixman, files('gtk.c'))
   gtk_ss.add(files('gtk-clipboard.c'))
   gtk_ss.add(when: x11, if_true: files('x_keymap.c'))
-  gtk_ss.add(when: opengl, if_true: files('gtk-gl-area.c'))
-  gtk_ss.add(when: [x11, opengl], if_true: files('gtk-egl.c'))
+  gtk_ss.add(when: [egl, opengl], if_true: files('gtk-gl-area.c'))
+  gtk_ss.add(when: [egl, x11, opengl], if_true: files('gtk-egl.c'))
   ui_modules += {'gtk' : gtk_ss}
 endif
 
@@ -168,7 +170,7 @@ if sdl.found()
     'sdl2-input.c',
     'sdl2.c',
   ))
-  sdl_ss.add(when: opengl, if_true: files('sdl2-gl.c'))
+  sdl_ss.add(when: [egl, opengl], if_true: files('sdl2-gl.c'))
   sdl_ss.add(when: x11, if_true: files('x_keymap.c'))
   ui_modules += {'sdl' : sdl_ss}
 endif
@@ -180,6 +182,13 @@ if spice.found()
     'spice-input.c',
     'spice-display.c'
   ))
+  if iosurface.found()
+    spice_core_ss.add(iosurface)
+  endif
+  if metal.found()
+    spice_core_ss.add(metal)
+    spice_core_ss.add(files('spice-display-metal.m'))
+  endif
   ui_modules += {'spice-core' : spice_core_ss}
 
   if gio.found()

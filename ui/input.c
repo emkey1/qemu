@@ -15,6 +15,8 @@ struct QemuInputHandlerState {
     int               events;
     QemuConsole       *con;
     uint32_t          leds_mask;
+    uint32_t          btn_down;   /* buttons this handler was told are down */
+    QemuConsole       *btn_con;   /* the console they were pressed on */
     QTAILQ_ENTRY(QemuInputHandlerState) node;
 };
 
@@ -48,6 +50,58 @@ static uint32_t kbd_default_delay_ms = 10;
 static uint32_t queue_count;
 static uint32_t queue_limit = 1024;
 
+static QemuInputHandlerState *qemu_input_find_handler(uint32_t mask,
+                                                      const QemuConsole *con);
+
+/*
+ * A release goes to whichever handler takes a console's buttons when it
+ * arrives, so a pointer that held a button and then stopped being that
+ * handler (mouse_set between a press and its release, a guest driver
+ * activating its tablet) would never hear of it: the guest sees the button
+ * held on that device for good, and a compositor that counts buttons per
+ * seat then ignores the same button on every other device. Let go of such
+ * buttons in the old handler's name: when the order of the handlers changes,
+ * or before the next event if the machine was not running then.
+ */
+static bool btn_orphans_pending;
+
+static void qemu_input_release_orphaned_buttons(void)
+{
+    QemuInputHandlerState *s;
+
+    if (replay_mode != REPLAY_MODE_NONE) {
+        return;
+    }
+    if (!runstate_is_running() && !runstate_check(RUN_STATE_SUSPENDED)) {
+        btn_orphans_pending = true;     /* devices take no events now */
+        return;
+    }
+    btn_orphans_pending = false;
+
+    QTAILQ_FOREACH(s, &handlers, node) {
+        if (!s->btn_down ||
+            qemu_input_find_handler(INPUT_EVENT_MASK_BTN, s->btn_con) == s) {
+            continue;
+        }
+        for (int b = 0; b < INPUT_BUTTON__MAX; b++) {
+            if (s->btn_down & (1u << b)) {
+                QemuInputEvent evt = {
+                    .type = INPUT_EVENT_KIND_BTN,
+                    .btn = {
+                        .button = b,
+                        .down = false,
+                    },
+                };
+                s->handler->event(s->dev, s->btn_con, &evt);
+            }
+        }
+        s->btn_down = 0;
+        if (s->handler->sync) {
+            s->handler->sync(s->dev);
+        }
+    }
+}
+
 static void notify_input_changed(uint32_t mask)
 {
     notifier_list_notify(&mouse_mode_notifiers, NULL);
@@ -75,6 +129,7 @@ void qemu_input_handler_activate(QemuInputHandlerState *s)
 {
     QTAILQ_REMOVE(&handlers, s, node);
     QTAILQ_INSERT_HEAD(&handlers, s, node);
+    qemu_input_release_orphaned_buttons();
     notify_input_changed(s->handler->mask);
 }
 
@@ -82,6 +137,7 @@ void qemu_input_handler_deactivate(QemuInputHandlerState *s)
 {
     QTAILQ_REMOVE(&handlers, s, node);
     QTAILQ_INSERT_TAIL(&handlers, s, node);
+    qemu_input_release_orphaned_buttons();
     notify_input_changed(s->handler->mask);
 }
 
@@ -347,10 +403,22 @@ void qemu_input_event_send_impl(QemuConsole *src, QemuInputEvent *evt)
 
     qemu_input_event_trace(src, evt);
 
+    if (btn_orphans_pending) {
+        qemu_input_release_orphaned_buttons();
+    }
+
     /* send event */
     s = qemu_input_find_handler(1 << evt->type, src);
     if (!s) {
         return;
+    }
+    if (evt->type == INPUT_EVENT_KIND_BTN) {
+        if (evt->btn.down) {
+            s->btn_down |= 1u << evt->btn.button;
+            s->btn_con = src;
+        } else {
+            s->btn_down &= ~(1u << evt->btn.button);
+        }
     }
     s->handler->event(s->dev, src, evt);
     s->events++;

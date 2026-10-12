@@ -114,6 +114,14 @@ if config_all_devices.has_key('CONFIG_VIRTIO_PCI')
   endif
 endif
 
+# UTM's device: its front end gives one to every "virt" machine.
+if config_all_devices.has_key('CONFIG_VIRTIO_GPU') and config_all_devices.has_key('CONFIG_FW_CFG_DMA')
+  virtio_ramfb_ss = ss.source_set()
+  virtio_ramfb_ss.add(when: ['CONFIG_VIRTIO_GPU', 'CONFIG_VIRTIO_PCI', 'CONFIG_FW_CFG_DMA'],
+                      if_true: [files('virtio-ramfb.c'), pixman])
+  hw_display_modules += {'virtio-ramfb': virtio_ramfb_ss}
+endif
+
 if config_all_devices.has_key('CONFIG_VIRTIO_VGA')
   virtio_vga_ss = ss.source_set()
   virtio_vga_ss.add(when: 'CONFIG_VIRTIO_VGA',

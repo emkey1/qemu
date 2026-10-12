@@ -12,8 +12,8 @@
 // parameter; with `last` 0 it leaves _ip after its parameters and falls
 // through, with `last` 1 it ends in the dispatch. `id` makes labels unique.
 
-// A second host. The bodies that touch nothing but guest registers -- the
-// ALU family of alu.S, mov_const and addi below -- and the pairs made of them
+// A second host. The bodies here and in alu.S -- the ALU family, mov_const
+// and addi, the loads and stores, the branches -- and the pairs made of them
 // are built by another translator as well as by AOK's: the QEMU plug-in
 // (tests/bench-utm, docs/utm_engine_study.md), which copies alu.S, this file
 // and pairs.h and assembles them with its own definitions in place of
@@ -30,9 +30,46 @@
 //   HOST_NAME     1 for a gadget the host has, 0 for one it lacks, for every
 //                 gadget pairs.h names
 //
-// A shared body does not fault, does not call out and does not end a block.
-// Anything that does one of those is a host's own (between the
-// RV_GADGET_HOST guards), under a name pairs.h may still mention.
+// Guest memory is the host's: how an address is translated, and what a miss
+// or a fault does. A load or store body computes the address and makes the
+// access itself, between the host's macros:
+//
+//   _addr         the register the address is in
+//   _sav, _savw   a register, and its low half, that the macros below leave
+//                 as it was: the body keeps what it needs after the access
+//                 there (a load's destination, a store's value)
+//   read_prep BITS, ID, AHEAD     _addr holds a guest address on entry and,
+//   write_prep BITS, ID, AHEAD    after it, a host address where BITS/8 bytes
+//                 can be read or written. It may use x9-x11, may call out,
+//                 and may not come back (a fault).
+//   write_done BITS, ID           follows the store instruction
+//   read_bullshit, write_bullshit BITS, ID, AHEAD
+//                 the same access's out-of-line code, placed after the
+//                 gadget's dispatch
+//   gret_ahead    the dispatch of a body that has already moved _ip past the
+//                 next gadget's word
+//
+// The body moves _ip past its parameters before the access (f_ip_past), and
+// AHEAD is how many bytes beyond them _ip is when the macro runs. A load's or
+// a store's last parameter is the host's own, whatever its fault path needs
+// to name the instruction: it is at [_ip, #-(AHEAD + 8)] there.
+//
+// How a block is left is the host's too. A body that ends its block names a
+// way out by parameter words it does not read:
+//
+//   F_WAY_WORDS       how many words name one way out
+//   branch_leave OFF  leave by the way out whose words begin at [_ip, #OFF].
+//                     It does not come back, so nothing of the body's is
+//                     live in it; give each its own indirect branch
+//                     (branch_dispatch below has the reason).
+//   pc_param REG      REG holds a parameter that is a guest code address, as
+//                     the translator wrote it; afterwards, the address
+//
+// Everything else is outside the contract: a shared body does not call out
+// on its own account and does not read the host's state. A gadget that must
+// is a host's own (between the RV_GADGET_HOST guards), under a name pairs.h
+// may still mention; a host that has no such gadget of AOK's can supply the
+// body macro itself and take the pairs that end in it.
 // tools/check-shared-gadgets.sh builds these files as such a host and fails
 // on a body that breaks the contract: run it after changing them.
 
@@ -51,6 +88,14 @@
     ldr x\dst, [_cpu, \slotreg]
 .else
     mov x\dst, x\fw
+.endif
+.endm
+// (the same, for a destination that is a name: _addr, _sav)
+.macro f_src_r dst, slotreg, fw
+.ifc \fw,_
+    ldr \dst, [_cpu, \slotreg]
+.else
+    mov \dst, x\fw
 .endif
 .endm
 
@@ -152,6 +197,7 @@
 .endif
 .endm
 
+#ifndef RV_GADGET_HOST   // AOK's own way out of a block
 // A branch gadget's way out, its own copy (jit/guest-arm64/control.S's
 // branch_dispatch has the reason: through the shared riscv64_chain every
 // transition between blocks left by ONE indirect branch). The rare ways out
@@ -176,6 +222,16 @@
 8:  b riscv64_chain_poked
 9:  b riscv64_branch_unchained
 .endm
+// One tagged word names a way out (core.S's riscv64_branch_dispatch has the
+// scheme), and a guest address in the stream is the address.
+#define F_WAY_WORDS 1
+.macro branch_leave off
+    ldr _ip, [_ip, #\off]
+    branch_dispatch
+.endm
+.macro pc_param reg
+.endm
+#endif // !RV_GADGET_HOST
 
 // ---- Bodies defined here because more than one file needs them ------------
 // alu.S builds the pairs, and holds its own gadgets' bodies; these are the
@@ -183,7 +239,7 @@
 
 // rd = constant. [rd_off][value]
 // rd = rs1 + imm. [rd_off][rs1_off][imm]
-// Unconditional branch. [target]
+// Unconditional branch. [way out]
 .macro f_mov_const_body id, last, fn=_, fm=_, res=0
     ldr x9, [_ip]
     ldr x10, [_ip, #8]
@@ -204,25 +260,26 @@ f_nostub mov_const
 .endm
 f_nostub addi
 .macro f_b_body id, last, fn=_, fm=_, res=0
-    ldr _ip, [_ip]
-    branch_dispatch
+    branch_leave 0
 .endm
 f_nostub b
 
-// Loads and stores. [rd_off|rs2_off][rs1_off][imm][orig_ip]
+// Loads and stores. [rd_off|rs2_off][rs1_off][imm][the host's word]
+// (the host's word: AOK's is the instruction's address, where a fault
+// restarts)
 // (`lid`: the old label id, unused -- the labels take the body's own `id`)
 // (the bodies only: memory.S's load_gadget emits the gadgets)
 .macro def_load name, size, lid, ld_insn, reg
 .macro f_\name\()_body id, last, fn=_, fm=_, res=0
-    ldr x19, [_ip]            // rd_off (callee-saved across prep)
+    ldr _sav, [_ip]           // rd_off (kept across prep)
     ldr x9, [_ip, #8]         // rs1_off
     ldr x10, [_ip, #16]       // imm
-    f_ip_past \last, 4       // 3 params + trailing orig_ip (fault restart)
-    f_src 7, x9, \fn
-    add x7, x7, x10           // effective address
+    f_ip_past \last, 4       // 3 params + the host's word
+    f_src_r _addr, x9, \fn
+    add _addr, _addr, x10     // effective address
     f_read_prep \last, \size, \id
-    \ld_insn \reg, [x7]
-    str x11, [_cpu, x19]
+    \ld_insn \reg, [_addr]
+    str x11, [_cpu, _sav]
     f_res \res, x11
     f_end_ahead \last
 .endm
@@ -245,11 +302,11 @@ def_load ld,  64, rvld,  ldr,   x11
     ldr x10, [_ip, #8]        // rs1_off (base)
     ldr x11, [_ip, #16]       // imm
     f_ip_past \last, 4
-    f_src 19, x9, \fn        // value survives prep in callee-saved reg
-    f_src 7, x10, \fm
-    add x7, x7, x11
+    f_src_r _sav, x9, \fn    // the value, kept across prep
+    f_src_r _addr, x10, \fm
+    add _addr, _addr, x11
     f_write_prep \last, \size, \id
-    \st_insn \reg, [x7]
+    \st_insn \reg, [_addr]
     write_done \size, \id
     f_end_ahead \last
 .endm
@@ -257,7 +314,7 @@ def_load ld,  64, rvld,  ldr,   x11
     f_write_bullshit \last, \size, \id
 .endm
 .endm
-def_store sb, 8,  rvsb, strb, w19
-def_store sh, 16, rvsh, strh, w19
-def_store sw, 32, rvsw, str,  w19
-def_store sd, 64, rvsd, str,  x19
+def_store sb, 8,  rvsb, strb, _savw
+def_store sh, 16, rvsh, strh, _savw
+def_store sw, 32, rvsw, str,  _savw
+def_store sd, 64, rvsd, str,  _sav

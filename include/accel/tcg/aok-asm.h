@@ -62,10 +62,13 @@ _ip      .req x28
     br x9
 .endm
 
+/* (a file of gadgets under another prefix defines its own: AOK_ASM_OWN_GADGET) */
+#ifndef AOK_ASM_OWN_GADGET
 .macro .gadget name
     .balign 16
     .globl SYM(aok_gadget_\name)
 SYM(aok_gadget_\name):
 .endm
+#endif
 
 #endif

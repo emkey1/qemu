@@ -73,6 +73,10 @@ The parts
 ``target/riscv/tcg/aok/``
   RISC-V's translator and gadgets.
 
+``target/riscv/tcg/aok/shared/``, ``scripts/aok-gadgets-sync.sh``
+  The gadgets RISC-V shares with iSH-AOK, as copies of its sources, and the
+  script that brings the copies up to date (`Gadgets shared with iSH-AOK`_).
+
 Outside those, the changes to TCG are small:
 
 * ``setjmp_gen_code`` offers each TB to ``TCGCPUOps.aok_translate_code``
@@ -102,6 +106,71 @@ gadget serves every register::
 The host registers a gadget may rely on are listed in ``aok.h``. Everything
 that must survive a call to C is in a callee-saved register, so a helper is a
 plain ``bl``.
+
+Fused pairs
+===========
+
+Two gadgets that follow one another in a stream can be one gadget that does
+both and dispatches once: the indirect branch between them, the one thing a
+gadget cannot do without, is gone. ``aok_gen_pair``, called by a translator
+after each instruction, looks the last two gadgets up in the front end's
+table of pairs and, where there is one, puts the fused gadget in the first's
+place and takes the second's word out::
+
+    [add_rr][rd][rs1][rs2] [slli][rd][rs1][imm]
+    [f2_add_rr__slli][rd][rs1][rs2][rd][rs1][imm]
+
+Where the second reads the register the first has just written, a variant of
+the pair hands the value over in a host register and the second does not load
+it (forwarding). The first still stores it: guest registers are always in
+``env``.
+
+Only gadgets that cannot fault, call C or end a TB are paired, so nothing
+about exceptions, interrupts or the instruction count changes: a pair is two
+instructions of one TB that nothing could have come between.
+
+This is iSH-AOK's scheme (``jit_pair_fuse`` in its ``jit/gen.c``). Which
+pairs exist is a list too, measured there from what programs execute.
+
+Gadgets shared with iSH-AOK
+===========================
+
+RISC-V's integer gadgets that touch nothing but guest registers, and the
+pairs made of them, are not written in this tree. ``shared/alu.S``,
+``shared/frag.h`` and ``shared/pairs.h`` are iSH-AOK's
+``jit/guest-riscv64`` files of those names, unchanged, and
+``gadgets-shared.S`` assembles them with this tree's definitions of what they
+ask of a host: the registers for the CPU state and the stream, how a gadget
+begins and ends, and which of the gadgets the pair list names exist here.
+``frag.h`` states that contract under "A second host".
+
+``scripts/aok-gadgets-sync.sh [CHECKOUT]`` copies the three files from a
+checkout of iSH-AOK and writes ``shared/host-gadgets.h`` (which gadgets exist
+here, read off the assembled object) and ``shared/SOURCE`` (the commit).
+``--check`` says whether the copies are current. **Do not edit the copies**:
+change iSH-AOK and copy again, so that a gadget improved or a pair added
+there arrives here with nothing ported by hand.
+
+``translate.c`` reads ``pairs.h`` as iSH-AOK's translator does, less the
+pairs with a half this front end lacks. Today that is the pairs of two
+integer gadgets, 118 of the 332. The rest have a load, a store or a branch in
+them, which here go through the softmmu TLB and QEMU's TB linking and are
+this tree's own (``gadgets.S``); written as bodies under the same contract,
+they would bring their pairs with them.
+
+In host CPU cycles on an Apple M5, same guest and programs as above, with the
+pairs and with ``QEMU_AOK_NO_PAIRS=1`` (three interleaved runs of each):
+
+==================== ============ ========== =======
+Workload             Without      With pairs Ratio
+==================== ============ ========== =======
+CoreMark             6.60 G       6.37 G     1.036
+n-body (doubles)     3.40 G       3.39 G     1.000
+Python               13.18 G      12.20 G    1.080
+xz -3                5.52 G       5.28 G     1.046
+sha256sum            3.35 G       3.22 G     1.039
+awk                  5.26 G       4.96 G     1.062
+==================== ============ ========== =======
 
 Rules a front end must keep
 ===========================
@@ -155,6 +224,9 @@ Run-time switches
 ``QEMU_AOK_NO_CSR``, ``QEMU_AOK_NO_ATOMIC``, ``QEMU_AOK_NO_FP``, ``QEMU_AOK_NO_FPNATIVE``
   Leave that instruction class to TCG (or, for the last, to softfloat), for
   bisecting.
+
+``QEMU_AOK_NO_PAIRS``, ``QEMU_AOK_NO_FWD``
+  Fuse no pairs; fuse them, but forward no register.
 
 RISC-V
 ======

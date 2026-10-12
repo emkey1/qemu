@@ -21,6 +21,7 @@ riscv_ss.add(files(
 if get_option('aok_gadgets')
   riscv_system_ss.add(files(
     'aok/gadgets.S',
+    'aok/gadgets-shared.S',
     'aok/translate.c',
   ))
 endif

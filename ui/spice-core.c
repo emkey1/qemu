@@ -1026,6 +1026,21 @@ static void qemu_spice_cleanup(void)
         return;
     }
 
+#if SPICE_SERVER_VERSION < 0x000f00
+    /*
+     * spice-server before 0.15 cannot have its keyboard and mouse taken away
+     * (spice_server_remove_interface: "VD_INTERFACE_REMOVING unsupported"),
+     * so it still points at them when spice_server_destroy() disconnects the
+     * inputs channel and releases the keys: inputs_release_keys() then reads
+     * the keyboard qemu_spice_input_cleanup() has just freed, and the process
+     * dies of it. A process that is only QEMU would not notice much; one that
+     * hosts QEMU as a library (UTM) takes its user's other windows with it at
+     * every guest shutdown. Leave such a server standing, as QEMU did before
+     * it had a cleanup at all.
+     */
+    return;
+#endif
+
     qemu_spice_display_cleanup();
     qemu_spice_input_cleanup();
     migration_remove_notifier(&migration_state);

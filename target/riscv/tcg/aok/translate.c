@@ -26,7 +26,10 @@
 #define G(name) aok_gadget_rv_##name
 #define DECL(name) void G(name)(void);
 
-/* target/riscv/tcg/aok/gadgets.S */
+/*
+ * The integer gadgets are iSH-AOK's (gadgets-shared.S), under the names its
+ * translator knows them by; the rest are this front end's own (gadgets.S).
+ */
 #define ALU_BOTH(X) \
     X(add) X(and) X(or) X(xor) X(sll) X(srl) X(sra) X(slt) X(sltu) \
     X(addw) X(sllw) X(srlw) X(sraw) X(ror) X(rorw) \
@@ -44,7 +47,8 @@
 #define DECL_RR(n) DECL(n##_rr)
 #define DECL_RI(n) DECL(n##_ri)
 ALU_BOTH(DECL_RR) ALU_BOTH(DECL_RI) ALU_RR(DECL_RR) ALU_RI(DECL_RI)
-DECL(li) DECL(pcrel) DECL(fence) DECL(jalr) DECL(jalr_lookup) DECL(lookup)
+DECL(mov_const) DECL(addi)
+DECL(pcrel) DECL(fence) DECL(jalr) DECL(jalr_lookup) DECL(lookup)
 DECL(call) DECL(call_exit)
 DECL(fadd_d) DECL(fsub_d) DECL(fmul_d) DECL(fdiv_d) DECL(fsqrt_d)
 DECL(fmadd_d) DECL(fmsub_d) DECL(fnmsub_d) DECL(fnmadd_d)
@@ -58,6 +62,65 @@ DECL(sb) DECL(sh) DECL(sw) DECL(sd)
 DECL(beq) DECL(bne) DECL(blt) DECL(bge) DECL(bltu) DECL(bgeu)
 
 typedef void (*Gadget)(void);
+
+/*
+ * The fused pairs: iSH-AOK's list (shared/pairs.h), read as its own
+ * translator reads it, less the pairs with a gadget this front end does not
+ * have (shared/host-gadgets.h). FUSE2(a, b) names a pair; HR_a says that a
+ * leaves its result in a host register as well, K_b how many operands b can
+ * take from one, and OPS_b which operand words those are.
+ */
+#include "shared/host-gadgets.h"
+#define PAIR_OP_NONE AOK_PAIR_OP_NONE
+#define PAIR_OP_SLOT AOK_PAIR_OP_SLOT
+#define FUSE2(a, b) RV_HOST(HOST_##a, HOST_##b)(a, b)
+#define RV_HOST(x, y) RV_HOST_(x, y)
+#define RV_HOST_(x, y) RV_HOST_##x##y
+#define RV_HOST_00(a, b)
+#define RV_HOST_01(a, b)
+#define RV_HOST_10(a, b)
+#define RV_HOST_11(a, b) RV_FUSE2_SEL(HR_##a, K_##b)(a, b)
+#define RV_FUSE2_SEL(h, k) RV_FUSE2_SEL_(h, k)
+#define RV_FUSE2_SEL_(h, k) RV_FUSE2_##h##_##k
+#define RV_FUSE2_0_0(a, b) \
+    RV_PAIR(a, b, NULL, NULL, {0, PAIR_OP_NONE}, {0, PAIR_OP_NONE})
+#define RV_FUSE2_0_1(a, b) RV_FUSE2_0_0(a, b)
+#define RV_FUSE2_0_2(a, b) RV_FUSE2_0_0(a, b)
+#define RV_FUSE2_1_0(a, b) RV_FUSE2_0_0(a, b)
+#define RV_FUSE2_1_1(a, b) RV_FW1(a, b) \
+    RV_PAIR(a, b, G(f2n_##a##__##b), NULL, OPS_##b, {0, PAIR_OP_NONE})
+#define RV_FUSE2_1_2(a, b) RV_FW1(a, b) RV_FW2(a, b) \
+    RV_PAIR(a, b, G(f2n_##a##__##b), G(f2m_##a##__##b), OPS_##b)
+
+#define RV_PAIR(a, b, fn, fm, ...) DECL(a) DECL(b) DECL(f2_##a##__##b)
+#define RV_FW1(a, b) DECL(f2n_##a##__##b)
+#define RV_FW2(a, b) DECL(f2m_##a##__##b)
+#include "shared/pairs.h"
+#undef RV_PAIR
+#undef RV_FW1
+#undef RV_FW2
+
+static const AokPair rv_pair_list[] = {
+#define RV_PAIR(a, b, fn, fm, ...) \
+    { G(a), G(b), G(f2_##a##__##b), { fn, fm }, 1 + NP_##a, { __VA_ARGS__ } },
+#define RV_FW1(a, b)
+#define RV_FW2(a, b)
+#include "shared/pairs.h"
+#undef RV_PAIR
+#undef RV_FW1
+#undef RV_FW2
+#undef FUSE2
+};
+
+static AokPairSet rv_pairs = { rv_pair_list, ARRAY_SIZE(rv_pair_list) };
+static bool rv_pairs_on;
+
+static void __attribute__((constructor)) rv_pairs_init(void)
+{
+    rv_pairs_on = !getenv("QEMU_AOK_NO_PAIRS");
+    rv_pairs.forward = !getenv("QEMU_AOK_NO_FWD");
+    aok_pair_set_init(&rv_pairs);
+}
 
 /* gadgets.S: the tag masks of the loads and stores, and rv_lookup's hash. */
 QEMU_BUILD_BUG_ON(TARGET_PAGE_BITS != 12);
@@ -411,7 +474,7 @@ static int alu_ri(Ctx *c, Gadget gadget, unsigned rd, unsigned rs1,
 static int li(Ctx *c, unsigned rd, int64_t value)
 {
     if (rd) {
-        aok_emit_gadget(&c->g, G(li));
+        aok_emit_gadget(&c->g, G(mov_const));
         aok_emit(&c->g, rd_off(rd));
         aok_emit(&c->g, value);
     }
@@ -420,7 +483,8 @@ static int li(Ctx *c, unsigned rd, int64_t value)
 
 static int addi(Ctx *c, unsigned rd, unsigned rs1, int64_t imm)
 {
-    return rs1 ? alu_ri(c, G(add_ri), rd, rs1, imm) : li(c, rd, imm);
+    /* (the gadgets iSH-AOK's translator picks for the two: its pairs' names) */
+    return rs1 ? alu_ri(c, G(addi), rd, rs1, imm) : li(c, rd, imm);
 }
 
 /* A load is done even into x0: it can fault, or read a device. */
@@ -1011,7 +1075,7 @@ static int insn16(Ctx *c, uint32_t insn)
         case 0: /* c.addi4spn */
             imm = (((insn >> 11) & 3) << 4) | (((insn >> 7) & 0xf) << 6) |
                   (((insn >> 6) & 1) << 2) | (((insn >> 5) & 1) << 3);
-            return imm ? alu_ri(c, G(add_ri), rdp, 2, imm) : UNKNOWN;
+            return imm ? alu_ri(c, G(addi), rdp, 2, imm) : UNKNOWN;
         case 2: /* c.lw */
         case 6: /* c.sw */
             imm = (((insn >> 10) & 7) << 3) | (((insn >> 6) & 1) << 2) |
@@ -1033,7 +1097,7 @@ static int insn16(Ctx *c, uint32_t insn)
     case 1:
         switch (f3) {
         case 0: /* c.addi, c.nop */
-            return alu_ri(c, G(add_ri), rd, rd, imm6);
+            return alu_ri(c, G(addi), rd, rd, imm6);
         case 1: /* c.addiw */
             return rd ? alu_ri(c, G(addw_ri), rd, rd, imm6) : UNKNOWN;
         case 2: /* c.li */
@@ -1044,7 +1108,7 @@ static int insn16(Ctx *c, uint32_t insn)
                            (((insn >> 5) & 1) << 6) |
                            (((insn >> 3) & 3) << 7) |
                            (((insn >> 2) & 1) << 5), 10);
-                return imm ? alu_ri(c, G(add_ri), 2, 2, imm) : UNKNOWN;
+                return imm ? alu_ri(c, G(addi), 2, 2, imm) : UNKNOWN;
             }
             /* c.lui */
             return imm6 ? li(c, rd, imm6 << 12) : UNKNOWN;
@@ -1198,6 +1262,9 @@ int riscv_aok_translate_code(CPUState *cs, TranslationBlock *tb,
         if (r == UNKNOWN) {
             c.g.p = start;
             break;
+        }
+        if (rv_pairs_on) {
+            aok_gen_pair(&c.g, start, &rv_pairs);
         }
         aok_gen_insn_end(&c.g, c.page_off + c.off, c.insn);
         c.off += c.len;

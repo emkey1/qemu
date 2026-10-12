@@ -27,8 +27,9 @@
 #define DECL(name) void G(name)(void);
 
 /*
- * The integer gadgets are iSH-AOK's (gadgets-shared.S), under the names its
- * translator knows them by; the rest are this front end's own (gadgets.S).
+ * The integer gadgets, the loads and stores and the branches are iSH-AOK's
+ * (gadgets-shared.S), under the names its translator knows them by; the
+ * rest are this front end's own (gadgets.S).
  */
 #define ALU_BOTH(X) \
     X(add) X(and) X(or) X(xor) X(sll) X(srl) X(sra) X(slt) X(sltu) \
@@ -48,7 +49,7 @@
 #define DECL_RI(n) DECL(n##_ri)
 ALU_BOTH(DECL_RR) ALU_BOTH(DECL_RI) ALU_RR(DECL_RR) ALU_RI(DECL_RI)
 DECL(mov_const) DECL(addi)
-DECL(pcrel) DECL(fence) DECL(jalr) DECL(jalr_lookup) DECL(lookup)
+DECL(pcrel) DECL(fence) DECL(jalr) DECL(jalr_cached) DECL(lookup)
 DECL(call) DECL(call_exit)
 DECL(fadd_d) DECL(fsub_d) DECL(fmul_d) DECL(fdiv_d) DECL(fsqrt_d)
 DECL(fmadd_d) DECL(fmsub_d) DECL(fnmsub_d) DECL(fnmadd_d)
@@ -60,6 +61,8 @@ DECL(fsgnj_d) DECL(fsgnjn_d) DECL(fsgnjx_d)
 DECL(lb) DECL(lbu) DECL(lh) DECL(lhu) DECL(lw) DECL(lwu) DECL(ld) DECL(flw)
 DECL(sb) DECL(sh) DECL(sw) DECL(sd)
 DECL(beq) DECL(bne) DECL(blt) DECL(bge) DECL(bltu) DECL(bgeu)
+DECL(beq_bk) DECL(bne_bk) DECL(blt_bk) DECL(bge_bk) DECL(bltu_bk) DECL(bgeu_bk)
+DECL(b) DECL(jal_link)
 
 typedef void (*Gadget)(void);
 
@@ -144,36 +147,37 @@ static inline void aok_rv_sync(CPURISCVState *env, uint64_t pc, uint64_t insn)
     env->excp_uw2 = 0;
 }
 
-#define LOAD_HELPER(name, type, fn, mop)                                    \
-uint64_t aok_rv_helper_##name(CPURISCVState *env, uint64_t addr,           \
-                              uint64_t pc, uint64_t insn);                  \
-uint64_t aok_rv_helper_##name(CPURISCVState *env, uint64_t addr,           \
-                              uint64_t pc, uint64_t insn)                   \
+/*
+ * (One a size. A load's value comes back whole: the gadget extends it, as it
+ * extends what it reads on the fast path.)
+ */
+#define LOAD_HELPER(bits, fn, mop)                                          \
+uint64_t aok_rv_helper_load##bits(CPURISCVState *env, uint64_t addr,       \
+                                  uint64_t pc, uint64_t insn);              \
+uint64_t aok_rv_helper_load##bits(CPURISCVState *env, uint64_t addr,       \
+                                  uint64_t pc, uint64_t insn)               \
 {                                                                           \
     aok_rv_sync(env, pc, insn);                                             \
-    return (type)fn(env, addr, OI(env, mop), 0);                            \
+    return fn(env, addr, OI(env, mop), 0);                                  \
 }
-LOAD_HELPER(lb,  int8_t,   cpu_ldb_mmu, MO_UB)
-LOAD_HELPER(lbu, uint8_t,  cpu_ldb_mmu, MO_UB)
-LOAD_HELPER(lh,  int16_t,  cpu_ldw_mmu, MO_LEUW)
-LOAD_HELPER(lhu, uint16_t, cpu_ldw_mmu, MO_LEUW)
-LOAD_HELPER(lw,  int32_t,  cpu_ldl_mmu, MO_LEUL)
-LOAD_HELPER(lwu, uint32_t, cpu_ldl_mmu, MO_LEUL)
-LOAD_HELPER(ld,  uint64_t, cpu_ldq_mmu, MO_LEUQ)
+LOAD_HELPER(8,  cpu_ldb_mmu, MO_UB)
+LOAD_HELPER(16, cpu_ldw_mmu, MO_LEUW)
+LOAD_HELPER(32, cpu_ldl_mmu, MO_LEUL)
+LOAD_HELPER(64, cpu_ldq_mmu, MO_LEUQ)
 
-#define STORE_HELPER(name, fn, mop)                                         \
-void aok_rv_helper_##name(CPURISCVState *env, uint64_t addr, uint64_t val, \
-                          uint64_t pc, uint64_t insn);                      \
-void aok_rv_helper_##name(CPURISCVState *env, uint64_t addr, uint64_t val, \
-                          uint64_t pc, uint64_t insn)                       \
+#define STORE_HELPER(bits, fn, mop)                                         \
+void aok_rv_helper_store##bits(CPURISCVState *env, uint64_t addr,          \
+                               uint64_t val, uint64_t pc, uint64_t insn);   \
+void aok_rv_helper_store##bits(CPURISCVState *env, uint64_t addr,          \
+                               uint64_t val, uint64_t pc, uint64_t insn)    \
 {                                                                           \
     aok_rv_sync(env, pc, insn);                                             \
     fn(env, addr, val, OI(env, mop), 0);                                    \
 }
-STORE_HELPER(sb, cpu_stb_mmu, MO_UB)
-STORE_HELPER(sh, cpu_stw_mmu, MO_LEUW)
-STORE_HELPER(sw, cpu_stl_mmu, MO_LEUL)
-STORE_HELPER(sd, cpu_stq_mmu, MO_LEUQ)
+STORE_HELPER(8,  cpu_stb_mmu, MO_UB)
+STORE_HELPER(16, cpu_stw_mmu, MO_LEUW)
+STORE_HELPER(32, cpu_stl_mmu, MO_LEUL)
+STORE_HELPER(64, cpu_stq_mmu, MO_LEUQ)
 
 /*
  * The A extension, in C for now: one call does the whole insn. These are
@@ -487,6 +491,15 @@ static int addi(Ctx *c, unsigned rd, unsigned rs1, int64_t imm)
     return rs1 ? alu_ri(c, G(addi), rd, rs1, imm) : li(c, rd, imm);
 }
 
+/*
+ * The last operand of a load or store, the one the shared gadgets leave to
+ * their host: what the slow path needs to name the insn, should it fault.
+ */
+static inline uint64_t mem_word(Ctx *c)
+{
+    return (uint64_t)c->off << 32 | c->insn;
+}
+
 /* A load is done even into x0: it can fault, or read a device. */
 static int load_to(Ctx *c, Gadget gadget, uint64_t reg_off, unsigned rs1,
                    int64_t imm)
@@ -495,8 +508,7 @@ static int load_to(Ctx *c, Gadget gadget, uint64_t reg_off, unsigned rs1,
     aok_emit(&c->g, reg_off);
     aok_emit(&c->g, rs_off(rs1));
     aok_emit(&c->g, imm);
-    aok_emit(&c->g, c->off);
-    aok_emit(&c->g, c->insn);
+    aok_emit(&c->g, mem_word(c));
     return NEXT;
 }
 
@@ -512,8 +524,7 @@ static int store_from(Ctx *c, Gadget gadget, uint64_t reg_off, unsigned rs1,
     aok_emit(&c->g, reg_off);
     aok_emit(&c->g, rs_off(rs1));
     aok_emit(&c->g, imm);
-    aok_emit(&c->g, c->off);
-    aok_emit(&c->g, c->insn);
+    aok_emit(&c->g, mem_word(c));
     return NEXT;
 }
 
@@ -562,15 +573,33 @@ static void jump_operands(Ctx *c, int n, int64_t delta)
     }
 }
 
+/* (iSH-AOK's b: aok_gadget_goto under the name its pairs know) */
 static void jump(Ctx *c, int n, int64_t delta)
 {
-    aok_emit_gadget(&c->g, aok_gadget_goto);
+    aok_emit_gadget(&c->g, G(b));
     jump_operands(c, n, delta);
 }
 
-static int branch(Ctx *c, Gadget gadget, unsigned rs1, unsigned rs2,
+/*
+ * A conditional branch, by funct3. Each has two layouts, as in iSH-AOK: a
+ * backward branch (a loop: mostly taken) gets the one whose taken way is the
+ * straight line.
+ */
+static int branch(Ctx *c, unsigned f3, unsigned rs1, unsigned rs2,
                   int64_t imm)
 {
+    static const Gadget fw[8] = {
+        G(beq), G(bne), NULL, NULL, G(blt), G(bge), G(bltu), G(bgeu),
+    };
+    static const Gadget bk[8] = {
+        G(beq_bk), G(bne_bk), NULL, NULL,
+        G(blt_bk), G(bge_bk), G(bltu_bk), G(bgeu_bk),
+    };
+    Gadget gadget = (imm < 0 ? bk : fw)[f3];
+
+    if (!gadget) {
+        return UNKNOWN;
+    }
     aok_emit_gadget(&c->g, gadget);
     aok_emit(&c->g, rs_off(rs1));
     aok_emit(&c->g, rs_off(rs2));
@@ -582,17 +611,20 @@ static int branch(Ctx *c, Gadget gadget, unsigned rs1, unsigned rs2,
 static int jal(Ctx *c, unsigned rd, int64_t imm)
 {
     if (rd) {
-        aok_emit_gadget(&c->g, G(pcrel));
+        /* A call: the link and the jump in one gadget. */
+        aok_emit_gadget(&c->g, G(jal_link));
         aok_emit(&c->g, rd_off(rd));
         aok_emit(&c->g, c->off + c->len);
+        jump_operands(c, 0, c->off + imm);
+    } else {
+        jump(c, 0, c->off + imm);
     }
-    jump(c, 0, c->off + imm);
     return END;
 }
 
 static int jalr(Ctx *c, unsigned rd, unsigned rs1, int64_t imm)
 {
-    aok_emit_gadget(&c->g, c->no_goto_ptr ? G(jalr) : G(jalr_lookup));
+    aok_emit_gadget(&c->g, c->no_goto_ptr ? G(jalr) : G(jalr_cached));
     aok_emit(&c->g, rd_off(rd));
     aok_emit(&c->g, rs_off(rs1));
     aok_emit(&c->g, imm);
@@ -983,9 +1015,6 @@ static int insn32(Ctx *c, uint32_t insn)
         G(lb), G(lh), G(lw), G(ld), G(lbu), G(lhu), G(lwu), NULL,
     };
     static const Gadget stores[8] = { G(sb), G(sh), G(sw), G(sd) };
-    static const Gadget branches[8] = {
-        G(beq), G(bne), NULL, NULL, G(blt), G(bge), G(bltu), G(bgeu),
-    };
     unsigned rd = (insn >> 7) & 31, rs1 = (insn >> 15) & 31;
     unsigned rs2 = (insn >> 20) & 31, f3 = (insn >> 12) & 7;
 
@@ -1007,10 +1036,7 @@ static int insn32(Ctx *c, uint32_t insn)
     case 0x67: /* jalr */
         return f3 == 0 ? jalr(c, rd, rs1, sext(insn >> 20, 12)) : UNKNOWN;
     case 0x63: /* branches */
-        if (!branches[f3]) {
-            return UNKNOWN;
-        }
-        return branch(c, branches[f3], rs1, rs2,
+        return branch(c, f3, rs1, rs2,
                       sext((((insn >> 31) & 1) << 12) |
                            (((insn >> 7) & 1) << 11) |
                            (((insn >> 25) & 0x3f) << 5) |
@@ -1143,7 +1169,7 @@ static int insn16(Ctx *c, uint32_t insn)
             imm = sext((b12 << 8) | (((insn >> 10) & 3) << 3) |
                        (((insn >> 5) & 3) << 6) | (((insn >> 3) & 3) << 1) |
                        (((insn >> 2) & 1) << 5), 9);
-            return branch(c, f3 == 6 ? G(beq) : G(bne), rs1p, 0, imm);
+            return branch(c, f3 == 6 ? 0 : 1, rs1p, 0, imm);
         }
         return UNKNOWN;
     case 2:
@@ -1282,7 +1308,13 @@ int riscv_aok_translate_code(CPUState *cs, TranslationBlock *tb,
         return 0;
     }
     if (r != END) {
+        /* Not an insn, but a gadget like another to the insn before it. */
+        uint64_t *start = c.g.p;
+
         jump(&c, 0, c.off);
+        if (rv_pairs_on) {
+            aok_gen_pair(&c.g, start, &rv_pairs);
+        }
     }
     return aok_gen_finish(&c.g, c.off);
 }

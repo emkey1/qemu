@@ -135,14 +135,27 @@ pairs exist is a list too, measured there from what programs execute.
 Gadgets shared with iSH-AOK
 ===========================
 
-RISC-V's integer gadgets that touch nothing but guest registers, and the
-pairs made of them, are not written in this tree. ``shared/alu.S``,
-``shared/frag.h`` and ``shared/pairs.h`` are iSH-AOK's
+RISC-V's integer gadgets, its loads and stores, its branches and direct
+jumps, and the pairs made of them are not written in this tree.
+``shared/alu.S``, ``shared/frag.h`` and ``shared/pairs.h`` are iSH-AOK's
 ``jit/guest-riscv64`` files of those names, unchanged, and
 ``gadgets-shared.S`` assembles them with this tree's definitions of what they
-ask of a host: the registers for the CPU state and the stream, how a gadget
-begins and ends, and which of the gadgets the pair list names exist here.
-``frag.h`` states that contract under "A second host".
+ask of a host. ``frag.h`` states that contract under "A second host":
+
+* the registers for the CPU state and the stream, and how a gadget begins
+  and ends;
+* guest memory: a load or store body computes the address and makes the
+  access, and between the two the host turns the guest address into a host
+  one (``read_prep``, ``write_prep``). Here that is the softmmu fast path,
+  and on a miss cputlb does the whole access in C and the body's own access
+  is made of a scratch word instead;
+* how a TB is left (``branch_leave``): here ``aok_gadget_goto``'s code, a
+  copy for each way out, so that each ends in an indirect branch of its own;
+* which of the gadgets the pair list names exist here.
+
+``jalr`` is this tree's own, since it ends in a TB lookup, but it is written
+as a body under the name of iSH-AOK's ``jalr_cached``, and so takes the pairs
+that end in that.
 
 ``scripts/aok-gadgets-sync.sh [CHECKOUT]`` copies the three files from a
 checkout of iSH-AOK and writes ``shared/host-gadgets.h`` (which gadgets exist
@@ -151,26 +164,28 @@ here, read off the assembled object) and ``shared/SOURCE`` (the commit).
 change iSH-AOK and copy again, so that a gadget improved or a pair added
 there arrives here with nothing ported by hand.
 
-``translate.c`` reads ``pairs.h`` as iSH-AOK's translator does, less the
-pairs with a half this front end lacks. Today that is the pairs of two
-integer gadgets, 118 of the 332. The rest have a load, a store or a branch in
-them, which here go through the softmmu TLB and QEMU's TB linking and are
-this tree's own (``gadgets.S``); written as bodies under the same contract,
-they would bring their pairs with them.
+``translate.c`` reads ``pairs.h`` as iSH-AOK's translator does. All 332 pairs
+are built. Not all can occur yet: iSH-AOK's translator also folds a few
+two-instruction idioms into one gadget (a shift pair, a shift and an add, a
+constant or a bit test and the branch on it), which this one does not, and
+the pairs that name those gadgets wait for that.
 
-In host CPU cycles on an Apple M5, same guest and programs as above, with the
-pairs and with ``QEMU_AOK_NO_PAIRS=1`` (three interleaved runs of each):
+In host CPU cycles on an Apple M5, same guest and programs as above, without
+pairs (``QEMU_AOK_NO_PAIRS=1``) and with them, five interleaved runs of each:
 
 ==================== ============ ========== =======
 Workload             Without      With pairs Ratio
 ==================== ============ ========== =======
-CoreMark             6.60 G       6.37 G     1.036
-n-body (doubles)     3.40 G       3.39 G     1.000
-Python               13.18 G      12.20 G    1.080
-xz -3                5.52 G       5.28 G     1.046
-sha256sum            3.35 G       3.22 G     1.039
-awk                  5.26 G       4.96 G     1.062
+CoreMark             6.72 G       6.23 G     1.080
+n-body (doubles)     3.37 G       3.25 G     1.035
+Python               12.92 G      11.80 G    1.095
+xz -3                5.58 G       4.88 G     1.144
+sha256sum            3.36 G       3.09 G     1.087
+awk                  5.02 G       4.65 G     1.080
 ==================== ============ ========== =======
+
+In a guest boot and those programs, 220,000 pairs were fused out of 697,000
+translated instructions, 66,000 of them forwarding a register.
 
 Rules a front end must keep
 ===========================
@@ -251,7 +266,7 @@ with the C extension. It stays within its page.
 Testing
 =======
 
-The reference for a stream is TCG in the same binary (``QEMU_AOK=0``). Two
+The reference for a stream is TCG in the same binary (``QEMU_AOK=0``). Three
 guest-side transcripts have been used, each compared between the two:
 
 * a set of programs whose output must be identical: CoreMark's checksums,
@@ -261,4 +276,11 @@ guest-side transcripts have been used, each compared between the two:
   awkward operands in all four rounding modes and hashes every result's bits
   together with the exception flags it raised.
 
-Both are identical with one guest CPU and with four.
+* a memory test: every access size at every alignment and across a page
+  boundary, and pointer walks over pages that fault on first touch and are
+  restarted by a signal handler that hashes each fault's address and pc. A
+  pair that repeated its first instruction after a fault in its second, or
+  reported the wrong one, changes it.
+
+All three are identical with one guest CPU and with four, with pairs, without
+them, and with forwarding off.

@@ -562,14 +562,35 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
 
     if (ss.resource_id) {
         struct virgl_renderer_resource_info info;
-        void *d3d_tex2d = NULL;
+        ScanoutTextureNative native = NO_NATIVE_TEXTURE;
 
 #if VIRGL_VERSION_MAJOR >= 1
         struct virgl_renderer_resource_info_ext ext;
         memset(&ext, 0, sizeof(ext));
         ret = virgl_renderer_resource_get_info_ext(ss.resource_id, &ext);
         info = ext.base;
-        d3d_tex2d = ext.d3d_tex2d;
+        if (ext.d3d_tex2d) {
+            native = (ScanoutTextureNative){
+                .type = SCANOUT_TEXTURE_NATIVE_TYPE_D3D,
+                .handle = ext.d3d_tex2d,
+            };
+        }
+#if defined(HAVE_VIRGL_RENDERER_NATIVE_SCANOUT) && defined(CONFIG_METAL)
+        /*
+         * A virglrenderer that draws on Metal (ANGLE) names the resource's
+         * Metal texture, and that is what the display has to be given: the
+         * GL texture id alone shows what was uploaded to the resource (the
+         * text console's dumb buffer) and nothing a guest context rendered
+         * into it, so every GL program and compositor was a black screen.
+         */
+        if (!ret && ext.version >= VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION &&
+            ext.native_type == VIRGL_NATIVE_HANDLE_METAL_TEXTURE) {
+            native = (ScanoutTextureNative){
+                .type = SCANOUT_TEXTURE_NATIVE_TYPE_METAL,
+                .handle = ext.native_handle,
+            };
+        }
+#endif
 #else
         memset(&info, 0, sizeof(info));
         ret = virgl_renderer_resource_get_info(ss.resource_id, &info);
@@ -594,11 +615,7 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
             info.flags & VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP,
             info.width, info.height,
             ss.r.x, ss.r.y, ss.r.width, ss.r.height,
-            d3d_tex2d ? (ScanoutTextureNative){
-                            .type = SCANOUT_TEXTURE_NATIVE_TYPE_D3D,
-                            .handle = d3d_tex2d,
-                        } : NO_NATIVE_TEXTURE,
-            NULL);
+            native, NULL);
     } else {
         qemu_console_set_surface(g->parent_obj.scanout[ss.scanout_id].con, NULL);
         qemu_console_gl_scanout_disable(g->parent_obj.scanout[ss.scanout_id].con);
@@ -1457,11 +1474,14 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
 #endif
     }
 #endif
-#ifdef VIRGL_RENDERER_D3D11_SHARE_TEXTURE
+    /* (ANGLE on D3D11 or on Metal: scanouts are the device's own textures) */
     if (qemu_egl_angle_native_device) {
+#if defined(VIRGL_RENDERER_NATIVE_SHARE_TEXTURE)
+        flags |= VIRGL_RENDERER_NATIVE_SHARE_TEXTURE;
+#elif defined(VIRGL_RENDERER_D3D11_SHARE_TEXTURE)
         flags |= VIRGL_RENDERER_D3D11_SHARE_TEXTURE;
-    }
 #endif
+    }
 #if VIRGL_VERSION_MAJOR >= 1
     if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
         flags |= VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER;

@@ -41,8 +41,18 @@
      VIRGL_VERSION_MICRO >= (micro))
 #endif
 
+/*
+ * Not on a Darwin host. A fixed mapping has to start on a host page, and a
+ * guest hands out the host-visible region in pages of its own: 4K ones on
+ * hosts whose pages are 16K. The first venus ring that landed between two
+ * host pages ("offset 0x21000") failed with EINVAL, which is not the error
+ * that falls back, and the guest had no Vulkan device. Blobs are mapped as
+ * subregions there, as they were before fixed mappings existed, and the
+ * region needs no backing of its own (virtio-gpu-gl.c).
+ */
 #define VIRGL_HAS_MAP_FIXED \
-    (VIRGL_CHECK_VERSION(1, 3, 0) && !IS_ENABLED(CONFIG_WIN32))
+    (VIRGL_CHECK_VERSION(1, 3, 0) && !IS_ENABLED(CONFIG_WIN32) && \
+     !IS_ENABLED(CONFIG_DARWIN))
 
 struct virtio_gpu_virgl_resource {
     struct virtio_gpu_simple_resource base;

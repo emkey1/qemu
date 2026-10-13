@@ -109,7 +109,7 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
     ERRP_GUARD();
     VirtIOGPUBase *b = VIRTIO_GPU_BASE(qdev);
     VirtIOGPU *g = VIRTIO_GPU(b);
-#if !defined(CONFIG_WIN32)
+#if !defined(CONFIG_WIN32) && !defined(CONFIG_DARWIN)
     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
     void *map;
 #endif
@@ -127,19 +127,16 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
 #ifdef CONFIG_IOSURFACE
     /*
      * UTM's front end asks for Vulkan (venus), Direct3D (neptune) and the
-     * blob resources they need whenever its settings allow them. Those rest
-     * on parts of UTM's QEMU fork that this tree does not have yet: its
-     * in-process render server and Metal-backed host memory. OpenGL through
-     * virgl needs none of them, so run with that rather than refuse to start.
+     * blob resources they need whenever its settings allow them. Venus is
+     * QEMU's own from here on; UTM's virglrenderer runs its render server
+     * as a thread where a process cannot be started. Neptune rests on parts
+     * of UTM's QEMU fork that this tree does not have, so run without it
+     * rather than refuse to start.
      */
-    if (virtio_gpu_venus_enabled(b->conf) || virtio_gpu_neptune_enabled(b->conf) ||
-        virtio_gpu_blob_enabled(b->conf)) {
-        warn_report("virtio-gpu: venus, neptune and blob resources are not "
-                    "available in this build; continuing with OpenGL only");
-        b->conf.flags &= ~((1 << VIRTIO_GPU_FLAG_VENUS_ENABLED) |
-                           (1 << VIRTIO_GPU_FLAG_NEPTUNE_ENABLED) |
-                           (1 << VIRTIO_GPU_FLAG_BLOB_ENABLED));
-        b->conf.hostmem = 0;
+    if (virtio_gpu_neptune_enabled(b->conf)) {
+        warn_report("virtio-gpu: neptune (Direct3D) is not available in this "
+                    "build; continuing without it");
+        b->conf.flags &= ~(1 << VIRTIO_GPU_FLAG_NEPTUNE_ENABLED);
     }
 #endif
 
@@ -161,7 +158,13 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
     g->parent_obj.conf.flags |= 1 << VIRTIO_GPU_FLAG_CONTEXT_INIT_ENABLED;
 #endif
 
-#if !defined(CONFIG_WIN32)
+    /*
+     * Backing for the whole host-visible region, for blobs mapped at fixed
+     * addresses in it. Not where they are not (VIRGL_HAS_MAP_FIXED): there
+     * it would only be address space, 8G of it as UTM asks, which an iOS
+     * process may not get.
+     */
+#if !defined(CONFIG_WIN32) && !defined(CONFIG_DARWIN)
     if (virtio_gpu_hostmem_enabled(b->conf)) {
         map = qemu_ram_mmap(-1, b->conf.hostmem, qemu_real_host_page_size(),
                             0, 0);

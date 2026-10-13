@@ -161,6 +161,7 @@ const TCGCPUOps x86_tcg_ops = {
 #ifdef X86_AOK
     .aok_translate_code = x86_aok_translate_code,
     .aok_pc_offset = offsetof(CPUX86State, eip),
+    .aok_fold_fpsr = x86_aok_fold_fpsr,
 #endif
     .get_tb_cpu_state = x86_get_tb_cpu_state,
     .synchronize_from_tb = x86_cpu_synchronize_from_tb,

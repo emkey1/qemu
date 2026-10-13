@@ -9,5 +9,6 @@
 
 int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
                            int *max_insns, vaddr pc, void *host_pc);
+void x86_aok_fold_fpsr(CPUState *cs, uint32_t fpsr);
 
 #endif

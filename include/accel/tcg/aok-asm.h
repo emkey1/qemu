@@ -71,6 +71,59 @@ _ip      .req x28
     br x9
 .endm
 
+/*
+ * The body of a front end's lookup gadget, entered with the pc to go to in
+ * x10 (and stored) and _ip at the two operands, [flags | cflags << 32]
+ * [cs_base] of the TB the gadget is in. It is tb_lookup()'s first step: the
+ * pc is hashed as tb_jmp_cache_hash_func() hashes it and both ways of
+ * cpu->tb_jmp_cache are read; a TB there with these flags is jumped to, as
+ * aok_goto_tail jumps, if it is a stream. Which is sound because nothing a
+ * stream executes changes the flags. Anything else is aok_lookup_slow's.
+ *
+ * The second way is tried also when the first has the pc under other flags:
+ * a kernel's code may run under two sets of them (x86: with the ss of a
+ * syscall and with the null one an interrupt leaves), and then the two TBs
+ * of one pc sit side by side.
+ */
+.macro aok_lookup_jc
+    ldr x11, [_bps]
+    eor x12, x10, x10, lsr #5
+    cbnz x11, 3f
+    lsr x13, x12, #5
+    and x12, x12, #0x7f
+    and x13, x13, #0x3f80
+    orr x12, x12, x13               /* the hash */
+    ldp x11, x9, [_ip]              /* what the TB must have */
+    add x13, _jc, x12, lsl #4
+    ldp x14, x15, [x13, #16]        /* tb, pc */
+    cmp x15, x10
+    b.ne 2f
+    cbz x14, 2f
+    ldp x15, x16, [x14, #8]         /* cs_base, flags | cflags << 32 */
+    cmp x16, x11
+    ccmp x15, x9, #0, eq
+    b.eq 5f
+2:  eor x12, x12, #1                /* the other way */
+    add x13, _jc, x12, lsl #4
+    ldp x14, x15, [x13, #16]
+    cmp x15, x10
+    b.ne 3f
+    cbz x14, 3f
+    ldp x15, x16, [x14, #8]
+    cmp x16, x11
+    ccmp x15, x9, #0, eq
+    b.ne 3f
+5:  ldrb w17, [x14, #28]            /* aok */
+    cbz w17, 3f
+    ldr w11, [_exitreq]
+    ldr _ip, [x14, #32]             /* tc.ptr */
+    mov _pc, x10
+    tbnz w11, #31, 4f
+    gret AOK_ENTER_WORDS
+3:  b SYM(aok_lookup_slow)
+4:  b SYM(aok_exit_requested)
+.endm
+
 /* (a file of gadgets under another prefix defines its own: AOK_ASM_OWN_GADGET) */
 #ifndef AOK_ASM_OWN_GADGET
 .macro .gadget name

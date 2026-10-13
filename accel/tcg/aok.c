@@ -99,6 +99,11 @@ static void aok_print_stats(void)
             "jump cache had, %" PRIu64 " of them under other flags and %"
             PRIu64 " other cflags\n", aok_stats.lookup_cached,
             aok_stats.lookup_cached_flags, aok_stats.lookup_cached_cflags);
+    fprintf(stderr, "aok: streams came back by an unlinked slot %" PRIu64
+            " times (%" PRIu64 " into a TB of two pages), for an exit "
+            "request %" PRIu64 ", otherwise %" PRIu64 "\n",
+            aok_stats.ret_slot, aok_stats.two_page, aok_stats.ret_request,
+            aok_stats.ret_none);
     if (aok_stats.lookup_cached_flags) {
         fprintf(stderr, "aok: the flags that differed, by bit:");
         for (int i = 0; i < 32; i++) {
@@ -322,8 +327,13 @@ int aok_gen_finish(AokGen *g, unsigned guest_size)
             aok_emit(g, tb_rx | n);
         }
     }
-    if (g->n_fix) {
-        /* One stub, and one word holding its address, for all of them. */
+    if (g->n_fix || tb->jmp_reset_offset[0] != TB_JMP_OFFSET_INVALID ||
+        tb->jmp_reset_offset[1] != TB_JMP_OFFSET_INVALID) {
+        /*
+         * One stub, and one word holding its address, for all of them. It
+         * comes right after the slots' stubs, where the main loop finds it
+         * for a slot whose TB may not be linked (aok_slot_to_lookup).
+         */
         const uint64_t *stub = g->rx + (g->p - g->base);
 
         if (tb_cflags(tb) & CF_NO_GOTO_PTR) {

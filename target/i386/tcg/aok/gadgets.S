@@ -685,8 +685,74 @@ alu_mem_forms1 \op, \store, \name, ea, 16, \sfx
 alu_mem_forms1 \op, \store, \name, ea, 32, \sfx
 alu_mem_forms1 \op, \store, \name, ea, 64, \sfx
 .endm
+/*
+ * The XMM registers. A load of all of one, and a store: [register] and the
+ * address. The ones called "a" are for an operand that must be aligned,
+ * which the fast path sees and anything else leaves to C, to raise what is
+ * due. Loads of the low 32 and 64 bits that clear the rest.
+ */
+.macro g_vload name, form, aligned
+.gadget \name
+    ldr x8, [_ip]
+    mem_begin \form, 1
+    x86_probe 128, \name, TLBE_READ
+    ldr q16, [_addr]
+    ld_barrier
+    str q16, [_cpu, x8]
+    gret_ahead
+miss_\name:
+    .if \aligned == 0
+    x86_unaligned 128, \name
+    .endif
+    add x9, x29, #AOK_FRAME_SCRATCH
+    x86_call_slow aok_x86_helper_ld, x9
+    add _addr, x29, #AOK_FRAME_SCRATCH
+    b back_\name
+.endm
+.macro g_vstore name, form, aligned
+.gadget \name
+    ldr x8, [_ip]
+    mem_begin \form, 1
+    ldr q16, [_cpu, x8]
+    x86_probe 128, \name, TLBE_WRITE
+    st_barrier
+    str q16, [_addr]
+    gret_ahead
+miss_\name:
+    .if \aligned == 0
+    x86_unaligned 128, \name
+    .endif
+    stur q16, [x29, #AOK_FRAME_SCRATCH]
+    add x9, x29, #AOK_FRAME_SCRATCH
+    x86_call_slow aok_x86_helper_vst, x9
+    add _addr, x29, #AOK_FRAME_SCRATCH
+    b back_\name
+.endm
+.macro g_vloadz name, bits, form, ldinsn:vararg
+.gadget \name
+    ldr x8, [_ip]
+    mem_begin \form, 1
+    x86_probe \bits, \name, TLBE_READ
+    \ldinsn, [_addr]
+    ld_barrier
+    add x9, _cpu, x8
+    stp x17, xzr, [x9]
+    gret_ahead
+    x86_slow_ld \bits, \name
+.endm
+.macro vloads_stores1 form, sfx
+g_vload vload128_\form\sfx, \form, 0
+g_vload vload128a_\form\sfx, \form, 1
+g_vstore vstore128_\form\sfx, \form, 0
+g_vstore vstore128a_\form\sfx, \form, 1
+g_vloadz vload32z_\form\sfx, 32, \form, ldr w17
+g_vloadz vload64z_\form\sfx, 64, \form, ldr x17
+.endm
+
 .macro all_mem sfx
 loads_stores \sfx
+vloads_stores1 bd, \sfx
+vloads_stores1 ea, \sfx
 alu_mem_forms add, 1, add, \sfx
 alu_mem_forms or, 1, or, \sfx
 alu_mem_forms and, 1, and, \sfx
@@ -1105,6 +1171,138 @@ g_bitscan lzcnt64, lzcnt, x, (AOK_CC_OP_BMILG + 3)
     dmb ish
     gret
 
+/* ---- SSE: moves and the integer operations ----------------------------------
+ *
+ * Between registers: [destination][source], offsets of sixteen bytes.
+ */
+.gadget vmov128
+    ldp x8, x9, [_ip]
+    ldr q16, [_cpu, x9]
+    str q16, [_cpu, x8]
+    gret 2
+/* The low 32 bits, the rest staying (movss). */
+.gadget vmov32
+    ldp x8, x9, [_ip]
+    ldr w12, [_cpu, x9]
+    str w12, [_cpu, x8]
+    gret 2
+/* The low 64 and the low 32, the rest cleared (movq, movd). */
+.gadget vmovq
+    ldp x8, x9, [_ip]
+    ldr x12, [_cpu, x9]
+    add x8, _cpu, x8
+    stp x12, xzr, [x8]
+    gret 2
+.gadget vmovd
+    ldp x8, x9, [_ip]
+    ldr w12, [_cpu, x9]
+    add x8, _cpu, x8
+    stp x12, xzr, [x8]
+    gret 2
+
+/*
+ * An operation of two operands: [destination][source][thunk]. The thunk
+ * is the host's insn for it, on v0 and v1 into v0, and a ret.
+ */
+.gadget vop
+    ldp x8, x9, [_ip]
+    ldr x10, [_ip, #16]
+    ldr q0, [_cpu, x8]
+    ldr q1, [_cpu, x9]
+    blr x10
+    str q0, [_cpu, x8]
+    gret 3
+/* A shift of every lane by a count: [register][thunk][count, signed] */
+.gadget vshift
+    ldp x8, x10, [_ip]
+    ldr x9, [_ip, #16]
+    ldr q0, [_cpu, x8]
+    blr x10
+    str q0, [_cpu, x8]
+    gret 3
+/*
+ * A choice of bytes: [destination][source][sixteen indices, two words]. An
+ * index past the source gives zero, which makes the shifts by bytes too.
+ */
+.gadget vtbl
+    ldp x8, x9, [_ip]
+    ldr q2, [_ip, #16]
+    ldr q1, [_cpu, x9]
+    tbl v0.16b, {v1.16b}, v2.16b
+    str q0, [_cpu, x8]
+    gret 4
+/* The same of two sources: [destination][its other half][indices] */
+.gadget vtbl2
+    ldp x8, x9, [_ip]
+    ldr q2, [_ip, #16]
+    ldr q0, [_cpu, x8]
+    ldr q1, [_cpu, x9]
+    tbl v3.16b, {v0.16b, v1.16b}, v2.16b
+    str q3, [_cpu, x8]
+    gret 4
+/* pmovmskb: [destination, a general register][source] */
+.gadget pmovmskb
+    ldp x8, x9, [_ip]
+    ldr q0, [_cpu, x9]
+    ushr v0.16b, v0.16b, #7
+    usra v0.8h, v0.8h, #7
+    usra v0.4s, v0.4s, #14
+    usra v0.2d, v0.2d, #28
+    umov w10, v0.b[0]
+    umov w11, v0.b[8]
+    orr w10, w10, w11, lsl #8
+    str x10, [_cpu, x8]
+    gret 2
+
+.macro thunk name, insn:vararg
+    .balign 8
+    .globl SYM(aok_x86_thunk_\name)
+SYM(aok_x86_thunk_\name):
+    \insn
+    ret
+.endm
+thunk xor, eor v0.16b, v0.16b, v1.16b
+thunk or, orr v0.16b, v0.16b, v1.16b
+thunk and, and v0.16b, v0.16b, v1.16b
+thunk andn, bic v0.16b, v1.16b, v0.16b
+.irp op, cmeq, cmgt, add, sub
+thunk \op\()b, \op v0.16b, v0.16b, v1.16b
+thunk \op\()w, \op v0.8h, v0.8h, v1.8h
+thunk \op\()d, \op v0.4s, v0.4s, v1.4s
+.endr
+thunk addq, add v0.2d, v0.2d, v1.2d
+thunk subq, sub v0.2d, v0.2d, v1.2d
+.irp op, uqadd, sqadd, uqsub, sqsub, urhadd
+thunk \op\()b, \op v0.16b, v0.16b, v1.16b
+thunk \op\()w, \op v0.8h, v0.8h, v1.8h
+.endr
+thunk uminb, umin v0.16b, v0.16b, v1.16b
+thunk umaxb, umax v0.16b, v0.16b, v1.16b
+thunk sminw, smin v0.8h, v0.8h, v1.8h
+thunk smaxw, smax v0.8h, v0.8h, v1.8h
+thunk mulw, mul v0.8h, v0.8h, v1.8h
+.irp op, zip1, zip2
+thunk \op\()b, \op v0.16b, v0.16b, v1.16b
+thunk \op\()w, \op v0.8h, v0.8h, v1.8h
+thunk \op\()d, \op v0.4s, v0.4s, v1.4s
+thunk \op\()q, \op v0.2d, v0.2d, v1.2d
+.endr
+/* The shifts: the count is in w9, negative to the right. */
+.macro thunk_shift name, op, lanes, r
+    .balign 16
+    .globl SYM(aok_x86_thunk_\name)
+SYM(aok_x86_thunk_\name):
+    dup v1.\lanes, \r\()9
+    \op v0.\lanes, v0.\lanes, v1.\lanes
+    ret
+.endm
+thunk_shift ushlw, ushl, 8h, w
+thunk_shift ushld, ushl, 4s, w
+thunk_shift ushlq, ushl, 2d, x
+thunk_shift sshlw, sshl, 8h, w
+thunk_shift sshld, sshl, 4s, w
+    .balign 16
+
 /* ---- Conditions ------------------------------------------------------------
  *
  * hf: make the host's flags the guest's again from the lazy state, for a
@@ -1401,49 +1599,7 @@ all_stack _mp
     /* (entered here with env->eip in x10 and _ip at the two operands) */
     .globl SYM(aok_x86_lookup_pc)
 SYM(aok_x86_lookup_pc):
-    ldr x11, [_bps]
-    eor x12, x10, x10, lsr #5
-    cbnz x11, 3f
-    lsr x13, x12, #5
-    and x12, x12, #0x7f
-    and x13, x13, #0x3f80
-    orr x12, x12, x13               /* the hash */
-    ldp x11, x9, [_ip]              /* what the TB must have */
-    add x13, _jc, x12, lsl #4
-    ldp x14, x15, [x13, #16]        /* tb, pc */
-    cmp x15, x10
-    b.ne 2f
-    cbz x14, 2f
-    ldp x15, x16, [x14, #8]         /* cs_base, flags | cflags << 32 */
-    cmp x16, x11
-    ccmp x15, x9, #0, eq
-    b.eq 5f
-    /*
-     * The other way. It is tried also when the first has the pc and other
-     * flags: kernel code runs with an ss from a syscall and with the null
-     * one an interrupt leaves, which is a bit of the flags (HF_SS32), so
-     * the two TBs of one pc sit side by side.
-     */
-2:  eor x12, x12, #1
-    add x13, _jc, x12, lsl #4
-    ldp x14, x15, [x13, #16]
-    cmp x15, x10
-    b.ne 3f
-    cbz x14, 3f
-    ldp x15, x16, [x14, #8]
-    cmp x16, x11
-    ccmp x15, x9, #0, eq
-    b.ne 3f
-5:  ldrb w17, [x14, #28]            /* aok */
-    cbz w17, 3f
-    /* A jump between streams, as aok_goto_tail makes it. */
-    ldr w11, [_exitreq]
-    ldr _ip, [x14, #32]             /* tc.ptr */
-    mov _pc, x10
-    tbnz w11, #31, 4f
-    gret AOK_ENTER_WORDS
-3:  b SYM(aok_lookup_slow)
-4:  b SYM(aok_exit_requested)
+    aok_lookup_jc
 
 /* ---- Instructions that are a call to C -------------------------------------
  *
@@ -1483,6 +1639,333 @@ SYM(aok_x86_lookup_pc):
     cbnz x0, 1f
     gret 4
 1:  mov x0, #0
+    b SYM(aok_exit)
+/*
+ * Arithmetic in floating point is QEMU's helpers', which are exact: [fn]
+ * and offsets of what they take by address, fn(env, env + a, env + b,
+ * env + c). They raise nothing. The second is for comis and ucomis, which
+ * leave the flags in cc_src as CC_OP_EFLAGS.
+ */
+.gadget call_h3
+    aok_fp_end
+    ldp x9, x1, [_ip]
+    ldp x2, x3, [_ip, #16]
+    mov x0, _cpu
+    add x1, _cpu, x1
+    add x2, _cpu, x2
+    add x3, _cpu, x3
+    blr x9
+    gret 4
+.gadget call_h3cc
+    aok_fp_end
+    ldp x9, x1, [_ip]
+    ldp x2, x3, [_ip, #16]
+    mov x0, _cpu
+    add x1, _cpu, x1
+    add x2, _cpu, x2
+    add x3, _cpu, x3
+    blr x9
+    str wzr, [_cpu, #AOK_X86_ENV_CC_OP]
+    gret 4
+/* [fn][a][source]: fn(env, env + a, the eight bytes at the source) */
+.gadget call_hval
+    aok_fp_end
+    ldp x9, x1, [_ip]
+    ldr x2, [_ip, #16]
+    mov x0, _cpu
+    add x1, _cpu, x1
+    ldr x2, [_cpu, x2]
+    blr x9
+    gret 3
+/* [fn][destination][a]: a general register = fn(env, env + a), 32 or 64 bits */
+.gadget call_hret32
+    aok_fp_end
+    ldp x9, x8, [_ip]
+    ldr x1, [_ip, #16]
+    mov x0, _cpu
+    add x1, _cpu, x1
+    blr x9
+    ldr x8, [_ip, #8]
+    mov w0, w0
+    str x0, [_cpu, x8]
+    gret 3
+.gadget call_hret64
+    aok_fp_end
+    ldp x9, x8, [_ip]
+    ldr x1, [_ip, #16]
+    mov x0, _cpu
+    add x1, _cpu, x1
+    blr x9
+    ldr x8, [_ip, #8]
+    str x0, [_cpu, x8]
+    gret 3
+
+/* ---- SSE arithmetic on doubles, on the host's FP unit ---------------------
+ *
+ * Each of these has the operands of call_h3 and is also that: [fn][d][d][s]
+ * (or as said), fn QEMU's helper for the insn, which is softfloat. The
+ * gadget does the cases where the host gives softfloat's answer, flags
+ * included, and calls fn for the rest. What differs between AArch64 and
+ * SSE, and what is done about it:
+ *
+ *   MXCSR. The host rounds to nearest even, and QEMU never changes that.
+ *   _fpok says MXCSR asks for the same and for nothing else (no DAZ, no
+ *   FZ); it is found when a stream first uses the FP unit, and nothing can
+ *   change MXCSR without a call to C, which ends that use (aok_fp_end).
+ *
+ *   Denormal operands raise a flag of their own in SSE (DE) and none in
+ *   AArch64: an operand must be a normal number or a zero.
+ *
+ *   NaNs. SSE's rule for which operand's NaN a result is, and the sign of
+ *   the NaN an invalid operation makes, are not AArch64's. An operand that
+ *   is a NaN or an infinity is fn's, and so is a result that is either:
+ *   that leaves overflow, invalid and division by zero to softfloat too.
+ *
+ *   Underflow. SSE detects tininess after rounding and AArch64 before. A
+ *   product or quotient below the smallest normal, or equal to it, is fn's
+ *   unless an operand shows it is an exact zero; sums that small are exact.
+ *
+ * So the only flag the host can have raised for an insn it completed is
+ * inexact, and that is all x86_aok_fold_fpsr() takes from its FPSR.
+ */
+
+/* The stream's first use of the FP unit since it last called C. */
+.macro x86_fp_begin again
+    mov x0, _cpu
+    bl SYM(aok_x86_fp_begin)
+    mov _fpok, x0
+    mov _fpact, #1
+    b \again
+.endm
+
+/* To \soft unless the double whose bits are \reg is normal or a zero. */
+.macro x86_fp_operand reg, soft
+    ubfx x13, \reg, #52, #11
+    sub w13, w13, #1
+    cmp w13, #0x7fd
+    b.ls 1f
+    lsl x14, \reg, #1
+    cbnz x14, \soft
+1:
+.endm
+
+/* The call of fn, as call_h3 makes it. */
+.macro x86_fp_soft
+    aok_fp_end
+    ldp x9, x1, [_ip]
+    ldp x2, x3, [_ip, #16]
+    mov x0, _cpu
+    add x1, _cpu, x1
+    add x2, _cpu, x2
+    add x3, _cpu, x3
+    blr x9
+.endm
+
+/*
+ * x12 = \insn of d16 and d17, whose bits are x10 and x11; to \soft where
+ * the result is not the host's to give. \zero: exact for a sum, mul, div
+ * or sqrt for which operand makes a zero result exact.
+ */
+.macro x86_fp_compute insn, zero, a, b, r, soft
+    fmov d16, \a
+    fmov d17, \b
+    .ifc \zero, sqrt
+    \insn d18, d17
+    .else
+    \insn d18, d16, d17
+    .endif
+    fmov \r, d18
+    ubfx x13, \r, #52, #11
+    .ifc \zero, exact
+    cmp w13, #0x7ff
+    b.eq \soft
+    .else
+    sub w13, w13, #2
+    cmp w13, #0x7fc
+    b.ls 2f
+    lsl x14, \r, #1
+    cbnz x14, \soft
+    .ifc \zero, mul
+    lsl x14, \a, #1
+    cbz x14, 2f
+    lsl x14, \b, #1
+    cbnz x14, \soft
+    .endif
+    .ifc \zero, div
+    lsl x14, \a, #1
+    cbnz x14, \soft
+    .endif
+2:
+    .endif
+.endm
+
+/* The scalar ones: the low eight bytes of d, the rest staying. */
+.macro x86_fp_sd name, insn, zero
+.gadget \name
+0:  cbz _fpact, 8f
+    cbz _fpok, 7f
+    ldr x8, [_ip, #8]
+    ldr x9, [_ip, #24]
+    ldr x10, [_cpu, x8]
+    ldr x11, [_cpu, x9]
+    .ifnc \zero, sqrt
+    x86_fp_operand x10, 7f
+    .endif
+    x86_fp_operand x11, 7f
+    x86_fp_compute \insn, \zero, x10, x11, x12, 7f
+    str x12, [_cpu, x8]
+    gret 4
+7:  x86_fp_soft
+    gret 4
+8:  x86_fp_begin 0b
+.endm
+x86_fp_sd fp_addsd, fadd, exact
+x86_fp_sd fp_subsd, fsub, exact
+x86_fp_sd fp_mulsd, fmul, mul
+x86_fp_sd fp_divsd, fdiv, div
+x86_fp_sd fp_sqrtsd, fsqrt, sqrt
+
+/* The packed ones: both lanes must be the host's, or neither is stored. */
+.macro x86_fp_pd name, insn, zero
+.gadget \name
+0:  cbz _fpact, 8f
+    cbz _fpok, 7f
+    ldr x8, [_ip, #8]
+    ldr x9, [_ip, #24]
+    add x8, _cpu, x8
+    add x9, _cpu, x9
+    ldp x10, x15, [x8]
+    ldp x11, x16, [x9]
+    x86_fp_operand x10, 7f
+    x86_fp_operand x11, 7f
+    x86_fp_operand x15, 7f
+    x86_fp_operand x16, 7f
+    x86_fp_compute \insn, \zero, x10, x11, x12, 7f
+    x86_fp_compute \insn, \zero, x15, x16, x17, 7f
+    stp x12, x17, [x8]
+    gret 4
+7:  x86_fp_soft
+    gret 4
+8:  x86_fp_begin 0b
+.endm
+x86_fp_pd fp_addpd, fadd, exact
+x86_fp_pd fp_subpd, fsub, exact
+x86_fp_pd fp_mulpd, fmul, mul
+x86_fp_pd fp_divpd, fdiv, div
+
+/*
+ * ucomisd and comisd: [fn][a][b][-]. Without a NaN they are one compare,
+ * and with one (or a denormal) fn's; either way cc_src holds ZF, PF and CF
+ * as CC_OP_EFLAGS, and the host's flags are left as fcmp leaves them for an
+ * ordered result, and for an unordered one so that the same conditions
+ * serve (translate-x86.c, HF_FCMP): N is the carry, V the parity.
+ */
+.macro x86_fp_cmp_operand reg, soft
+    ubfx x13, \reg, #52, #11
+    sub w13, w13, #1
+    cmp w13, #0x7fd
+    b.ls 1f
+    lsl x14, \reg, #1
+    cbz x14, 1f
+    lsl x14, \reg, #12
+    cbnz x14, \soft
+1:
+.endm
+.gadget fp_comisd
+    ldr x8, [_ip, #8]
+    ldr x9, [_ip, #16]
+    ldr x10, [_cpu, x8]
+    ldr x11, [_cpu, x9]
+    x86_fp_cmp_operand x10, 7f
+    x86_fp_cmp_operand x11, 7f
+    fmov d16, x10
+    fmov d17, x11
+    fcmp d16, d17
+    cset w12, eq
+    cset w13, mi
+    orr w12, w13, w12, lsl #6
+    str x12, [_cpu, #AOK_X86_ENV_CC_SRC]
+    str wzr, [_cpu, #AOK_X86_ENV_CC_OP]
+    gret 4
+7:  x86_fp_soft
+    str wzr, [_cpu, #AOK_X86_ENV_CC_OP]
+    ldr x12, [_cpu, #AOK_X86_ENV_CC_SRC]
+    and x14, x12, #1                /* CF */
+    ubfx x13, x12, #6, #1           /* ZF */
+    lsl x15, x14, #31
+    orr x15, x15, x13, lsl #30
+    eor x14, x14, #1
+    orr x15, x15, x14, lsl #29
+    ubfx x13, x12, #2, #1           /* PF */
+    orr x15, x15, x13, lsl #28
+    msr nzcv, x15
+    gret 4
+
+/*
+ * cvtsi2sd: [fn][d][source]. From 32 bits it is exact. From 64 it may
+ * round, which is the host's to do under a plain MXCSR.
+ */
+.gadget fp_cvtsi2sd
+    ldp x8, x9, [_ip, #8]
+    ldr w10, [_cpu, x9]
+    scvtf d16, w10
+    str d16, [_cpu, x8]
+    gret 3
+.gadget fp_cvtsq2sd
+0:  cbz _fpact, 8f
+    cbz _fpok, 7f
+    ldp x8, x9, [_ip, #8]
+    ldr x10, [_cpu, x9]
+    scvtf d16, x10
+    str d16, [_cpu, x8]
+    gret 3
+7:  aok_fp_end
+    ldp x9, x1, [_ip]
+    ldr x2, [_ip, #16]
+    mov x0, _cpu
+    add x1, _cpu, x1
+    ldr x2, [_cpu, x2]
+    blr x9
+    gret 3
+8:  x86_fp_begin 0b
+
+/*
+ * cvttsd2si: [fn][destination][a]. Truncation, whatever MXCSR says, of a
+ * normal number or zero that is in range; the host raises inexact as SSE
+ * does. Out of range SSE gives the "integer indefinite", which is fn's.
+ */
+.macro x86_fp_cvtt name, r, limit, retgadget
+.gadget \name
+0:  cbz _fpact, 8f
+    ldp x8, x9, [_ip, #8]
+    ldr x10, [_cpu, x9]
+    x86_fp_operand x10, 7f
+    ubfx x13, x10, #52, #11
+    cmp w13, #\limit
+    b.hs 7f
+    fmov d16, x10
+    fcvtzs \r\()12, d16
+    str x12, [_cpu, x8]
+    gret 3
+7:  b SYM(aok_gadget_x86_\retgadget)
+8:  x86_fp_begin 0b
+.endm
+x86_fp_cvtt fp_cvttsd2si, w, 0x41e, call_hret32
+x86_fp_cvtt fp_cvttsd2sq, x, 0x43e, call_hret64
+
+/*
+ * After the insn that follows an sti: [pc delta][where interrupt_request
+ * is]. If an interrupt has been waiting for the flag, the main loop takes
+ * it now; one that comes later asks for an exit as any does.
+ */
+.gadget irq_check
+    ldp x9, x10, [_ip]
+    ldr w11, [_cpu, x10]
+    cbnz w11, 1f
+    gret 2
+1:  add _pc, _pc, x9
+    str _pc, [_pcp]
+    mov x0, #0
     b SYM(aok_exit)
 /* [pc delta]: to the main loop, for the insn there next. */
 .gadget exit

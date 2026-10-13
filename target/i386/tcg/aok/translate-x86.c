@@ -22,7 +22,9 @@
 #include "qemu/osdep.h"
 #include "qemu/bitops.h"
 #include "qemu/host-utils.h"
+#include "qemu/int128.h"
 #include "cpu.h"
+#include "fpu/softfloat.h"
 #include "exec/helper-proto.h"
 #include "tcg/helper-tcg.h"
 #include "exec/target_page.h"
@@ -69,6 +71,34 @@ static const MemTab loadsx_tab[3][2] = {
     { MEMT(loadsx32_64) MEMT(loadsx32_64) },
 };
 static const Gadget mov_tab[4] = { SIZES(ENTRY, mov) };
+
+/* SSE (gadgets.S): the loads and stores, the shapes, and the thunks. */
+MEMD(vload128) MEMD(vload128a) MEMD(vstore128) MEMD(vstore128a)
+MEMD(vload32z) MEMD(vload64z)
+/* [aligned] */
+static const MemTab vload_tab[2] = { MEMT(vload128) MEMT(vload128a) };
+static const MemTab vstore_tab[2] = { MEMT(vstore128) MEMT(vstore128a) };
+/* [64 bits] */
+static const MemTab vloadz_tab[2] = { MEMT(vload32z) MEMT(vload64z) };
+DECL(vmov128) DECL(vmov32) DECL(vmovq) DECL(vmovd)
+DECL(vop) DECL(vshift) DECL(vtbl) DECL(vtbl2) DECL(pmovmskb)
+DECL(call_h3) DECL(call_h3cc) DECL(call_hval) DECL(call_hret32)
+DECL(call_hret64)
+/* Doubles on the host's FP unit: each is call_h3 (or as named) otherwise. */
+DECL(fp_addsd) DECL(fp_subsd) DECL(fp_mulsd) DECL(fp_divsd) DECL(fp_sqrtsd)
+DECL(fp_addpd) DECL(fp_subpd) DECL(fp_mulpd) DECL(fp_divpd)
+DECL(fp_comisd) DECL(fp_cvtsi2sd) DECL(fp_cvtsq2sd)
+DECL(fp_cvttsd2si) DECL(fp_cvttsd2sq)
+#define TH(name) aok_x86_thunk_##name
+#define THD(name) void TH(name)(void);
+#define BWD(X, n) X(n##b) X(n##w) X(n##d)
+#define BW(X, n) X(n##b) X(n##w)
+THD(xor) THD(or) THD(and) THD(andn)
+BWD(THD, cmeq) BWD(THD, cmgt) BWD(THD, add) BWD(THD, sub) THD(addq) THD(subq)
+BW(THD, uqadd) BW(THD, sqadd) BW(THD, uqsub) BW(THD, sqsub) BW(THD, urhadd)
+THD(uminb) THD(umaxb) THD(sminw) THD(smaxw) THD(mulw)
+BWD(THD, zip1) THD(zip1q) BWD(THD, zip2) THD(zip2q)
+THD(ushlw) THD(ushld) THD(ushlq) THD(sshlw) THD(sshld)
 
 /* The two-operand arithmetic, by the opcode's three bits, and test. */
 enum { ALU_ADD, ALU_OR, ALU_ADC, ALU_SBB, ALU_AND, ALU_SUB, ALU_XOR, ALU_CMP,
@@ -149,7 +179,7 @@ static const Gadget cmov_tab[2][A_N] = {
 static const Gadget jcc_tab[A_N] = { CONDS(ENTRY, jcc_) };
 
 DECL(jmp) DECL(jmpi) DECL(lookup) DECL(call_c) DECL(call_c_exit)
-DECL(call_c_ea) DECL(call_c_stop) DECL(exit)
+DECL(call_c_ea) DECL(call_c_stop) DECL(exit) DECL(irq_check)
 #define MPD(n) DECL(n) DECL(n##_mp)
 #define MPT(n) { G(n), G(n##_mp) }
 MPD(push) MPD(pushi) MPD(pop) MPD(leave) MPD(call) MPD(calli) MPD(ret)
@@ -187,7 +217,8 @@ QEMU_BUILD_BUG_ON(IF_MASK != AOK_X86_IF);
 enum { NEXT, END, UNKNOWN };
 
 /* What the host's NZCV says of the guest's flags. */
-enum { HF_NONE, HF_SUB, HF_ADD, HF_LOGIC, HF_INCDEC, HF_NZ, HF_BT, HF_N };
+enum { HF_NONE, HF_SUB, HF_ADD, HF_LOGIC, HF_INCDEC, HF_NZ, HF_BT, HF_FCMP,
+       HF_N };
 /* The lazy operations with a size, in cc_op's order: (cc_op - 4) / 4. */
 enum { CLS_MUL, CLS_ADD, CLS_ADC, CLS_SUB, CLS_SBB, CLS_LOGIC, CLS_INC,
        CLS_DEC, CLS_SHL, CLS_SAR, CLS_N };
@@ -202,6 +233,8 @@ typedef struct Ctx {
     bool no_goto_ptr;
     bool iopl_ok;           /* cli and sti are allowed here */
     bool abm, bmi1;         /* f3 before bsf and bsr makes tzcnt and lzcnt */
+    bool sse;               /* SSE insns raise nothing here */
+    bool fp;                /* doubles on the host's FP unit */
     int hf;
     int cc;                 /* the lazy cc_op, or -1 where it is not known */
     /* Liveness: see flags_dead(). */
@@ -219,6 +252,9 @@ typedef struct Ctx {
 #define T0      offsetof(CPUX86State, aok_tmp[0])
 #define T1      offsetof(CPUX86State, aok_tmp[1])
 #define SEGBASE(s) offsetof(CPUX86State, segs[s].base)
+/* An XMM register, and where a memory operand of an SSE operation goes. */
+#define X(r)    offsetof(CPUX86State, xmm_regs[r])
+#define XT0     offsetof(CPUX86State, xmm_t0)
 
 typedef struct Mem {
     int base, index;        /* a register, or -1 */
@@ -492,6 +528,12 @@ static const int8_t cond_tab[HF_N][16] = {
     /* After a bt gadget the host's Z is the guest's carry inverted. */
     [HF_BT]     = { -1, -1, A_NE, A_EQ, -1, -1, -1, -1,
                     -1, -1, -1, -1, -1, -1, -1, -1 },
+    /*
+     * After comisd's gadget: fcmp's flags, or for an unordered pair N, Z
+     * and V with no C. The guest has no overflow or sign then.
+     */
+    [HF_FCMP]   = { -1, -1, A_MI, A_PL, A_EQ, A_NE, A_LS, A_HI,
+                    -1, -1, A_VS, A_VC, -1, -1, A_EQ, A_NE },
 };
 
 static int cc_class(int cc)
@@ -531,6 +573,8 @@ static void hf_restore(Ctx *c, bool nz_only)
 static unsigned x86_nohf;
 /* QEMU_AOK_X86_NOLIVE: every flag is computed (see "Liveness"). */
 static bool x86_nolive;
+/* QEMU_AOK_X86_NOFP: every floating-point insn is softfloat's. */
+static bool x86_nofp;
 
 /* Emit what makes x86 condition @cc one of the host's, and return that. */
 static int cond_arm(Ctx *c, unsigned cc)
@@ -628,11 +672,37 @@ static uint64_t x86_ld(CPUX86State *env, uint64_t addr, unsigned sz)
 
 void aok_x86_helper_ld(CPUX86State *env, uint64_t addr, uint64_t pc,
                        uint32_t sz, uint64_t *out);
+/* Sixteen bytes, as gen_ldo_env_A0() loads them: @sz is 4, | 16 if aligned. */
+static MemOpIdx x86_oi16(CPUX86State *env, unsigned sz)
+{
+    MemOp atom = env->features[FEAT_1_ECX] & CPUID_EXT_AVX ?
+                 MO_ATOM_IFALIGN : MO_ATOM_IFALIGN_PAIR;
+
+    return make_memop_idx(MO_128 | MO_LE | atom | (sz & 16 ? MO_ALIGN_16 : 0),
+                          cpu_mmu_index(env_cpu(env), false));
+}
+
 void aok_x86_helper_ld(CPUX86State *env, uint64_t addr, uint64_t pc,
                        uint32_t sz, uint64_t *out)
 {
     x86_sync(env, pc);
-    *out = x86_ld(env, addr, sz);
+    if ((sz & 15) == 4) {
+        Int128 v = cpu_ld16_mmu(env, addr, x86_oi16(env, sz), 0);
+
+        out[0] = int128_getlo(v);
+        out[1] = int128_gethi(v);
+    } else {
+        *out = x86_ld(env, addr, sz);
+    }
+}
+
+void aok_x86_helper_vst(CPUX86State *env, uint64_t addr, uint64_t pc,
+                        uint32_t sz, const uint64_t *in);
+void aok_x86_helper_vst(CPUX86State *env, uint64_t addr, uint64_t pc,
+                        uint32_t sz, const uint64_t *in)
+{
+    x86_sync(env, pc);
+    cpu_st16_mmu(env, addr, int128_make128(in[0], in[1]), x86_oi16(env, sz), 0);
 }
 
 static void x86_st(CPUX86State *env, uint64_t addr, unsigned sz, uint64_t v)
@@ -1007,6 +1077,50 @@ void aok_x86_helper_rdtsc(CPUX86State *env, uint64_t pc, uint64_t a,
 {
     x86_sync(env, pc);
     helper_rdtsc(env);
+}
+
+/* MXCSR: the rounding control, flush to zero, denormals are zero. */
+#define MXCSR_RC    0x6000
+#define MXCSR_FZ    0x8000
+#define MXCSR_DAZ   0x0040
+
+/*
+ * A stream is about to compute on the host's FP unit (gadgets.S, "SSE
+ * arithmetic on doubles"). From here to the stream's next aok_fp_end the
+ * host's FPSR collects what its insns raise. Returns whether the host
+ * rounds as MXCSR asks, with denormals as they are: QEMU leaves the host's
+ * FPCR to nearest even and nothing else.
+ */
+uint64_t aok_x86_fp_begin(CPUX86State *env);
+uint64_t aok_x86_fp_begin(CPUX86State *env)
+{
+    uint64_t fpcr;
+
+    __asm__ volatile("mrs %0, fpcr\n\tmsr fpsr, xzr" : "=r"(fpcr));
+    /* The host's RMode, FZ, DN, AHP, FZ16, and its trap enables. */
+    return !(env->mxcsr & (MXCSR_RC | MXCSR_FZ | MXCSR_DAZ)) &&
+           !(fpcr & 0x07f89f00);
+}
+
+/* TCGCPUOps.aok_fold_fpsr: inexact is all a gadget leaves to the host. */
+void x86_aok_fold_fpsr(CPUState *cs, uint32_t fpsr)
+{
+    CPUX86State *env = cpu_env(cs);
+
+    if (fpsr & 0x10) {
+        set_float_exception_flags(get_float_exception_flags(&env->sse_status)
+                                  | float_flag_inexact, &env->sse_status);
+    }
+}
+
+/* pause: @pc is the next insn's, where the CPU is when it has yielded. */
+void aok_x86_helper_pause(CPUX86State *env, uint64_t pc, uint64_t a,
+                          uint64_t b);
+void aok_x86_helper_pause(CPUX86State *env, uint64_t pc, uint64_t a,
+                          uint64_t b)
+{
+    x86_sync(env, pc);
+    helper_pause(env);
 }
 
 /* ---- Read-modify-write of memory as one step -------------------------------
@@ -1937,6 +2051,7 @@ static void __attribute__((constructor)) x86_aok_init(void)
         x86_nohf = strtoul(s, NULL, 16);
     }
     x86_nolive = getenv("QEMU_AOK_X86_NOLIVE");
+    x86_nofp = getenv("QEMU_AOK_X86_NOFP");
     s = getenv("QEMU_AOK_X86_SKIP");
 
     /* "88,89,1af": one-byte opcodes, and 0F ones as 1xx */
@@ -1964,6 +2079,447 @@ static void __attribute__((constructor)) x86_aok_init(void)
         c->end = d->end;                \
     } while (0)
 
+/* ---- SSE -------------------------------------------------------------------
+ *
+ * The moves, and the integer operations that are one insn of the host's.
+ * Nothing here reads or sets MXCSR; arithmetic in floating point is TCG's.
+ * Without VEX an operation's memory operand must be aligned, and is loaded
+ * to xmm_t0 as TCG's code loads it.
+ */
+
+/* The source of an operation: the register, or xmm_t0 loaded. */
+static uint64_t sse_src(Ctx *c, const Insn *d)
+{
+    if (d->mod == 3) {
+        return X(d->rm);
+    }
+    mem(c, d, vload_tab[1], XT0, 4 | 16);
+    return XT0;
+}
+
+static int sse_op(Ctx *c, const Insn *d, void (*thunk)(void))
+{
+    uint64_t src = sse_src(c, d);
+
+    E3(G(vop), X(d->reg), src, thunk);
+    return NEXT;
+}
+
+/* A choice of the source's bytes (gadgets.S, vtbl). */
+static int sse_tbl(Ctx *c, uint64_t dst, uint64_t src, const uint8_t *idx)
+{
+    E4(G(vtbl), dst, src, ldq_le_p(idx), ldq_le_p(idx + 8));
+    return NEXT;
+}
+
+/*
+ * Floating point: one call of the helper TCG's code would call, on the
+ * registers by address. A scalar's memory operand is loaded to xmm_t0.
+ */
+static int sse_fp(Ctx *c, const Insn *d, unsigned b, int pfx, int64_t imm)
+{
+#define FP4(n) { helper_##n##ps_xmm, helper_##n##pd_xmm, helper_##n##ss, \
+                 helper_##n##sd }
+    /* add mul . . sub min div max, each for ps, pd, ss, sd */
+    static void (*const arith[8][4])(CPUX86State *, ZMMReg *, ZMMReg *,
+                                     ZMMReg *) = {
+        FP4(add), FP4(mul), { NULL }, { NULL },
+        FP4(sub), FP4(min), FP4(div), FP4(max),
+    };
+    bool mem_op = d->mod != 3, w = d->w;
+    uint64_t g = X(d->reg), e = X(d->rm);
+    uint8_t idx[16];
+    void *fn;
+
+    switch (b) {
+    case 0x58 ... 0x5f:
+        if (b == 0x5a) {
+            /* cvtss2sd, cvtsd2ss; the packed ones between registers */
+            if (pfx >= 2) {
+                if (mem_op) {
+                    mem(c, d, load_tab[pfx], XT0, pfx);
+                    e = XT0;
+                }
+                E4(G(call_h3), pfx == 2 ? helper_cvtss2sd : helper_cvtsd2ss,
+                   g, g, e);
+            } else if (!mem_op) {
+                E4(G(call_h3), pfx ? helper_cvtpd2ps_xmm : helper_cvtps2pd_xmm,
+                   g, e, 0);
+            } else {
+                return UNKNOWN;
+            }
+        } else if (b == 0x5b) {
+            if (pfx == 3 || mem_op) {
+                return UNKNOWN;
+            }
+            E4(G(call_h3), pfx == 0 ? helper_cvtdq2ps_xmm :
+               pfx == 1 ? helper_cvtps2dq_xmm : helper_cvttps2dq_xmm, g, e, 0);
+        } else {
+            /* add mul . . sub . div .: doubles, scalar and packed */
+            static const Gadget host[8][2] = {
+                { G(fp_addpd), G(fp_addsd) }, { G(fp_mulpd), G(fp_mulsd) },
+                { NULL }, { NULL }, { G(fp_subpd), G(fp_subsd) }, { NULL },
+                { G(fp_divpd), G(fp_divsd) }, { NULL },
+            };
+            Gadget gadget = G(call_h3);
+
+            if (c->fp && (pfx & 1) && host[b - 0x58][pfx >> 1]) {
+                gadget = host[b - 0x58][pfx >> 1];
+            }
+            if (pfx < 2) {
+                e = sse_src(c, d);
+            } else if (mem_op) {
+                mem(c, d, load_tab[pfx], XT0, pfx);
+                e = XT0;
+            }
+            E4(gadget, arith[b - 0x58][pfx], g, g, e);
+        }
+        c->hf = HF_NONE;
+        return NEXT;
+
+    case 0x51:              /* sqrt */
+        if (pfx < 2) {
+            e = sse_src(c, d);
+            E4(G(call_h3), pfx ? helper_sqrtpd_xmm : helper_sqrtps_xmm, g, e,
+               0);
+        } else {
+            if (mem_op) {
+                mem(c, d, load_tab[pfx], XT0, pfx);
+                e = XT0;
+            }
+            E4(c->fp && pfx == 3 ? G(fp_sqrtsd) : G(call_h3),
+               pfx == 2 ? helper_sqrtss : helper_sqrtsd, g, g, e);
+        }
+        c->hf = HF_NONE;
+        return NEXT;
+
+    case 0x2a:              /* cvtsi2ss, cvtsi2sd: from a general register */
+        if (pfx < 2) {
+            return UNKNOWN;
+        }
+        fn = pfx == 2 ? (w ? (void *)helper_cvtsq2ss : (void *)helper_cvtsi2ss)
+                      : (w ? (void *)helper_cvtsq2sd : (void *)helper_cvtsi2sd);
+        if (mem_op) {
+            mem(c, d, load_tab[w ? 3 : 2], T0, w ? 3 : 2);
+        }
+        E3(!c->fp || pfx == 2 ? G(call_hval) :
+           w ? G(fp_cvtsq2sd) : G(fp_cvtsi2sd), fn, g, mem_op ? T0 : R(d->rm));
+        c->hf = HF_NONE;
+        return NEXT;
+
+    case 0x2c:              /* cvttss2si, cvttsd2si */
+    case 0x2d:              /* cvtss2si, cvtsd2si: to a general register */
+        if (pfx < 2) {
+            return UNKNOWN;
+        }
+        if (b == 0x2c) {
+            fn = pfx == 2 ? (w ? (void *)helper_cvttss2sq
+                               : (void *)helper_cvttss2si)
+                          : (w ? (void *)helper_cvttsd2sq
+                               : (void *)helper_cvttsd2si);
+        } else {
+            fn = pfx == 2 ? (w ? (void *)helper_cvtss2sq
+                               : (void *)helper_cvtss2si)
+                          : (w ? (void *)helper_cvtsd2sq
+                               : (void *)helper_cvtsd2si);
+        }
+        if (mem_op) {
+            mem(c, d, load_tab[pfx], XT0, pfx);
+            e = XT0;
+        }
+        if (c->fp && b == 0x2c && pfx == 3) {
+            E3(w ? G(fp_cvttsd2sq) : G(fp_cvttsd2si), fn, R(d->reg), e);
+        } else {
+            E3(w ? G(call_hret64) : G(call_hret32), fn, R(d->reg), e);
+        }
+        c->hf = HF_NONE;
+        return NEXT;
+
+    case 0x2e:              /* ucomiss, ucomisd */
+    case 0x2f:              /* comiss, comisd */
+        if (pfx > 1) {
+            return UNKNOWN;
+        }
+        if (mem_op) {
+            mem(c, d, load_tab[pfx ? 3 : 2], XT0, pfx ? 3 : 2);
+            e = XT0;
+        }
+        E4(c->fp && pfx ? G(fp_comisd) : G(call_h3cc),
+           b == 0x2e ? (pfx ? helper_ucomisd : helper_ucomiss)
+                     : (pfx ? helper_comisd : helper_comiss), g, e, 0);
+        set_flags(c, c->fp && pfx ? HF_FCMP : HF_NONE, CC_OP_EFLAGS);
+        return NEXT;
+
+    case 0x50:              /* movmskps, movmskpd */
+        if (pfx > 1 || mem_op) {
+            return UNKNOWN;
+        }
+        E3(G(call_hret32), pfx ? helper_movmskpd_xmm : helper_movmskps_xmm,
+           R(d->reg), e);
+        c->hf = HF_NONE;
+        return NEXT;
+
+    case 0xc6:              /* shufps, shufpd: lanes of both operands */
+        if (pfx > 1) {
+            return UNKNOWN;
+        }
+        e = sse_src(c, d);
+        if (pfx == 0) {
+            for (int i = 0; i < 16; i++) {
+                idx[i] = (i >= 8 ? 16 : 0) + ((imm >> (i / 4 * 2)) & 3) * 4 +
+                         i % 4;
+            }
+        } else {
+            for (int i = 0; i < 16; i++) {
+                idx[i] = (i >= 8 ? 16 : 0) + ((imm >> (i / 8)) & 1) * 8 + i % 8;
+            }
+        }
+        E4(G(vtbl2), g, e, ldq_le_p(idx), ldq_le_p(idx + 8));
+        return NEXT;
+
+    default:
+        return UNKNOWN;
+    }
+#undef FP4
+}
+
+/* @pfx: none, 66, f3, f2. @b: the opcode after 0f; the modrm is decoded. */
+static int sse(Ctx *c, const Insn *d, unsigned b, int pfx, int64_t imm)
+{
+    /* The operations of 66 0f xx on registers, by xx. */
+    static void (*const op66[256])(void) = {
+        [0x14] = TH(zip1q), [0x15] = TH(zip2q),
+        [0x54] = TH(and), [0x55] = TH(andn), [0x56] = TH(or),
+        [0x57] = TH(xor),
+        [0x60] = TH(zip1b), [0x61] = TH(zip1w), [0x62] = TH(zip1d),
+        [0x64] = TH(cmgtb), [0x65] = TH(cmgtw), [0x66] = TH(cmgtd),
+        [0x68] = TH(zip2b), [0x69] = TH(zip2w), [0x6a] = TH(zip2d),
+        [0x6c] = TH(zip1q), [0x6d] = TH(zip2q),
+        [0x74] = TH(cmeqb), [0x75] = TH(cmeqw), [0x76] = TH(cmeqd),
+        [0xd4] = TH(addq), [0xd5] = TH(mulw),
+        [0xd8] = TH(uqsubb), [0xd9] = TH(uqsubw), [0xda] = TH(uminb),
+        [0xdb] = TH(and), [0xdc] = TH(uqaddb), [0xdd] = TH(uqaddw),
+        [0xde] = TH(umaxb), [0xdf] = TH(andn),
+        [0xe0] = TH(urhaddb), [0xe3] = TH(urhaddw),
+        [0xe8] = TH(sqsubb), [0xe9] = TH(sqsubw), [0xea] = TH(sminw),
+        [0xeb] = TH(or), [0xec] = TH(sqaddb), [0xed] = TH(sqaddw),
+        [0xee] = TH(smaxw), [0xef] = TH(xor),
+        [0xf8] = TH(subb), [0xf9] = TH(subw), [0xfa] = TH(subd),
+        [0xfb] = TH(subq), [0xfc] = TH(addb), [0xfd] = TH(addw),
+        [0xfe] = TH(addd),
+    };
+    bool mem_op = d->mod != 3;
+    uint64_t g = X(d->reg), e = X(d->rm);
+    uint8_t idx[16];
+
+    if (!c->sse) {
+        return UNKNOWN;
+    }
+    switch (b) {
+    case 0x10:              /* movups, movupd, movss, movsd: G from E */
+        if (pfx < 2) {
+            if (mem_op) {
+                mem(c, d, vload_tab[0], g, 4);
+            } else {
+                E2(G(vmov128), g, e);
+            }
+        } else if (mem_op) {
+            mem(c, d, vloadz_tab[pfx == 3], g, pfx == 3 ? 3 : 2);
+        } else {
+            E2(pfx == 3 ? G(mov64) : G(vmov32), g, e);
+        }
+        return NEXT;
+    case 0x11:              /* and E from G */
+        if (pfx < 2) {
+            if (mem_op) {
+                mem(c, d, vstore_tab[0], g, 4);
+            } else {
+                E2(G(vmov128), e, g);
+            }
+        } else if (mem_op) {
+            mem(c, d, store_tab[pfx == 3 ? 3 : 2], g, pfx == 3 ? 3 : 2);
+        } else {
+            E2(pfx == 3 ? G(mov64) : G(vmov32), e, g);
+        }
+        return NEXT;
+
+    case 0x12:              /* movlps, movlpd; movhlps */
+    case 0x16:              /* movhps, movhpd; movlhps */
+        if (pfx > 1 || (pfx == 1 && !mem_op)) {
+            return UNKNOWN;
+        }
+        if (mem_op) {
+            mem(c, d, load_tab[3], g + (b == 0x16 ? 8 : 0), 3);
+        } else if (b == 0x12) {
+            E2(G(mov64), g, e + 8);
+        } else {
+            E2(G(mov64), g + 8, e);
+        }
+        return NEXT;
+    case 0x13:
+    case 0x17:
+        if (pfx > 1 || !mem_op) {
+            return UNKNOWN;
+        }
+        mem(c, d, store_tab[3], g + (b == 0x17 ? 8 : 0), 3);
+        return NEXT;
+
+    case 0x28:              /* movaps, movapd */
+    case 0x29:
+        if (pfx > 1) {
+            return UNKNOWN;
+        }
+        if (!mem_op) {
+            E2(G(vmov128), b == 0x28 ? g : e, b == 0x28 ? e : g);
+        } else if (b == 0x28) {
+            mem(c, d, vload_tab[1], g, 4 | 16);
+        } else {
+            mem(c, d, vstore_tab[1], g, 4 | 16);
+        }
+        return NEXT;
+    case 0x2b:              /* movntps, movntpd, movntdq: stores */
+    case 0xe7:
+        if ((b == 0x2b ? pfx > 1 : pfx != 1) || !mem_op) {
+            return UNKNOWN;
+        }
+        mem(c, d, vstore_tab[1], g, 4 | 16);
+        return NEXT;
+
+    case 0x6e:              /* movd, movq: from a general register */
+        if (pfx != 1) {
+            return UNKNOWN;
+        }
+        if (mem_op) {
+            mem(c, d, vloadz_tab[d->w], g, d->w ? 3 : 2);
+        } else {
+            E2(d->w ? G(vmovq) : G(vmovd), g, R(d->rm));
+        }
+        return NEXT;
+    case 0x7e:              /* and to one; after f3, movq between XMMs */
+        if (pfx == 1) {
+            if (mem_op) {
+                mem(c, d, store_tab[d->w ? 3 : 2], g, d->w ? 3 : 2);
+            } else {
+                E2(d->w ? G(mov64) : G(mov32), R(d->rm), g);
+            }
+        } else if (pfx == 2) {
+            if (mem_op) {
+                mem(c, d, vloadz_tab[1], g, 3);
+            } else {
+                E2(G(vmovq), g, e);
+            }
+        } else {
+            return UNKNOWN;
+        }
+        return NEXT;
+    case 0xd6:              /* movq to E */
+        if (pfx != 1) {
+            return UNKNOWN;
+        }
+        if (mem_op) {
+            mem(c, d, store_tab[3], g, 3);
+        } else {
+            E2(G(vmovq), e, g);
+        }
+        return NEXT;
+
+    case 0x6f:              /* movdqa, and after f3 movdqu */
+    case 0x7f:
+        if (pfx != 1 && pfx != 2) {
+            return UNKNOWN;
+        }
+        if (!mem_op) {
+            E2(G(vmov128), b == 0x6f ? g : e, b == 0x6f ? e : g);
+        } else if (b == 0x6f) {
+            mem(c, d, vload_tab[pfx == 1], g, pfx == 1 ? 4 | 16 : 4);
+        } else {
+            mem(c, d, vstore_tab[pfx == 1], g, pfx == 1 ? 4 | 16 : 4);
+        }
+        return NEXT;
+
+    case 0xd7:              /* pmovmskb */
+        if (pfx != 1 || mem_op) {
+            return UNKNOWN;
+        }
+        E2(G(pmovmskb), R(d->reg), e);
+        return NEXT;
+
+    case 0x70:              /* pshufd, pshufhw, pshuflw */
+        if (pfx == 0) {
+            return UNKNOWN;
+        }
+        for (int i = 0; i < 16; i++) {
+            idx[i] = i;
+        }
+        if (pfx == 1) {
+            for (int i = 0; i < 16; i++) {
+                idx[i] = ((imm >> (i / 4 * 2)) & 3) * 4 + i % 4;
+            }
+        } else {
+            int base = pfx == 2 ? 8 : 0;
+
+            for (int i = 0; i < 8; i++) {
+                idx[base + i] = base + ((imm >> (i / 2 * 2)) & 3) * 2 + i % 2;
+            }
+        }
+        return sse_tbl(c, g, sse_src(c, d), idx);
+
+    case 0x71:              /* the shifts by an immediate */
+    case 0x72:
+    case 0x73: {
+        static void (*const lanes[3][2])(void) = {
+            { TH(ushlw), TH(sshlw) }, { TH(ushld), TH(sshld) },
+            { TH(ushlq), NULL },
+        };
+        int op = d->reg & 7, bits = 16 << (b - 0x71), n = imm & 0xff;
+
+        if (pfx != 1 || mem_op) {
+            return UNKNOWN;
+        }
+        if (b == 0x73 && (op == 3 || op == 7)) {
+            /* psrldq and pslldq: by bytes */
+            for (int i = 0; i < 16; i++) {
+                int from = op == 3 ? i + n : i - n;
+
+                idx[i] = from >= 0 && from < 16 ? from : 0xff;
+            }
+            return sse_tbl(c, e, e, idx);
+        }
+        if (op != 2 && op != 4 && op != 6) {
+            return UNKNOWN;
+        }
+        if (op == 4) {
+            /* An arithmetic shift by more leaves the sign everywhere. */
+            if (b == 0x73) {
+                return UNKNOWN;
+            }
+            E3(G(vshift), e, lanes[b - 0x71][1], -MIN(n, bits - 1));
+        } else {
+            /* By the lane's size or more it clears, as the host's does. */
+            n = MIN(n, bits);
+            E3(G(vshift), e, lanes[b - 0x71][0], op == 2 ? -n : n);
+        }
+        return NEXT;
+    }
+
+    case 0x14:              /* unpcklps, unpckhps: lanes of 32 bits */
+    case 0x15:
+        if (pfx == 0) {
+            return sse_op(c, d, b == 0x14 ? TH(zip1d) : TH(zip2d));
+        }
+        break;
+    case 0x54 ... 0x57:     /* andps, andnps, orps, xorps */
+        if (pfx == 0) {
+            return sse_op(c, d, op66[b]);
+        }
+        break;
+    }
+    if (pfx == 1 && op66[b]) {
+        return sse_op(c, d, op66[b]);
+    }
+    return sse_fp(c, d, b, pfx, imm);
+}
+
 /* The opcodes after 0F. */
 static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
 {
@@ -1975,6 +2531,20 @@ static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
     c->op = 0x100 | b;
     if (x86_skip[c->op]) {
         return UNKNOWN;
+    }
+    if ((b >= 0x10 && b <= 0x17) || (b >= 0x28 && b <= 0x2f) ||
+        (b >= 0x50 && b <= 0x7f) || b == 0xc6 || (b >= 0xd0 && b != 0xff)) {
+        int pfx = d->repne ? 3 : d->rep ? 2 : d->o16 ? 1 : 0;
+
+        /* The SSE opcodes, which the prefixes tell apart. */
+        if (d->lock || (d->w && b != 0x6e && b != 0x7e && b != 0x2a &&
+                        b != 0x2c && b != 0x2d)) {
+            return UNKNOWN;
+        }
+        modrm(d);
+        imm = (b >= 0x70 && b <= 0x73) || b == 0xc6 ? fimm(d, 1) : 0;
+        FIN();
+        return sse(c, d, b, pfx, imm);
     }
     if ((d->rep || d->repne) && (b & 0xf0) != 0x80 && b != 0x1e &&
         b != 0x1f && b != 0xbc && b != 0xbd) {
@@ -2237,7 +2807,7 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
     if ((d->rep || d->repne) &&
         !(b == 0xc2 || b == 0xc3 || b == 0xe8 || b == 0xe9 || b == 0xeb ||
           b == 0xff || (b & 0xf0) == 0x70 || (b >= 0xa4 && b <= 0xa7) ||
-          (b >= 0xaa && b <= 0xaf))) {
+          (b >= 0xaa && b <= 0xaf) || b == 0x90)) {
         return UNKNOWN;
     }
 
@@ -2399,6 +2969,14 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
     case 0x90 ... 0x97:     /* xchg with rax; 90 itself is nop */
         FIN();
         r = (b & 7) | d->rb;
+        if (d->rep || d->repne) {
+            if (!d->rep || r != R_EAX) {
+                return UNKNOWN;
+            }
+            /* pause: the CPU's turn ends, at the next insn */
+            E4(G(call_c), aok_x86_helper_pause, c->off + c->len, 0, 0);
+            return END;
+        }
         if (r == R_EAX) {
             return NEXT;
         }
@@ -2604,6 +3182,7 @@ static bool translate(Ctx *c, CPUState *cs, TranslationBlock *tb,
     uint64_t *sti_start = NULL;
     unsigned sti_off = 0;
     int sti_fix = 0;
+    bool live = c->live;
 
     c->off = 0;
     c->hf = HF_NONE;
@@ -2624,7 +3203,10 @@ static bool translate(Ctx *c, CPUState *cs, TranslationBlock *tb,
         c->must = 0;
         c->sti = false;
         c->cut = false;
+        /* (After an sti the TB may be left behind this insn: every flag.) */
+        c->live = live && !after_sti;
         *r = insn(c, code + c->off, code + (TARGET_PAGE_SIZE - c->page_off));
+        c->live = live;
         if (*r == UNKNOWN && c->cut && c->off == 0) {
             /*
              * The TB's first insn runs into the next page: then it is the
@@ -2633,7 +3215,6 @@ static bool translate(Ctx *c, CPUState *cs, TranslationBlock *tb,
              */
             unsigned rem = TARGET_PAGE_SIZE - c->page_off;
             const uint8_t *next = aok_gen_next_page(&c->g, cs, pc + rem);
-            bool live = c->live;
             uint8_t buf[32];
 
             if (!next) {
@@ -2660,8 +3241,9 @@ static bool translate(Ctx *c, CPUState *cs, TranslationBlock *tb,
         if (after_sti && (*r != NEXT || c->sti)) {
             /*
              * sti takes effect after the insn that follows it, and here that
-             * is done by keeping the two in one TB that ends in the main
-             * loop. This insn cannot be that one, so the sti is not ours.
+             * is done by keeping the two in one TB, with a look for a waiting
+             * interrupt after the second. This insn cannot be that one, so
+             * the sti is not ours.
              */
             c->g.p = sti_start;
             c->g.n_fix = sti_fix;
@@ -2687,9 +3269,10 @@ static bool translate(Ctx *c, CPUState *cs, TranslationBlock *tb,
             c->must = MAX(c->must, owed - 1);
         }
         if (after_sti) {
-            /* Interrupts are enabled from here: the main loop looks. */
-            E1(G(exit), c->off);
-            *r = END;
+            /* Interrupts are enabled from here: is one waiting? */
+            E2(G(irq_check), c->off,
+               (int64_t)offsetof(X86CPU, parent_obj.interrupt_request) -
+               (int64_t)offsetof(X86CPU, env));
         }
         if (*r == END) {
             return !c->must;
@@ -2737,6 +3320,8 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     c->iopl_ok = (flags & HF_CPL_MASK) <= ((flags >> IOPL_SHIFT) & 3);
     c->abm = env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_ABM;
     c->bmi1 = env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_BMI1;
+    c->sse = !(flags & (HF_EM_MASK | HF_TS_MASK)) && (flags & HF_OSFXSR_MASK);
+    c->fp = !x86_nofp;
     c->live = !x86_nolive;
     if (!translate(c, cs, tb, *max_insns, pc, host_pc, &r)) {
         c->live = false;

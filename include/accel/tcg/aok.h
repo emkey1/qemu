@@ -232,6 +232,12 @@ typedef struct AokStats {
     /* Of those, the TB's pc was in the jump cache; with other flags. */
     uint64_t lookup_cached, lookup_cached_flags, lookup_cached_cflags;
     uint64_t lookup_flag_bit[32];   /* which bits of the flags differed */
+    /*
+     * How streams came back to the main loop: by a slot not yet linked,
+     * for an exit request, or with nothing to link from. And the entries
+     * of streams that cannot be linked to, being of two pages.
+     */
+    uint64_t ret_slot, ret_request, ret_none, two_page;
     /* TBs left to TCG, by the major opcode of their first insn. */
     uint64_t declined_op[128], declined_c;
     /* Pairs fused, and how many of them forward a register. */

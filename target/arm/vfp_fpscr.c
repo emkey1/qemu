@@ -21,6 +21,9 @@
 #include "cpu.h"
 #include "internals.h"
 #include "cpu-features.h"
+#if defined(CONFIG_AOK_GADGETS) && !defined(CONFIG_USER_ONLY)
+#include "tcg/aok/aok-arm.h"
+#endif
 
 uint32_t vfp_get_fpcr(CPUARMState *env)
 {
@@ -141,6 +144,9 @@ static void vfp_set_fpcr_masked(CPUARMState *env, uint32_t val, uint32_t mask)
         FPCR_EBF | FPCR_FIZ | FPCR_AH | FPCR_NEP;
     env->vfp.fpcr &= ~mask;
     env->vfp.fpcr |= val;
+#if defined(CONFIG_AOK_GADGETS) && !defined(CONFIG_USER_ONLY)
+    arm_aok_fpcr_changed(env);
+#endif
 }
 
 void vfp_set_fpcr(CPUARMState *env, uint32_t val)

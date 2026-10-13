@@ -229,6 +229,8 @@ typedef struct AokStats {
 } AokStats;
 extern AokStats aok_stats;
 extern bool aok_stats_enabled;
+/* The main loop is about to enter one of TCG's TBs (QEMU_AOK_STATS=2). */
+void aok_stats_tcg_entry(CPUState *cpu);
 
 #endif /* CONFIG_AOK_GADGETS */
 #endif /* ACCEL_TCG_AOK_H */

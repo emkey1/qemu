@@ -29,8 +29,8 @@ _ip      .req x28
 #define AOK_ENTER_WORDS 3
 
 /*
- * aok_tb_exec's frame, off x29: where it keeps AokCPU.host_fpsr, and eight
- * bytes that are any gadget's to use between two dispatches.
+ * aok_tb_exec's frame, off x29: where it keeps AokCPU.host_fpsr, and
+ * twenty-four bytes that are any gadget's to use between two dispatches.
  */
 #define AOK_FRAME_FPSR  96
 #define AOK_FRAME_SCRATCH 104
@@ -43,11 +43,16 @@ _ip      .req x28
  * raise host flags of its own, or want the guest's, so the stream's are
  * moved to *AokCPU.host_fpsr first, for the front end to fold into its own
  * FP status, and the next FP gadget starts over. Clobbers x14-x17.
+ *
+ * A front end may also have given the host's FPCR its guest's modes when it
+ * set _fpact. QEMU's own code computes with FPCR zero, as every thread
+ * starts, so that is put back.
  */
 .macro aok_fp_end
     cbz _fpact, 9f
     mrs x16, fpsr
     ldr x17, [x29, #AOK_FRAME_FPSR]
+    msr fpcr, xzr
     mov _fpact, #0
     ldr w15, [x17]
     orr w15, w15, w16

@@ -16,7 +16,7 @@
     .balign 16
     .globl SYM(aok_tb_exec)
 SYM(aok_tb_exec):
-    stp x29, x30, [sp, #-112]!
+    stp x29, x30, [sp, #-128]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
@@ -42,7 +42,7 @@ SYM(aok_exit):
     ldp x23, x24, [sp, #48]
     ldp x25, x26, [sp, #64]
     ldp x27, x28, [sp, #80]
-    ldp x29, x30, [sp], #112
+    ldp x29, x30, [sp], #128
     ret
 
 /*

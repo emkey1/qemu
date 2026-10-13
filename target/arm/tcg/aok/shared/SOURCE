@@ -1,0 +1,3 @@
+iSH-AOK jit/guest-arm64 (alu_spec.S frag.h)
+commit 8d58e6ae896afc737c59f9f772eb6ef761a9b638
+licence: as target/riscv/tcg/aok/shared/SOURCE says of guest-riscv64's

@@ -7,6 +7,8 @@
 
 #include "qemu/osdep.h"
 #include "hw/core/cpu.h"
+#include "exec/cpu-common.h"
+#include "accel/tcg/cpu-ops.h"
 #include "tcg/tcg.h"
 #include "tcg/insn-start-words.h"
 #include "accel/tcg/aok.h"
@@ -15,9 +17,63 @@ bool aok_enabled = true;
 bool aok_stats_enabled;
 AokStats aok_stats;
 
+/*
+ * QEMU_AOK_STATS=2: which of TCG's TBs the main loop enters most, by pc and
+ * first insn. Each such entry is a stream that could not go on, so this is
+ * the list of what a front end should learn next.
+ */
+#define AOK_PROF_SIZE 8192
+static bool aok_prof_enabled;
+static struct AokProf {
+    uint64_t pc, n;
+    uint32_t insn;
+} aok_prof[AOK_PROF_SIZE];
+
+void aok_stats_tcg_entry(CPUState *cpu)
+{
+    uint64_t pc;
+    unsigned h;
+
+    if (!aok_prof_enabled || !cpu->cc->tcg_ops->aok_translate_code) {
+        return;
+    }
+    pc = *(uint64_t *)((void *)cpu_env(cpu) + cpu->cc->tcg_ops->aok_pc_offset);
+    h = (pc >> 1) * 0x9e3779b97f4a7c15ull >> 40;
+    for (int i = 0; i < 16; i++) {
+        struct AokProf *e = &aok_prof[(h + i) % AOK_PROF_SIZE];
+
+        if (e->n && e->pc == pc) {
+            e->n++;
+            return;
+        }
+        if (!e->n) {
+            e->pc = pc;
+            e->n = 1;
+            cpu_memory_rw_debug(cpu, pc, &e->insn, 4, false);
+            return;
+        }
+    }
+}
+
+static int aok_prof_cmp(const void *a, const void *b)
+{
+    const struct AokProf *x = a, *y = b;
+
+    return x->n < y->n ? 1 : x->n > y->n ? -1 : 0;
+}
+
 static void aok_print_stats(void)
 {
     uint64_t tbs = aok_stats.tb_aok + aok_stats.tb_tcg;
+
+    if (aok_prof_enabled) {
+        qsort(aok_prof, AOK_PROF_SIZE, sizeof(aok_prof[0]), aok_prof_cmp);
+        for (int i = 0; i < 400 && aok_prof[i].n; i++) {
+            fprintf(stderr, "aok: tcg-entry %10" PRIu64 " %016" PRIx64
+                    " %08x\n", aok_prof[i].n, aok_prof[i].pc,
+                    aok_prof[i].insn);
+        }
+    }
 
     fprintf(stderr, "aok: %" PRIu64 " of %" PRIu64 " TBs (%.1f%%), "
             "%" PRIu64 " guest insns; TCG kept %" PRIu64 " TBs, "
@@ -48,8 +104,10 @@ static void __attribute__((constructor)) aok_init(void)
     if (s && !strcmp(s, "0")) {
         aok_enabled = false;
     }
-    if (getenv("QEMU_AOK_STATS")) {
+    s = getenv("QEMU_AOK_STATS");
+    if (s) {
         aok_stats_enabled = true;
+        aok_prof_enabled = !strcmp(s, "2");
         atexit(aok_print_stats);
     }
 }

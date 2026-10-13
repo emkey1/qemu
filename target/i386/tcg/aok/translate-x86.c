@@ -253,6 +253,7 @@ typedef struct Ctx {
     int cpl;
     bool io_ok;             /* a port may be read and written with no check */
     bool abm, bmi1;         /* f3 before bsf and bsr makes tzcnt and lzcnt */
+    bool lahf;              /* lahf and sahf exist here */
     bool sse;               /* SSE insns raise nothing here */
     bool fp;                /* doubles on the host's FP unit */
     int hf;
@@ -1154,6 +1155,39 @@ void aok_x86_helper_popf(CPUX86State *env, uint64_t pc, uint64_t mask,
 {
     helper_write_eflags(env, env->aok_tmp[0], mask);
     env->eip = pc;
+}
+
+/*
+ * clc, stc, cmc, lahf, sahf (@op, in that order): the flags themselves are
+ * wanted, so the lazy state becomes them, as gen_compute_eflags() makes it.
+ */
+void aok_x86_helper_flagop(CPUX86State *env, uint64_t pc, uint64_t op,
+                           uint64_t b);
+void aok_x86_helper_flagop(CPUX86State *env, uint64_t pc, uint64_t op,
+                           uint64_t b)
+{
+    uint32_t f = cpu_cc_compute_all(env);
+
+    switch (op) {
+    case 0:
+        f &= ~CC_C;
+        break;
+    case 1:
+        f |= CC_C;
+        break;
+    case 2:
+        f ^= CC_C;
+        break;
+    case 3:
+        env->regs[R_EAX] = deposit64(env->regs[R_EAX], 8, 8, f | 2);
+        break;
+    default:
+        f = (f & CC_O) | ((env->regs[R_EAX] >> 8) &
+                          (CC_S | CC_Z | CC_A | CC_P | CC_C));
+        break;
+    }
+    env->cc_src = f;
+    env->cc_op = CC_OP_EFLAGS;
 }
 
 /* A segment register loaded: @sel is where the selector is, 16 bits. */
@@ -3165,6 +3199,34 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
         e = src_e(c, d, 1);
         return load_seg(c, r, e);
 
+    case 0x8f:              /* pop E */
+        modrm(d);
+        FIN();
+        if ((d->reg & 7) || d->o16) {
+            return UNKNOWN;
+        }
+        if (d->mod == 3) {
+            E2(pop_tab[c->c64][c->mp], R(d->rm), word(c, SW(c)));
+        } else {
+            /*
+             * The store may fault, so the stack pointer moves after it; but
+             * an address made with the stack pointer is made with the one
+             * it will have (QEMU's popl_esp_hack).
+             */
+            Insn top = *d;
+
+            top.m = (Mem){ .base = R_ESP, .index = -1, .seg = -1 };
+            mem(c, &top, load_tab[SW(c)], T0, SW(c));
+            if (d->m.base == R_ESP) {
+                d->m.disp += c->c64 ? 8 : 4;
+            }
+            mem(c, d, store_tab[SW(c)], T0, SW(c));
+            E5(c->c64 ? G(lea64) : G(lea32), R(R_ESP), R(R_ESP), ZERO, 0,
+               c->c64 ? 8 : 4);
+        }
+        c->hf = HF_NONE;
+        return NEXT;
+
     case 0x8d:              /* lea: no segment's base, whatever the prefix */
         modrm(d);
         FIN();
@@ -3410,6 +3472,24 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
         c->hf = HF_NONE;
         return NEXT;
 
+    case 0x9e:              /* sahf, lahf */
+    case 0x9f:
+        FIN();
+        if (!c->lahf) {
+            return UNKNOWN;
+        }
+        E4(G(call_c), aok_x86_helper_flagop, c->off, b == 0x9f ? 3 : 4, 0);
+        set_flags(c, HF_NONE, CC_OP_EFLAGS);
+        return NEXT;
+    case 0xf5:              /* cmc, clc, stc */
+    case 0xf8:
+    case 0xf9:
+        FIN();
+        E4(G(call_c), aok_x86_helper_flagop, c->off,
+           b == 0xf5 ? 2 : b - 0xf8, 0);
+        set_flags(c, HF_NONE, CC_OP_EFLAGS);
+        return NEXT;
+
     case 0xfc:              /* cld, std */
         FIN();
         E0(G(cld));
@@ -3634,6 +3714,8 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     c->io_ok = c->iopl_ok && !(flags & HF_IOBPT_MASK);
     c->abm = env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_ABM;
     c->bmi1 = env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_BMI1;
+    c->lahf = !c->c64 ||
+              (env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_LAHF_LM);
     c->sse = !(flags & (HF_EM_MASK | HF_TS_MASK)) && (flags & HF_OSFXSR_MASK);
     c->fp = !x86_nofp;
     c->live = !x86_nolive;

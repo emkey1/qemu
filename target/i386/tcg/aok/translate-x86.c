@@ -1,0 +1,2755 @@
+/*
+ * AOK gadgets for x86-64 guests: the translator.
+ *
+ * Turns 64-bit code into a gadget stream (include/accel/tcg/aok.h). It
+ * decodes what it is sure of and stops in front of anything else, so that
+ * the next TB starts there and TCG translates it; a TB whose first insn is
+ * one of those is declined outright. Only long mode's 64-bit code segment is
+ * translated at all: the rest of the architecture's modes are firmware's and
+ * a boot loader's, and TCG's.
+ *
+ * Conditions. The flags are QEMU's lazy ones and every gadget that sets them
+ * stores them (gadgets.S), so they are exact wherever anything looks. What
+ * is tracked here is only a shortcut: which of the guest's flags the host's
+ * NZCV holds where the next gadget begins (Ctx.hf), and which lazy operation
+ * the stored state is of (Ctx.cc). A condition that the host's flags decide
+ * is tested on them; one they do not is first made so from the stored state
+ * (the hf gadgets), or computed in C.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "qemu/osdep.h"
+#include "qemu/bitops.h"
+#include "qemu/host-utils.h"
+#include "cpu.h"
+#include "exec/helper-proto.h"
+#include "tcg/helper-tcg.h"
+#include "exec/target_page.h"
+#include "exec/translation-block.h"
+#include "accel/tcg/aok.h"
+#include "accel/tcg/cpu-ldst-common.h"
+#include "accel/tcg/cpu-mmu-index.h"
+#include "accel/tcg/probe.h"
+#include "aok-i386.h"
+#include "aok-i386-asm.h"
+
+#define G(name) aok_gadget_x86_##name
+#define DECL(name) void G(name)(void);
+#define SIZES(X, n) X(n##8) X(n##16) X(n##32) X(n##64)
+#define ENTRY(name) G(name),
+
+typedef void (*Gadget)(void);
+
+/* A gadget with a memory operand: [the ea form][with barriers] */
+typedef Gadget MemTab[2][2];
+#define MEMD(n) DECL(n##_bd) DECL(n##_bd_mp) DECL(n##_ea) DECL(n##_ea_mp)
+#define MEMT(n) { { G(n##_bd), G(n##_bd_mp) }, { G(n##_ea), G(n##_ea_mp) } },
+
+DECL(ea) DECL(ea_seg) DECL(ea_pc) DECL(ea_pc_seg)
+SIZES(DECL, mov)
+DECL(movzx8) DECL(movzx16) DECL(movsx8_32) DECL(movsx8_64)
+DECL(movsx16_32) DECL(movsx16_64) DECL(movsx32_64)
+DECL(movi8) DECL(movi16) DECL(movi64) DECL(pcrel)
+DECL(lea64) DECL(lea32) DECL(lea_ea64) DECL(lea_ea32)
+DECL(xchg32) DECL(xchg64) DECL(cdqe) DECL(cwde) DECL(cqo) DECL(cdq)
+
+SIZES(MEMD, load) SIZES(MEMD, loadw) SIZES(MEMD, store) SIZES(MEMD, storei)
+MEMD(loadzx8) MEMD(loadzx16) MEMD(loadsx8_32) MEMD(loadsx8_64)
+MEMD(loadsx16_32) MEMD(loadsx16_64) MEMD(loadsx32_64)
+static const MemTab load_tab[4] = { SIZES(MEMT, load) };
+static const MemTab loadw_tab[4] = { SIZES(MEMT, loadw) };
+static const MemTab store_tab[4] = { SIZES(MEMT, store) };
+static const MemTab storei_tab[4] = { SIZES(MEMT, storei) };
+/* [the source's size][a 64-bit destination] */
+static const MemTab loadzx_tab[2] = { MEMT(loadzx8) MEMT(loadzx16) };
+static const MemTab loadsx_tab[3][2] = {
+    { MEMT(loadsx8_32) MEMT(loadsx8_64) },
+    { MEMT(loadsx16_32) MEMT(loadsx16_64) },
+    { MEMT(loadsx32_64) MEMT(loadsx32_64) },
+};
+static const Gadget mov_tab[4] = { SIZES(ENTRY, mov) };
+
+/* The two-operand arithmetic, by the opcode's three bits, and test. */
+enum { ALU_ADD, ALU_OR, ALU_ADC, ALU_SBB, ALU_AND, ALU_SUB, ALU_XOR, ALU_CMP,
+       ALU_TEST };
+typedef struct AluG {
+    Gadget rr, ri;
+    MemTab rm, mr, mi;
+} AluG;
+#define ALUD(n) DECL(n##_rr) DECL(n##_ri) MEMD(n##_rm) MEMD(n##_mr) \
+    MEMD(n##_mi)
+#define ALUT(n) { G(n##_rr), G(n##_ri), MEMT(n##_rm) MEMT(n##_mr) \
+    MEMT(n##_mi) },
+SIZES(ALUD, add) SIZES(ALUD, or) SIZES(ALUD, and) SIZES(ALUD, sub)
+SIZES(ALUD, xor) SIZES(ALUD, cmp) SIZES(ALUD, test)
+static const AluG alu_g[9][4] = {
+    [ALU_ADD] = { SIZES(ALUT, add) },
+    [ALU_OR] = { SIZES(ALUT, or) },
+    [ALU_AND] = { SIZES(ALUT, and) },
+    [ALU_SUB] = { SIZES(ALUT, sub) },
+    [ALU_XOR] = { SIZES(ALUT, xor) },
+    [ALU_CMP] = { SIZES(ALUT, cmp) },
+    [ALU_TEST] = { SIZES(ALUT, test) },
+};
+
+SIZES(DECL, not) SIZES(DECL, neg) SIZES(DECL, inc) SIZES(DECL, dec)
+static const Gadget not_tab[4] = { SIZES(ENTRY, not) };
+static const Gadget neg_tab[4] = { SIZES(ENTRY, neg) };
+static const Gadget incdec_tab[2][4] = {
+    { SIZES(ENTRY, inc) }, { SIZES(ENTRY, dec) },
+};
+DECL(adc32_rr) DECL(adc64_rr) DECL(adc32_ri) DECL(adc64_ri)
+DECL(sbb32_rr) DECL(sbb64_rr) DECL(sbb32_ri) DECL(sbb64_ri)
+/* [sbb][64 bits][an immediate] */
+static const Gadget adc_tab[2][2][2] = {
+    { { G(adc32_rr), G(adc32_ri) }, { G(adc64_rr), G(adc64_ri) } },
+    { { G(sbb32_rr), G(sbb32_ri) }, { G(sbb64_rr), G(sbb64_ri) } },
+};
+#define CL(n) DECL(n##_cl)
+#define CLENTRY(n) G(n##_cl),
+SIZES(DECL, shl) SIZES(DECL, shr) SIZES(DECL, sar)
+SIZES(CL, shl) SIZES(CL, shr) SIZES(CL, sar)
+/* [shl, shr, sar][size] */
+static const Gadget shift_tab[3][4] = {
+    { SIZES(ENTRY, shl) }, { SIZES(ENTRY, shr) }, { SIZES(ENTRY, sar) },
+};
+static const Gadget shift_cl_tab[3][4] = {
+    { SIZES(CLENTRY, shl) }, { SIZES(CLENTRY, shr) }, { SIZES(CLENTRY, sar) },
+};
+DECL(imul32_rr) DECL(imul64_rr) DECL(imul32_ri) DECL(imul64_ri)
+SIZES(DECL, ror) DECL(rot32_cl) DECL(rot64_cl) DECL(bswap32) DECL(bswap64)
+static const Gadget ror_tab[4] = { SIZES(ENTRY, ror) };
+#define BTD(n) DECL(n##32_ri) DECL(n##64_ri) DECL(n##32_rr) DECL(n##64_rr)
+#define BTT(n) { { G(n##32_ri), G(n##32_rr) }, { G(n##64_ri), G(n##64_rr) } }
+BTD(bt) BTD(bts) BTD(btr) BTD(btc)
+/* [bt, bts, btr, btc][64 bits][the bit is a register's] */
+static const Gadget bt_tab[4][2][2] = { BTT(bt), BTT(bts), BTT(btr), BTT(btc) };
+DECL(bsf32) DECL(bsf64) DECL(bsr32) DECL(bsr64)
+DECL(tzcnt32) DECL(tzcnt64) DECL(lzcnt32) DECL(lzcnt64)
+DECL(cli) DECL(sti) DECL(mb_ld) DECL(mb_st) DECL(mb)
+
+SIZES(DECL, hf_sub) SIZES(DECL, hf_add) SIZES(DECL, hf_logic)
+static const Gadget hf_sub_tab[4] = { SIZES(ENTRY, hf_sub) };
+static const Gadget hf_add_tab[4] = { SIZES(ENTRY, hf_add) };
+static const Gadget hf_logic_tab[4] = { SIZES(ENTRY, hf_logic) };
+DECL(cond) DECL(cf_sub) DECL(cf_add) DECL(cf_zero) DECL(cf) DECL(cf_bt)
+DECL(flush_cc)
+
+/* The host's conditions, in the order of the tables there is one of each in. */
+enum { A_EQ, A_NE, A_CS, A_CC, A_MI, A_PL, A_VS, A_VC, A_HI, A_LS, A_GE, A_LT,
+       A_GT, A_LE, A_N };
+#define CONDS(X, p) X(p##eq) X(p##ne) X(p##cs) X(p##cc) X(p##mi) X(p##pl) \
+    X(p##vs) X(p##vc) X(p##hi) X(p##ls) X(p##ge) X(p##lt) X(p##gt) X(p##le)
+CONDS(DECL, set_) CONDS(DECL, cmov32_) CONDS(DECL, cmov64_) CONDS(DECL, jcc_)
+static const Gadget set_tab[A_N] = { CONDS(ENTRY, set_) };
+static const Gadget cmov_tab[2][A_N] = {
+    { CONDS(ENTRY, cmov32_) }, { CONDS(ENTRY, cmov64_) },
+};
+static const Gadget jcc_tab[A_N] = { CONDS(ENTRY, jcc_) };
+
+DECL(jmp) DECL(jmpi) DECL(lookup) DECL(call_c) DECL(call_c_exit)
+DECL(call_c_ea) DECL(call_c_stop) DECL(exit)
+#define MPD(n) DECL(n) DECL(n##_mp)
+#define MPT(n) { G(n), G(n##_mp) }
+MPD(push) MPD(pushi) MPD(pop) MPD(leave) MPD(call) MPD(calli) MPD(ret)
+static const Gadget push_tab[2] = MPT(push), pushi_tab[2] = MPT(pushi);
+static const Gadget pop_tab[2] = MPT(pop), leave_tab[2] = MPT(leave);
+static const Gadget call_tab[2] = MPT(call), calli_tab[2] = MPT(calli);
+static const Gadget ret_tab[2] = MPT(ret);
+
+/* What the assembly sources know of CPUX86State (aok-i386-asm.h). */
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, regs) != AOK_X86_ENV_REGS);
+QEMU_BUILD_BUG_ON(sizeof(((CPUX86State *)0)->regs[0]) != 8);
+QEMU_BUILD_BUG_ON(R_EAX != 0 || R_ECX != 1 || R_EDX != 2);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, regs[R_ESP]) != AOK_X86_ENV_RSP);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, regs[R_EBP]) != AOK_X86_ENV_RBP);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, cc_dst) != AOK_X86_ENV_CC_DST);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, cc_src) != AOK_X86_ENV_CC_SRC);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, cc_src2) != AOK_X86_ENV_CC_SRC2);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, cc_op) != AOK_X86_ENV_CC_OP);
+QEMU_BUILD_BUG_ON(sizeof(((CPUX86State *)0)->cc_op) != 4);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, aok_zero) != AOK_X86_ENV_AOK_ZERO);
+QEMU_BUILD_BUG_ON(CC_OP_MULB != AOK_CC_OP_MUL);
+QEMU_BUILD_BUG_ON(CC_OP_ADDB != AOK_CC_OP_ADD);
+QEMU_BUILD_BUG_ON(CC_OP_ADCB != AOK_CC_OP_ADC);
+QEMU_BUILD_BUG_ON(CC_OP_SUBB != AOK_CC_OP_SUB);
+QEMU_BUILD_BUG_ON(CC_OP_SBBB != AOK_CC_OP_SBB);
+QEMU_BUILD_BUG_ON(CC_OP_LOGICB != AOK_CC_OP_LOGIC);
+QEMU_BUILD_BUG_ON(CC_OP_INCB != AOK_CC_OP_INC);
+QEMU_BUILD_BUG_ON(CC_OP_DECB != AOK_CC_OP_DEC);
+QEMU_BUILD_BUG_ON(CC_OP_SHLB != AOK_CC_OP_SHL);
+QEMU_BUILD_BUG_ON(CC_OP_SARB != AOK_CC_OP_SAR);
+QEMU_BUILD_BUG_ON(CC_OP_BMILGB != AOK_CC_OP_BMILG);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, eflags) != AOK_X86_ENV_EFLAGS);
+QEMU_BUILD_BUG_ON(IF_MASK != AOK_X86_IF);
+
+enum { NEXT, END, UNKNOWN };
+
+/* What the host's NZCV says of the guest's flags. */
+enum { HF_NONE, HF_SUB, HF_ADD, HF_LOGIC, HF_INCDEC, HF_NZ, HF_BT, HF_N };
+/* The lazy operations with a size, in cc_op's order: (cc_op - 4) / 4. */
+enum { CLS_MUL, CLS_ADD, CLS_ADC, CLS_SUB, CLS_SBB, CLS_LOGIC, CLS_INC,
+       CLS_DEC, CLS_SHL, CLS_SAR, CLS_N };
+
+typedef struct Ctx {
+    AokGen g;
+    uint64_t page_off;      /* of the TB's first insn in its page */
+    unsigned off;           /* of this insn from the TB's first */
+    unsigned len;           /* of this insn */
+    unsigned op;            /* its opcode, for the statistics */
+    bool mp;                /* other CPUs run: memory gadgets with barriers */
+    bool no_goto_ptr;
+    bool iopl_ok;           /* cli and sti are allowed here */
+    bool abm, bmi1;         /* f3 before bsf and bsr makes tzcnt and lzcnt */
+    int hf;
+    int cc;                 /* the lazy cc_op, or -1 where it is not known */
+    /* Liveness: see flags_dead(). */
+    bool live;
+    unsigned must;          /* insns after this one that have to be here */
+    const uint8_t *next, *end;      /* the code after this insn */
+    bool sti;               /* this insn was sti */
+    bool cut;               /* this insn has bytes beyond the page */
+} Ctx;
+
+/* ---- Operands --------------------------------------------------------- */
+
+#define R(r)    ((uint64_t)(r) * 8)
+#define ZERO    offsetof(CPUX86State, aok_zero)
+#define T0      offsetof(CPUX86State, aok_tmp[0])
+#define T1      offsetof(CPUX86State, aok_tmp[1])
+#define SEGBASE(s) offsetof(CPUX86State, segs[s].base)
+
+typedef struct Mem {
+    int base, index;        /* a register, or -1 */
+    int scale;
+    int64_t disp;
+    bool riprel;
+    int seg;                /* R_FS, R_GS, or -1 */
+} Mem;
+
+typedef struct Insn {
+    const uint8_t *p, *end;
+    bool bad;               /* ran into the end of the page */
+    bool o16, rep, repne, lock;
+    bool a32;               /* 67: fine where there is no address */
+    bool rex, w;
+    int rr, rx, rb;         /* REX.R, REX.X and REX.B, as 0 or 8 */
+    int seg;
+    int mod, reg, rm;
+    Mem m;
+} Insn;
+
+static unsigned f8(Insn *d)
+{
+    if (d->p >= d->end) {
+        d->bad = true;
+        return 0;
+    }
+    return *d->p++;
+}
+
+/* An immediate of @n bytes, sign-extended. */
+static int64_t fimm(Insn *d, int n)
+{
+    int64_t v;
+
+    if (d->end - d->p < n) {
+        d->bad = true;
+        d->p = d->end;
+        return 0;
+    }
+    switch (n) {
+    case 1:
+        v = (int8_t)d->p[0];
+        break;
+    case 2:
+        v = (int16_t)lduw_le_p(d->p);
+        break;
+    case 4:
+        v = (int32_t)ldl_le_p(d->p);
+        break;
+    default:
+        v = ldq_le_p(d->p);
+        break;
+    }
+    d->p += n;
+    return v;
+}
+
+/* The immediate of an operand of size @sz that is at most four bytes. */
+static int64_t fimmz(Insn *d, int sz)
+{
+    return fimm(d, sz == 0 ? 1 : sz == 1 ? 2 : 4);
+}
+
+static void modrm(Insn *d)
+{
+    unsigned b = f8(d);
+
+    d->mod = b >> 6;
+    d->reg = ((b >> 3) & 7) | d->rr;
+    d->rm = b & 7;
+    d->m = (Mem){ .base = -1, .index = -1, .seg = d->seg };
+    if (d->mod == 3) {
+        d->rm |= d->rb;
+        return;
+    }
+    if (d->a32) {
+        d->bad = true;
+    }
+    if (d->rm == 4) {
+        unsigned sib = f8(d);
+        int index = ((sib >> 3) & 7) | d->rx;
+
+        if (index != 4) {
+            d->m.index = index;
+            d->m.scale = sib >> 6;
+        }
+        if ((sib & 7) == 5 && d->mod == 0) {
+            d->m.disp = fimm(d, 4);
+        } else {
+            d->m.base = (sib & 7) | d->rb;
+        }
+    } else if (d->rm == 5 && d->mod == 0) {
+        d->m.riprel = true;
+        d->m.disp = fimm(d, 4);
+    } else {
+        d->m.base = d->rm | d->rb;
+    }
+    if (d->mod == 1) {
+        d->m.disp = fimm(d, 1);
+    } else if (d->mod == 2) {
+        d->m.disp = fimm(d, 4);
+    }
+}
+
+/* A byte register: without a REX prefix 4 to 7 are ah, ch, dh and bh. */
+static uint64_t r8(const Insn *d, int r)
+{
+    return !d->rex && r >= 4 && r < 8 ? R(r - 4) + 1 : R(r);
+}
+
+static uint64_t rn(const Insn *d, int r, int sz)
+{
+    return sz == 0 ? r8(d, r) : R(r);
+}
+
+static uint64_t ro(int r)
+{
+    return r < 0 ? ZERO : R(r);
+}
+
+static void emit(Ctx *c, Gadget gadget, int n, ...)
+{
+    va_list ap;
+
+    aok_emit_gadget(&c->g, gadget);
+    va_start(ap, n);
+    while (n--) {
+        aok_emit(&c->g, va_arg(ap, uint64_t));
+    }
+    va_end(ap);
+}
+#define E0(g)             emit(c, g, 0)
+#define E1(g, a)          emit(c, g, 1, (uint64_t)(a))
+#define E2(g, a, b)       emit(c, g, 2, (uint64_t)(a), (uint64_t)(b))
+#define E3(g, a, b, d)    emit(c, g, 3, (uint64_t)(a), (uint64_t)(b), \
+                               (uint64_t)(d))
+#define E4(g, a, b, d, e) emit(c, g, 4, (uint64_t)(a), (uint64_t)(b), \
+                               (uint64_t)(d), (uint64_t)(e))
+#define E5(g, a, b, d, e, f) emit(c, g, 5, (uint64_t)(a), (uint64_t)(b), \
+                               (uint64_t)(d), (uint64_t)(e), (uint64_t)(f))
+
+/* A memory gadget's last operand (gadgets.S, "Guest memory"). */
+static uint64_t word(Ctx *c, int sz)
+{
+    return (uint64_t)c->off << 32 | sz;
+}
+
+/*
+ * A gadget with the insn's memory operand: [own] and the address, which an
+ * ea gadget before it has computed unless it is a base and a displacement.
+ * @again: this is the store of an insn whose load was the gadget before the
+ * last, and what that load's ea gadget left is still there.
+ */
+/* The ea gadget of the insn's memory operand. */
+static void emit_ea(Ctx *c, const Insn *d)
+{
+    const Mem *m = &d->m;
+
+    if (m->riprel) {
+        uint64_t delta = (int64_t)c->off + c->len + m->disp;
+
+        if (m->seg >= 0) {
+            E2(G(ea_pc_seg), delta, SEGBASE(m->seg));
+        } else {
+            E1(G(ea_pc), delta);
+        }
+    } else if (m->seg >= 0) {
+        E5(G(ea_seg), ro(m->base), ro(m->index), m->scale, m->disp,
+           SEGBASE(m->seg));
+    } else {
+        E4(G(ea), ro(m->base), ro(m->index), m->scale, m->disp);
+    }
+}
+
+static void mem2(Ctx *c, const Insn *d, const MemTab tab, uint64_t own, int sz,
+                 bool again)
+{
+    const Mem *m = &d->m;
+    bool ea = m->riprel || m->seg >= 0 || m->index >= 0;
+
+    if (ea && !again) {
+        emit_ea(c, d);
+    }
+    aok_emit_gadget(&c->g, tab[ea][c->mp]);
+    aok_emit(&c->g, own);
+    if (!ea) {
+        aok_emit(&c->g, ro(m->base));
+        aok_emit(&c->g, m->disp);
+    }
+    aok_emit(&c->g, word(c, sz));
+    c->hf = HF_NONE;        /* the softmmu compare */
+}
+
+static void mem(Ctx *c, const Insn *d, const MemTab tab, uint64_t own, int sz)
+{
+    mem2(c, d, tab, own, sz, false);
+}
+
+/* The insn's E operand as a source: the register, or a temporary loaded. */
+static uint64_t src_e(Ctx *c, const Insn *d, int sz)
+{
+    if (d->mod == 3) {
+        return rn(d, d->rm, sz);
+    }
+    mem(c, d, load_tab[sz], T0, sz);
+    return T0;
+}
+
+/*
+ * The insn's E operand as one a register gadget reads and writes: the
+ * register, or a temporary between a load that has checked the page may be
+ * written and the store. Nothing between the two may call C (the address).
+ */
+static uint64_t rmw_begin(Ctx *c, const Insn *d, int sz)
+{
+    if (d->mod == 3) {
+        return rn(d, d->rm, sz);
+    }
+    mem(c, d, loadw_tab[sz], T0, sz);
+    return T0;
+}
+
+/* @again: nothing since rmw_begin() called C: the address is still there. */
+static void rmw_end(Ctx *c, const Insn *d, int sz, bool again)
+{
+    if (d->mod != 3) {
+        mem2(c, d, store_tab[sz], T0, sz, again);
+    }
+}
+
+/*
+ * The [pc delta][slot] pair of a direct jump to @delta bytes from the TB's
+ * first insn. As with goto_tb, only a destination in the TB's own page may
+ * be linked; any other is looked up each time.
+ */
+static void way(Ctx *c, int n, int64_t delta)
+{
+    int64_t dest = (int64_t)c->page_off + delta;
+
+    aok_emit(&c->g, delta);
+    if (dest >= 0 && dest < TARGET_PAGE_SIZE) {
+        aok_emit(&c->g, aok_slot(&c->g, n));
+    } else {
+        aok_emit(&c->g, aok_slot_unlinked(&c->g));
+    }
+}
+
+/* ---- Conditions --------------------------------------------------------- */
+
+/*
+ * The host's condition for each of the sixteen of x86 (o no b ae e ne be a
+ * s ns p np l ge le g), by what its flags hold; -1 where they do not say.
+ * After a subtraction the host's carry is the guest's inverted; after a
+ * logic operation the gadget compared the result with zero, which leaves no
+ * overflow, and the guest has no carry.
+ */
+static const int8_t cond_tab[HF_N][16] = {
+    [HF_NONE]   = { -1, -1, -1, -1, -1, -1, -1, -1,
+                    -1, -1, -1, -1, -1, -1, -1, -1 },
+    [HF_SUB]    = { A_VS, A_VC, A_CC, A_CS, A_EQ, A_NE, A_LS, A_HI,
+                    A_MI, A_PL, -1, -1, A_LT, A_GE, A_LE, A_GT },
+    [HF_ADD]    = { A_VS, A_VC, A_CS, A_CC, A_EQ, A_NE, -1, -1,
+                    A_MI, A_PL, -1, -1, A_LT, A_GE, A_LE, A_GT },
+    [HF_LOGIC]  = { -1, -1, -1, -1, A_EQ, A_NE, A_EQ, A_NE,
+                    A_MI, A_PL, -1, -1, A_LT, A_GE, A_LE, A_GT },
+    [HF_INCDEC] = { A_VS, A_VC, -1, -1, A_EQ, A_NE, -1, -1,
+                    A_MI, A_PL, -1, -1, A_LT, A_GE, A_LE, A_GT },
+    [HF_NZ]     = { -1, -1, -1, -1, A_EQ, A_NE, -1, -1,
+                    A_MI, A_PL, -1, -1, -1, -1, -1, -1 },
+    /* After a bt gadget the host's Z is the guest's carry inverted. */
+    [HF_BT]     = { -1, -1, A_NE, A_EQ, -1, -1, -1, -1,
+                    -1, -1, -1, -1, -1, -1, -1, -1 },
+};
+
+static int cc_class(int cc)
+{
+    return cc >= CC_OP_MULB && cc < CC_OP_MULB + 4 * CLS_N ?
+           (cc - CC_OP_MULB) >> 2 : -1;
+}
+
+/* Make the host's flags the stored state's, if a gadget can. */
+static void hf_restore(Ctx *c, bool nz_only)
+{
+    int cls = cc_class(c->cc), sz = c->cc & 3;
+
+    if (c->hf != HF_NONE || cls < 0) {
+        return;
+    }
+    if (cls == CLS_SUB) {
+        E0(hf_sub_tab[sz]);
+        c->hf = HF_SUB;
+    } else if (cls == CLS_ADD) {
+        E0(hf_add_tab[sz]);
+        c->hf = HF_ADD;
+    } else if (cls == CLS_LOGIC) {
+        E0(hf_logic_tab[sz]);
+        c->hf = HF_LOGIC;
+    } else if (nz_only) {
+        /* Every one of them keeps its result in cc_dst. */
+        E0(hf_logic_tab[sz]);
+        c->hf = HF_NZ;
+    }
+}
+
+/*
+ * QEMU_AOK_X86_NOHF, for bisecting: a mask of the HF_ classes whose
+ * conditions are computed in C all the same, and bit 8 for "restore none".
+ */
+static unsigned x86_nohf;
+/* QEMU_AOK_X86_NOLIVE: every flag is computed (see "Liveness"). */
+static bool x86_nolive;
+
+/* Emit what makes x86 condition @cc one of the host's, and return that. */
+static int cond_arm(Ctx *c, unsigned cc)
+{
+    int a = cond_tab[c->hf][cc];
+
+    if (a < 0 && c->hf == HF_NONE && !(x86_nohf & 0x100)) {
+        hf_restore(c, cc == 4 || cc == 5 || cc == 8 || cc == 9);
+        a = cond_tab[c->hf][cc];
+    }
+    if ((x86_nohf & (1 << c->hf)) || (x86_nohf >> 16 & (1 << cc))) {
+        a = -1;
+    }
+    if (a < 0) {
+        E1(G(cond), cc);
+        c->hf = HF_NONE;
+        a = A_NE;
+    }
+    return a;
+}
+
+/*
+ * Emit what makes the carry flag a byte, and return the byte's offset: inc,
+ * dec, adc and sbb take it so. This comes before anything of the insn that
+ * may change the host's flags.
+ */
+static uint64_t emit_cf(Ctx *c)
+{
+    int cls = cc_class(c->cc);
+
+    if (cls == CLS_INC || cls == CLS_DEC) {
+        return offsetof(CPUX86State, cc_src);   /* where the last one put it */
+    }
+    hf_restore(c, false);
+    switch (c->hf) {
+    case HF_SUB:
+        E0(G(cf_sub));
+        break;
+    case HF_ADD:
+        E0(G(cf_add));
+        break;
+    case HF_LOGIC:
+        E0(G(cf_zero));
+        break;
+    case HF_BT:
+        E0(G(cf_bt));
+        break;
+    default:
+        E0(G(cf));
+        c->hf = HF_NONE;
+        break;
+    }
+    return T1;
+}
+
+static void set_flags(Ctx *c, int hf, int cc)
+{
+    c->hf = hf;
+    c->cc = cc;
+}
+
+/* ---- The softmmu slow paths, and the instructions done in C -----------------
+ *
+ * Nothing is unwound from a stream, so each of these stores the insn's pc
+ * before anything that may raise an exception. The lazy flags need nothing:
+ * they are in env at all times.
+ */
+
+static void x86_sync(CPUX86State *env, uint64_t pc)
+{
+    aok_no_retaddr();
+    env->eip = pc;
+}
+
+static MemOpIdx x86_oi(CPUX86State *env, unsigned sz)
+{
+    return make_memop_idx(sz | MO_LE, cpu_mmu_index(env_cpu(env), false));
+}
+
+static uint64_t x86_ld(CPUX86State *env, uint64_t addr, unsigned sz)
+{
+    MemOpIdx oi = x86_oi(env, sz);
+
+    switch (sz) {
+    case 0:
+        return cpu_ldb_mmu(env, addr, oi, 0);
+    case 1:
+        return cpu_ldw_mmu(env, addr, oi, 0);
+    case 2:
+        return cpu_ldl_mmu(env, addr, oi, 0);
+    default:
+        return cpu_ldq_mmu(env, addr, oi, 0);
+    }
+}
+
+void aok_x86_helper_ld(CPUX86State *env, uint64_t addr, uint64_t pc,
+                       uint32_t sz, uint64_t *out);
+void aok_x86_helper_ld(CPUX86State *env, uint64_t addr, uint64_t pc,
+                       uint32_t sz, uint64_t *out)
+{
+    x86_sync(env, pc);
+    *out = x86_ld(env, addr, sz);
+}
+
+static void x86_st(CPUX86State *env, uint64_t addr, unsigned sz, uint64_t v)
+{
+    MemOpIdx oi = x86_oi(env, sz);
+
+    switch (sz) {
+    case 0:
+        cpu_stb_mmu(env, addr, v, oi, 0);
+        break;
+    case 1:
+        cpu_stw_mmu(env, addr, v, oi, 0);
+        break;
+    case 2:
+        cpu_stl_mmu(env, addr, v, oi, 0);
+        break;
+    default:
+        cpu_stq_mmu(env, addr, v, oi, 0);
+        break;
+    }
+}
+
+void aok_x86_helper_st(CPUX86State *env, uint64_t addr, uint64_t pc,
+                       uint32_t sz, uint64_t v);
+void aok_x86_helper_st(CPUX86State *env, uint64_t addr, uint64_t pc,
+                       uint32_t sz, uint64_t v)
+{
+    x86_sync(env, pc);
+    x86_st(env, addr, sz, v);
+}
+
+/*
+ * The load of an insn that then stores to the same place: the read, as the
+ * insn makes it, and then whatever a write would raise, raised now, while
+ * nothing has been changed.
+ */
+static uint64_t x86_ld_rmw(CPUX86State *env, uint64_t addr, unsigned sz)
+{
+    int mmu_idx = cpu_mmu_index(env_cpu(env), false);
+    unsigned size = 1 << sz, first = -(addr | TARGET_PAGE_MASK);
+    uint64_t v = x86_ld(env, addr, sz);
+
+    if (first >= size) {
+        probe_write(env, addr, size, mmu_idx, 0);
+    } else {
+        probe_write(env, addr, first, mmu_idx, 0);
+        probe_write(env, addr + first, size - first, mmu_idx, 0);
+    }
+    return v;
+}
+
+void aok_x86_helper_rmw(CPUX86State *env, uint64_t addr, uint64_t pc,
+                        uint32_t sz, uint64_t *out);
+void aok_x86_helper_rmw(CPUX86State *env, uint64_t addr, uint64_t pc,
+                        uint32_t sz, uint64_t *out)
+{
+    x86_sync(env, pc);
+    *out = x86_ld_rmw(env, addr, sz);
+}
+
+/* Whether x86 condition @cc holds of the lazy flags. */
+uint64_t aok_x86_helper_cond(CPUX86State *env, uint64_t cc);
+uint64_t aok_x86_helper_cond(CPUX86State *env, uint64_t cc)
+{
+    uint32_t f = cpu_cc_compute_all(env);
+    bool s = f & CC_S, o = f & CC_O, r;
+
+    switch (cc >> 1) {
+    case 0:
+        r = o;
+        break;
+    case 1:
+        r = f & CC_C;
+        break;
+    case 2:
+        r = f & CC_Z;
+        break;
+    case 3:
+        r = f & (CC_C | CC_Z);
+        break;
+    case 4:
+        r = s;
+        break;
+    case 5:
+        r = f & CC_P;
+        break;
+    case 6:
+        r = s != o;
+        break;
+    default:
+        r = (f & CC_Z) || s != o;
+        break;
+    }
+    return r ^ (cc & 1);
+}
+
+uint64_t aok_x86_helper_cf(CPUX86State *env);
+uint64_t aok_x86_helper_cf(CPUX86State *env)
+{
+    return helper_cc_compute_c(env->cc_dst, env->cc_src, env->cc_src2,
+                               env->cc_op) & 1;
+}
+
+/* An operand of an insn done in C, by its offset. */
+static uint64_t x86_rd(CPUX86State *env, uint64_t off, unsigned sz)
+{
+    void *p = (void *)env + off;
+
+    switch (sz) {
+    case 0:
+        return ldub_p(p);
+    case 1:
+        return lduw_he_p(p);
+    case 2:
+        return (uint32_t)ldl_he_p(p);
+    default:
+        return ldq_he_p(p);
+    }
+}
+
+static void x86_set16(CPUX86State *env, int r, uint64_t v)
+{
+    env->regs[r] = deposit64(env->regs[r], 0, 16, v);
+}
+
+/* mul and imul with one operand: gen_MUL() and gen_IMUL(). */
+void aok_x86_helper_mul(CPUX86State *env, uint64_t pc, uint64_t off,
+                        uint64_t sz);
+void aok_x86_helper_mul(CPUX86State *env, uint64_t pc, uint64_t off,
+                        uint64_t sz)
+{
+    uint64_t v = x86_rd(env, off, sz), a = env->regs[R_EAX], t, hi;
+
+    switch (sz) {
+    case 0:
+        t = (uint8_t)a * v;
+        x86_set16(env, R_EAX, t);
+        env->cc_dst = t;
+        env->cc_src = t & 0xff00;
+        break;
+    case 1:
+        t = (uint16_t)a * v;
+        x86_set16(env, R_EAX, t);
+        x86_set16(env, R_EDX, t >> 16);
+        env->cc_dst = t;
+        env->cc_src = t >> 16;
+        break;
+    case 2:
+        t = (uint64_t)(uint32_t)a * v;
+        env->regs[R_EAX] = (uint32_t)t;
+        env->regs[R_EDX] = t >> 32;
+        env->cc_dst = env->regs[R_EAX];
+        env->cc_src = env->regs[R_EDX];
+        break;
+    default:
+        mulu64(&t, &hi, a, v);
+        env->regs[R_EAX] = t;
+        env->regs[R_EDX] = hi;
+        env->cc_dst = t;
+        env->cc_src = hi;
+        break;
+    }
+    env->cc_op = CC_OP_MULB + sz;
+}
+
+void aok_x86_helper_imul(CPUX86State *env, uint64_t pc, uint64_t off,
+                         uint64_t sz);
+void aok_x86_helper_imul(CPUX86State *env, uint64_t pc, uint64_t off,
+                         uint64_t sz)
+{
+    uint64_t v = x86_rd(env, off, sz), a = env->regs[R_EAX], t, hi;
+
+    switch (sz) {
+    case 0:
+        t = (int64_t)(int8_t)a * (int8_t)v;
+        x86_set16(env, R_EAX, t);
+        env->cc_src = (int64_t)(int8_t)t - t;
+        break;
+    case 1:
+        t = (int64_t)(int16_t)a * (int16_t)v;
+        x86_set16(env, R_EAX, t);
+        x86_set16(env, R_EDX, t >> 16);
+        env->cc_src = (int64_t)(int16_t)t - t;
+        break;
+    case 2:
+        t = (int64_t)(int32_t)a * (int32_t)v;
+        env->regs[R_EAX] = (uint32_t)t;
+        env->regs[R_EDX] = t >> 32;
+        env->cc_src = (int64_t)(int32_t)t - t;
+        break;
+    default:
+        muls64(&t, &hi, a, v);
+        env->regs[R_EAX] = t;
+        env->regs[R_EDX] = hi;
+        env->cc_src = ((int64_t)t < 0 ? -1 : 0) - hi;
+        break;
+    }
+    env->cc_dst = t;
+    env->cc_op = CC_OP_MULB + sz;
+}
+
+/* div and idiv: QEMU's helpers, which raise #DE. @sz: + 4 for idiv. */
+void aok_x86_helper_div(CPUX86State *env, uint64_t pc, uint64_t off,
+                        uint64_t sz);
+void aok_x86_helper_div(CPUX86State *env, uint64_t pc, uint64_t off,
+                        uint64_t sz)
+{
+    uint64_t v = x86_rd(env, off, sz & 3);
+
+    x86_sync(env, pc);
+    switch (sz) {
+    case 0:
+        helper_divb_AL(env, v);
+        break;
+    case 1:
+        helper_divw_AX(env, v);
+        break;
+    case 2:
+        helper_divl_EAX(env, v);
+        break;
+    case 3:
+        helper_divq_EAX(env, v);
+        break;
+    case 4:
+        helper_idivb_AL(env, v);
+        break;
+    case 5:
+        helper_idivw_AX(env, v);
+        break;
+    case 6:
+        helper_idivl_EAX(env, v);
+        break;
+    default:
+        helper_idivq_EAX(env, v);
+        break;
+    }
+}
+
+/* A register of a size, or a temporary, written as a register is. */
+static void x86_wr(CPUX86State *env, uint64_t off, unsigned sz, uint64_t v)
+{
+    void *p = (void *)env + off;
+
+    switch (sz) {
+    case 0:
+        stb_p(p, v);
+        break;
+    case 1:
+        stw_he_p(p, v);
+        break;
+    case 2:
+        stq_he_p(p, (uint32_t)v);
+        break;
+    default:
+        stq_he_p(p, v);
+        break;
+    }
+}
+
+static uint64_t x86_mask(unsigned sz)
+{
+    return sz == 3 ? UINT64_MAX : (1ull << (8 << sz)) - 1;
+}
+
+void aok_x86_helper_flush_cc(CPUX86State *env);
+void aok_x86_helper_flush_cc(CPUX86State *env)
+{
+    env->cc_src = cpu_cc_compute_all(env);
+    env->cc_op = CC_OP_EFLAGS;
+}
+
+/*
+ * rol and ror whose flags are wanted: gen_ROL() and gen_ROR(), which leave
+ * every flag but the carry and the overflow, here as CC_OP_EFLAGS. @arg:
+ * the size, 4 to the right, 8 by cl, the count from bit 8.
+ */
+void aok_x86_helper_rot(CPUX86State *env, uint64_t pc, uint64_t off,
+                        uint64_t arg);
+void aok_x86_helper_rot(CPUX86State *env, uint64_t pc, uint64_t off,
+                        uint64_t arg)
+{
+    unsigned sz = arg & 3;
+    bool right = arg & 4;
+    unsigned count = (arg & 8 ? env->regs[R_ECX] : arg >> 8) &
+                     (sz == 3 ? 63 : 31);
+    uint64_t v = x86_rd(env, off, sz), res;
+    uint32_t f, cf;
+
+    if (!count) {
+        x86_wr(env, off, sz, v);
+        return;
+    }
+    if (sz == 3) {
+        res = right ? ror64(v, count) : rol64(v, count);
+        cf = right ? res >> 63 : res & 1;
+    } else {
+        /* As gen_rot_replicate(): the value repeated to 32 bits. */
+        uint32_t w = sz == 0 ? v * 0x01010101u : sz == 1 ? v | v << 16 : v;
+
+        w = right ? ror32(w, count) : rol32(w, count);
+        res = w;
+        cf = right ? w >> 31 : w & 1;
+    }
+    f = cpu_cc_compute_all(env) & ~(CC_C | CC_O);
+    f |= cf;
+    if (((v ^ res) >> ((8 << sz) - 1)) & 1) {
+        f |= CC_O;
+    }
+    x86_wr(env, off, sz, res);
+    env->cc_src = f;
+    env->cc_op = CC_OP_EFLAGS;
+}
+
+/*
+ * shld and shrd, 32 and 64 bits: gen_shiftd_rm_T1(). @arg: as for the
+ * rotates, and the source register from bit 16.
+ */
+void aok_x86_helper_shiftd(CPUX86State *env, uint64_t pc, uint64_t off,
+                           uint64_t arg);
+void aok_x86_helper_shiftd(CPUX86State *env, uint64_t pc, uint64_t off,
+                           uint64_t arg)
+{
+    unsigned sz = arg & 3;
+    bool right = arg & 4;
+    unsigned count = (arg & 8 ? env->regs[R_ECX] : (arg >> 8) & 0xff) &
+                     (sz == 3 ? 63 : 31);
+    uint64_t dst = x86_rd(env, off, sz);
+    uint64_t src = x86_rd(env, R((arg >> 16) & 31), sz), res, cs;
+
+    if (!count) {
+        x86_wr(env, off, sz, dst);
+        return;
+    }
+    if (sz == 2) {
+        if (right) {
+            uint64_t t = src << 32 | dst;
+
+            cs = t >> (count - 1);
+            res = (uint32_t)(t >> count);
+        } else {
+            uint64_t t = dst << 32 | src;
+
+            cs = (t << (count - 1)) >> 32;
+            res = (t << count) >> 32;
+        }
+    } else if (right) {
+        cs = dst >> (count - 1);
+        res = dst >> count | src << (64 - count);
+    } else {
+        cs = dst << (count - 1);
+        res = dst << count | src >> (64 - count);
+    }
+    x86_wr(env, off, sz, res);
+    env->cc_dst = res;
+    env->cc_src = cs;
+    env->cc_op = (right ? CC_OP_SARB : CC_OP_SHLB) + sz;
+}
+
+/* pushf's value, to the first temporary: the flags become CC_OP_EFLAGS. */
+void aok_x86_helper_pushf(CPUX86State *env, uint64_t pc, uint64_t a,
+                          uint64_t b);
+void aok_x86_helper_pushf(CPUX86State *env, uint64_t pc, uint64_t a,
+                          uint64_t b)
+{
+    env->aok_tmp[0] = helper_read_eflags(env);
+}
+
+void aok_x86_helper_rdtsc(CPUX86State *env, uint64_t pc, uint64_t a,
+                          uint64_t b);
+void aok_x86_helper_rdtsc(CPUX86State *env, uint64_t pc, uint64_t a,
+                          uint64_t b)
+{
+    x86_sync(env, pc);
+    helper_rdtsc(env);
+}
+
+/* ---- Read-modify-write of memory as one step -------------------------------
+ *
+ * cmpxchg, xadd and xchg always, and with other CPUs running the insns that
+ * have a lock prefix. Where no other CPU runs (@par clear) it is a load and
+ * a store, as TCG makes it then; otherwise cputlb's atomic helpers.
+ */
+
+enum { F_ADD, F_AND, F_OR, F_XOR, F_XCHG };
+
+#define ATOMIC4(name, ...)                                  \
+    switch (sz) {                                           \
+    case 0:                                                 \
+        return cpu_atomic_##name##b_mmu(__VA_ARGS__);       \
+    case 1:                                                 \
+        return cpu_atomic_##name##w_le_mmu(__VA_ARGS__);    \
+    case 2:                                                 \
+        return cpu_atomic_##name##l_le_mmu(__VA_ARGS__);    \
+    default:                                                \
+        return cpu_atomic_##name##q_le_mmu(__VA_ARGS__);    \
+    }
+
+/* What was there, having put there that @kind @v. */
+static uint64_t x86_fetch_op(CPUX86State *env, uint64_t addr, int kind,
+                             uint64_t v, unsigned sz, bool par)
+{
+    MemOpIdx oi = x86_oi(env, sz);
+
+    if (!par) {
+        uint64_t old = x86_ld_rmw(env, addr, sz);
+
+        x86_st(env, addr, sz,
+               kind == F_ADD ? old + v : kind == F_AND ? old & v :
+               kind == F_OR ? old | v : kind == F_XOR ? old ^ v : v);
+        return old;
+    }
+    switch (kind) {
+    case F_ADD:
+        ATOMIC4(fetch_add, env, addr, v, oi, 0);
+    case F_AND:
+        ATOMIC4(fetch_and, env, addr, v, oi, 0);
+    case F_OR:
+        ATOMIC4(fetch_or, env, addr, v, oi, 0);
+    case F_XOR:
+        ATOMIC4(fetch_xor, env, addr, v, oi, 0);
+    default:
+        ATOMIC4(xchg, env, addr, v, oi, 0);
+    }
+}
+
+static uint64_t x86_cmpxchg(CPUX86State *env, uint64_t addr, uint64_t cmp,
+                            uint64_t new, unsigned sz, bool par)
+{
+    MemOpIdx oi = x86_oi(env, sz);
+
+    if (!par) {
+        uint64_t old = x86_ld_rmw(env, addr, sz);
+
+        /* A store either way, as the instruction makes one. */
+        x86_st(env, addr, sz, old == cmp ? new : old);
+        return old;
+    }
+    ATOMIC4(cmpxchg, env, addr, cmp, new, oi, 0);
+}
+
+/* The operations beyond the ALU_ ones, which are themselves here. */
+enum { AT_INC = 16, AT_DEC, AT_NOT, AT_NEG, AT_XCHG, AT_XADD, AT_CMPXCHG,
+       AT_BTS, AT_BTR, AT_BTC };
+#define AT_IMM  0x1000
+#define AT_PAR  0x2000
+
+/*
+ * @a: the offset of the register that is the other operand, or with AT_IMM
+ * the operand itself; @b: the operation, the size from bit 8, and the two
+ * flags above. The lazy flags are stored as TCG's code for the insn would.
+ */
+void aok_x86_helper_atomic(CPUX86State *env, uint64_t pc, uint64_t a,
+                           uint64_t b, uint64_t addr);
+void aok_x86_helper_atomic(CPUX86State *env, uint64_t pc, uint64_t a,
+                           uint64_t b, uint64_t addr)
+{
+    unsigned op = b & 0xff, sz = (b >> 8) & 3;
+    bool par = b & AT_PAR;
+    uint64_t m = x86_mask(sz);
+    uint64_t v = (b & AT_IMM ? a : x86_rd(env, a, sz)) & m, old, res;
+    uint32_t f;
+
+    x86_sync(env, pc);
+    switch (op) {
+    case ALU_ADD:
+        old = x86_fetch_op(env, addr, F_ADD, v, sz, par);
+        env->cc_dst = old + v;
+        env->cc_src = v;
+        env->cc_op = CC_OP_ADDB + sz;
+        break;
+    case ALU_SUB:
+        old = x86_fetch_op(env, addr, F_ADD, -v & m, sz, par);
+        env->cc_dst = old - v;
+        env->cc_src = v;
+        env->cc_op = CC_OP_SUBB + sz;
+        break;
+    case ALU_AND:
+        old = x86_fetch_op(env, addr, F_AND, v, sz, par);
+        env->cc_dst = old & v;
+        env->cc_op = CC_OP_LOGICB + sz;
+        break;
+    case ALU_OR:
+        old = x86_fetch_op(env, addr, F_OR, v, sz, par);
+        env->cc_dst = old | v;
+        env->cc_op = CC_OP_LOGICB + sz;
+        break;
+    case ALU_XOR:
+        old = x86_fetch_op(env, addr, F_XOR, v, sz, par);
+        env->cc_dst = old ^ v;
+        env->cc_op = CC_OP_LOGICB + sz;
+        break;
+    case AT_INC:
+    case AT_DEC:
+        /* They keep the carry, which the lazy state of theirs holds. */
+        f = helper_cc_compute_c(env->cc_dst, env->cc_src, env->cc_src2,
+                                env->cc_op) & 1;
+        v = op == AT_INC ? 1 : m;
+        old = x86_fetch_op(env, addr, F_ADD, v, sz, par);
+        env->cc_dst = old + v;
+        env->cc_src = f;
+        env->cc_op = (op == AT_INC ? CC_OP_INCB : CC_OP_DECB) + sz;
+        break;
+    case AT_NOT:
+        x86_fetch_op(env, addr, F_XOR, m, sz, par);
+        break;
+    case AT_NEG:
+        do {
+            old = x86_ld(env, addr, sz);
+            res = -old & m;
+        } while (x86_cmpxchg(env, addr, old, res, sz, par) != old);
+        env->cc_dst = res;
+        env->cc_src = old;
+        env->cc_op = CC_OP_SUBB + sz;
+        break;
+    case AT_XCHG:
+        old = x86_fetch_op(env, addr, F_XCHG, v, sz, par);
+        x86_wr(env, a, sz, old);
+        break;
+    case AT_XADD:
+        old = x86_fetch_op(env, addr, F_ADD, v, sz, par);
+        env->cc_dst = old + v;
+        env->cc_src = v;
+        env->cc_op = CC_OP_ADDB + sz;
+        x86_wr(env, a, sz, old);
+        break;
+    case AT_CMPXCHG: {
+        uint64_t cmp = env->regs[R_EAX] & m;
+
+        old = x86_cmpxchg(env, addr, cmp, v, sz, par);
+        if (old != cmp) {
+            x86_wr(env, R(R_EAX), sz, old);
+        }
+        env->cc_dst = cmp - old;
+        env->cc_src = old;
+        env->cc_op = CC_OP_SUBB + sz;
+        break;
+    }
+    default: {
+        /* bts, btr, btc with the bit's number: the carry is the old bit. */
+        unsigned bit = v & ((8 << sz) - 1);
+        uint64_t mask = 1ull << bit;
+
+        f = cpu_cc_compute_all(env) & ~CC_C;
+        old = x86_fetch_op(env, addr, op == AT_BTS ? F_OR :
+                           op == AT_BTR ? F_AND : F_XOR,
+                           op == AT_BTR ? ~mask & m : mask, sz, par);
+        env->cc_src = f | ((old >> bit) & 1);
+        env->cc_op = CC_OP_EFLAGS;
+        break;
+    }
+    }
+}
+
+/* ---- The string instructions -------------------------------------------- */
+
+enum { S_MOVS, S_CMPS, S_STOS, S_LODS, S_SCAS };
+
+/*
+ * @a: which, the size from bit 4, and from bit 8 whether repeated (1, or 2
+ * for repnz); @b: the offset of the base of the source's segment, or zero.
+ * A rep goes page by page on the host's memory where the pages are RAM and
+ * the direction is up, which is the same as going element by element, and
+ * the registers are brought up to date before anything that may fault.
+ * Returns whether to go by the main loop and start the insn again: a long
+ * rep must not keep an interrupt waiting.
+ */
+uint64_t aok_x86_helper_string(CPUX86State *env, uint64_t pc, uint64_t a,
+                               uint64_t b);
+uint64_t aok_x86_helper_string(CPUX86State *env, uint64_t pc, uint64_t a,
+                               uint64_t b)
+{
+    unsigned op = a & 15, sz = (a >> 4) & 3, rep = (a >> 8) & 3;
+    uint64_t size = 1 << sz, m = x86_mask(sz);
+    uint64_t seg = b ? ldq_he_p((void *)env + b) : 0;
+    int mmu_idx = cpu_mmu_index(env_cpu(env), false);
+    int64_t step = env->df < 0 ? -(int64_t)size : size;
+    uint64_t n = rep ? env->regs[R_ECX] : 1;
+    unsigned budget = 4096;
+
+    x86_sync(env, pc);
+    while (n) {
+        uint64_t di = env->regs[R_EDI], si = env->regs[R_ESI], sa = si + seg;
+        uint64_t done = 1, v, v2;
+        bool stop = false;
+
+        if (!budget--) {
+            return 1;
+        }
+        switch (op) {
+        case S_MOVS:
+        case S_STOS: {
+            uint64_t room = -(di | TARGET_PAGE_MASK), cnt;
+            uint8_t *hd = NULL, *hs = NULL;
+
+            if (op == S_MOVS) {
+                room = MIN(room, -(sa | TARGET_PAGE_MASK));
+            }
+            cnt = MIN(n, room >> sz);
+            if (step > 0 && cnt) {
+                if (op == S_MOVS) {
+                    hs = probe_access(env, sa, cnt << sz, MMU_DATA_LOAD,
+                                      mmu_idx, 0);
+                }
+                if (op == S_STOS || hs) {
+                    hd = probe_access(env, di, cnt << sz, MMU_DATA_STORE,
+                                      mmu_idx, 0);
+                }
+            }
+            if (hd && op == S_STOS) {
+                v = env->regs[R_EAX];
+                if (sz == 0) {
+                    memset(hd, v, cnt);
+                } else {
+                    for (uint64_t i = 0; i < cnt; i++) {
+                        if (sz == 1) {
+                            stw_le_p(hd + i * 2, v);
+                        } else if (sz == 2) {
+                            stl_le_p(hd + i * 4, v);
+                        } else {
+                            stq_le_p(hd + i * 8, v);
+                        }
+                    }
+                }
+                done = cnt;
+            } else if (hd) {
+                if ((uintptr_t)(hd - hs) >= cnt << sz) {
+                    memmove(hd, hs, cnt << sz);
+                } else {
+                    /* The destination overlaps what is yet to be read. */
+                    for (uint64_t i = 0; i < cnt; i++) {
+                        uint64_t t;
+
+                        memcpy(&t, hs + i * size, size);
+                        memcpy(hd + i * size, &t, size);
+                    }
+                }
+                done = cnt;
+            } else {
+                v = op == S_STOS ? env->regs[R_EAX] : x86_ld(env, sa, sz);
+                x86_st(env, di, sz, v);
+            }
+            break;
+        }
+        case S_LODS:
+            v = x86_ld(env, sa, sz);
+            x86_wr(env, R(R_EAX), sz, v);
+            break;
+        default:
+            if (op == S_SCAS) {
+                v = env->regs[R_EAX] & m;
+            } else {
+                v = x86_ld(env, sa, sz);
+            }
+            v2 = x86_ld(env, di, sz);
+            env->cc_dst = v - v2;
+            env->cc_src = v2;
+            env->cc_op = CC_OP_SUBB + sz;
+            stop = (((v - v2) & m) == 0) ? rep == 2 : rep == 1;
+            break;
+        }
+        if (op != S_STOS && op != S_SCAS) {
+            env->regs[R_ESI] = si + step * done;
+        }
+        if (op != S_LODS) {
+            env->regs[R_EDI] = di + step * done;
+        }
+        if (rep) {
+            env->regs[R_ECX] -= done;
+        }
+        n -= done;
+        if (stop) {
+            break;
+        }
+    }
+    return 0;
+}
+
+/* ---- Liveness --------------------------------------------------------------
+ *
+ * Some insns set flags in a way the lazy state can only say by computing
+ * every flag first: a rotate changes the carry and the overflow and keeps
+ * the rest, inc and dec keep the carry. Usually nothing reads what they set
+ * (a rotate in a hash is followed by an add), and TCG then drops the
+ * computation as dead code. Here the same is seen by looking ahead: the
+ * flags an insn sets are dead if the insns after it neither read them, nor
+ * can fault or leave the TB, up to one that sets them all. Such an insn is
+ * then translated with no flags at all, and the stored state stays that of
+ * the insn before it until it is replaced.
+ *
+ * peek() knows only the commonest forms, all between registers, and every
+ * one of them is a form insn() translates: the insns looked at have to be in
+ * this TB, which the translator's loop checks (Ctx.must).
+ */
+
+enum { P_OTHER, P_PASS, P_WRITE };
+
+/* What the insn at @p does to the flags, and its length. */
+static int peek(const uint8_t *p, const uint8_t *end, unsigned *len)
+{
+    Insn dd = { .p = p, .end = end, .seg = -1 }, *d = &dd;
+    unsigned b = f8(d), count;
+    int sz, bsz, r = P_OTHER;
+
+    if (b == 0x66) {
+        d->o16 = true;
+        b = f8(d);
+    }
+    if (b >= 0x40 && b <= 0x4f) {
+        d->rex = true;
+        d->w = b & 8;
+        d->rr = (b & 4) << 1;
+        d->rx = (b & 2) << 2;
+        d->rb = (b & 1) << 3;
+        b = f8(d);
+    }
+    sz = d->w ? 3 : d->o16 ? 1 : 2;
+    bsz = b & 1 ? sz : 0;
+    d->mod = 0;
+    if (b == 0x0f) {
+        b = f8(d);
+        switch (b) {
+        case 0x1f:
+            modrm(d);
+            r = P_PASS;
+            break;
+        case 0xaf:
+            modrm(d);
+            if (d->mod == 3 && sz >= 2) {
+                r = P_WRITE;
+            }
+            break;
+        case 0xb6:
+        case 0xb7:
+        case 0xbe:
+        case 0xbf:
+            modrm(d);
+            if (d->mod == 3 && sz >= 2) {
+                r = P_PASS;
+            }
+            break;
+        case 0xc8 ... 0xcf:
+            if (sz >= 2) {
+                r = P_PASS;
+            }
+            break;
+        }
+        b = 0x100;
+    }
+    switch (b) {
+    case 0x00 ... 0x3f:
+        if ((b & 7) < 4) {
+            modrm(d);
+        } else if ((b & 7) < 6) {
+            fimmz(d, bsz);
+            d->mod = 3;
+        }
+        if (d->mod == 3 && (b & 7) < 6 && (b >> 3) != ALU_ADC &&
+            (b >> 3) != ALU_SBB) {
+            r = P_WRITE;
+        }
+        break;
+    case 0x80:
+    case 0x81:
+    case 0x83:
+        modrm(d);
+        if (b == 0x81) {
+            fimmz(d, sz);
+        } else {
+            fimm(d, 1);
+        }
+        if (d->mod == 3 && (d->reg & 7) != ALU_ADC &&
+            (d->reg & 7) != ALU_SBB) {
+            r = P_WRITE;
+        }
+        break;
+    case 0x84:
+    case 0x85:
+        modrm(d);
+        if (d->mod == 3) {
+            r = P_WRITE;
+        }
+        break;
+    case 0xa8:
+    case 0xa9:
+        fimmz(d, bsz);
+        r = P_WRITE;
+        break;
+    case 0x69:
+    case 0x6b:
+        modrm(d);
+        if (b == 0x69) {
+            fimmz(d, sz);
+        } else {
+            fimm(d, 1);
+        }
+        if (d->mod == 3 && sz >= 2) {
+            r = P_WRITE;
+        }
+        break;
+    case 0x63:
+        modrm(d);
+        if (d->mod == 3 && d->w) {
+            r = P_PASS;
+        }
+        break;
+    case 0x88 ... 0x8b:
+        modrm(d);
+        if (d->mod == 3) {
+            r = P_PASS;
+        }
+        break;
+    case 0x8d:
+        modrm(d);
+        if (d->mod != 3 && sz >= 2) {
+            r = P_PASS;
+        }
+        break;
+    case 0x90:
+        if (!d->rb) {
+            r = P_PASS;
+        }
+        break;
+    case 0x98:
+    case 0x99:
+        if (sz >= 2) {
+            r = P_PASS;
+        }
+        break;
+    case 0xb0 ... 0xb7:
+        fimm(d, 1);
+        r = P_PASS;
+        break;
+    case 0xb8 ... 0xbf:
+        fimm(d, sz == 3 ? 8 : sz == 1 ? 2 : 4);
+        r = P_PASS;
+        break;
+    case 0xc6:
+    case 0xc7:
+        modrm(d);
+        fimmz(d, bsz);
+        if (d->mod == 3 && !(d->reg & 7)) {
+            r = P_PASS;
+        }
+        break;
+    case 0xc0:
+    case 0xc1:
+    case 0xd0:
+    case 0xd1:
+        modrm(d);
+        count = (b < 0xd0 ? fimm(d, 1) : 1) & (bsz == 3 ? 63 : 31);
+        if (d->mod == 3 && count) {
+            /* A shift sets them all; a rotate will be one of these too. */
+            r = (d->reg & 7) >= 4 ? P_WRITE : (d->reg & 7) < 2 ? P_PASS :
+                P_OTHER;
+        }
+        break;
+    case 0xf6:
+    case 0xf7:
+        modrm(d);
+        if ((d->reg & 7) < 2) {
+            fimmz(d, bsz);
+        }
+        if (d->mod == 3) {
+            r = (d->reg & 7) < 2 || (d->reg & 7) == 3 ? P_WRITE :
+                (d->reg & 7) == 2 ? P_PASS : P_OTHER;
+        }
+        break;
+    }
+    if (d->bad) {
+        return P_OTHER;
+    }
+    *len = d->p - p;
+    return r;
+}
+
+#define LIVE_HORIZON 6
+
+/* Whether nothing reads the flags the insn being translated sets. */
+static bool flags_dead(Ctx *c)
+{
+    const uint8_t *p = c->next;
+    unsigned len;
+
+    if (!c->live) {
+        return false;
+    }
+    for (unsigned n = 1; n <= LIVE_HORIZON; n++) {
+        switch (peek(p, c->end, &len)) {
+        case P_WRITE:
+            /* All of them will be translated, and into this TB? */
+            if (c->g.n_insns + 1 + n >= c->g.max_insns ||
+                !aok_gen_room(&c->g, 24 + 8 * n)) {
+                return false;
+            }
+            c->must = MAX(c->must, n);
+            return true;
+        case P_PASS:
+            p += len;
+            break;
+        default:
+            return false;
+        }
+    }
+    return false;
+}
+
+/* ---- Instructions ------------------------------------------------------- */
+
+static void alu_flags(Ctx *c, int op, int sz)
+{
+    switch (op) {
+    case ALU_ADD:
+        set_flags(c, HF_ADD, CC_OP_ADDB + sz);
+        break;
+    case ALU_SUB:
+    case ALU_CMP:
+        set_flags(c, HF_SUB, CC_OP_SUBB + sz);
+        break;
+    default:
+        set_flags(c, HF_LOGIC, CC_OP_LOGICB + sz);
+        break;
+    }
+}
+
+/*
+ * An insn on memory that is one step (aok_x86_helper_atomic): @a is the
+ * other operand, a register's offset or with @imm itself.
+ */
+static int atomic(Ctx *c, const Insn *d, int op, int sz, uint64_t a, bool imm,
+                  bool par)
+{
+    emit_ea(c, d);
+    E4(G(call_c_ea), aok_x86_helper_atomic, c->off, a,
+       op | sz << 8 | (imm ? AT_IMM : 0) | (par ? AT_PAR : 0));
+    c->hf = HF_NONE;
+    switch (op) {
+    case ALU_ADD:
+    case AT_XADD:
+        c->cc = CC_OP_ADDB + sz;
+        break;
+    case ALU_SUB:
+    case AT_NEG:
+    case AT_CMPXCHG:
+        c->cc = CC_OP_SUBB + sz;
+        break;
+    case ALU_AND:
+    case ALU_OR:
+    case ALU_XOR:
+        c->cc = CC_OP_LOGICB + sz;
+        break;
+    case AT_INC:
+        c->cc = CC_OP_INCB + sz;
+        break;
+    case AT_DEC:
+        c->cc = CC_OP_DECB + sz;
+        break;
+    case AT_BTS:
+    case AT_BTR:
+    case AT_BTC:
+        c->cc = CC_OP_EFLAGS;
+        break;
+    default:            /* not and xchg set none */
+        break;
+    }
+    return NEXT;
+}
+
+/*
+ * adc and sbb, which take the carry as a byte: E op= G, G op= E (@to_reg)
+ * or E op= immediate. To memory it is a load, the register form on a
+ * temporary, and a store.
+ */
+static int adc(Ctx *c, const Insn *d, int op, int sz, bool to_reg,
+               bool has_imm, int64_t imm)
+{
+    bool sbb = op == ALU_SBB;
+    uint64_t cf, dst, src = 0;
+    bool rmw = false;
+
+    if (sz < 2 || (d->lock && c->mp)) {
+        return UNKNOWN;
+    }
+    cf = emit_cf(c);
+    if (to_reg) {
+        dst = R(d->reg);
+        src = src_e(c, d, sz);
+    } else {
+        dst = rmw_begin(c, d, sz);
+        src = R(d->reg);
+        rmw = true;
+    }
+    E3(adc_tab[sbb][sz == 3][has_imm], dst, has_imm ? imm : src, cf);
+    set_flags(c, sbb ? HF_SUB : HF_ADD, (sbb ? CC_OP_SBBB : CC_OP_ADCB) + sz);
+    if (rmw) {
+        rmw_end(c, d, sz, true);
+    }
+    return NEXT;
+}
+
+/* E op= G, or G op= E (@to_reg). */
+static int alu_modrm(Ctx *c, const Insn *d, int op, int sz, bool to_reg)
+{
+    const AluG *a = &alu_g[op][sz];
+    uint64_t g = rn(d, d->reg, sz);
+
+    if (d->lock) {
+        /* Only with memory to write; where no other CPU runs it is nothing. */
+        if (to_reg || d->mod == 3 || op == ALU_CMP || op == ALU_TEST) {
+            return UNKNOWN;
+        }
+        if (c->mp && op != ALU_ADC && op != ALU_SBB) {
+            return atomic(c, d, op, sz, g, false, true);
+        }
+    }
+    if (op == ALU_ADC || op == ALU_SBB) {
+        return adc(c, d, op, sz, to_reg, false, 0);
+    }
+    if (d->mod == 3) {
+        uint64_t e = rn(d, d->rm, sz);
+
+        if (to_reg) {
+            E2(a->rr, g, e);
+        } else {
+            E2(a->rr, e, g);
+        }
+    } else {
+        mem(c, d, to_reg ? a->rm : a->mr, g, sz);
+    }
+    alu_flags(c, op, sz);
+    return NEXT;
+}
+
+/* E op= immediate. */
+static int alu_imm(Ctx *c, const Insn *d, int op, int sz, int64_t imm)
+{
+    const AluG *a = &alu_g[op][sz];
+
+    if (sz < 3) {
+        imm &= MAKE_64BIT_MASK(0, 8 << sz);
+    }
+    if (d->lock) {
+        if (d->mod == 3 || op == ALU_CMP || op == ALU_TEST) {
+            return UNKNOWN;
+        }
+        if (c->mp && op != ALU_ADC && op != ALU_SBB) {
+            return atomic(c, d, op, sz, imm, true, true);
+        }
+    }
+    if (op == ALU_ADC || op == ALU_SBB) {
+        return adc(c, d, op, sz, false, true, imm);
+    }
+    if (d->mod == 3) {
+        E2(a->ri, rn(d, d->rm, sz), imm);
+    } else {
+        mem(c, d, a->mi, imm, sz);
+    }
+    alu_flags(c, op, sz);
+    return NEXT;
+}
+
+/* rol and ror of E. */
+static int rotate(Ctx *c, const Insn *d, int sz, bool cl, unsigned count,
+                  bool right)
+{
+    unsigned bits = 8 << sz;
+    uint64_t e;
+
+    if (flags_dead(c) && !(cl && sz < 2)) {
+        e = rmw_begin(c, d, sz);
+        if (cl) {
+            E2(sz == 3 ? G(rot64_cl) : G(rot32_cl), e, !right);
+        } else {
+            /* To the right, in the size: by nothing is still a write. */
+            count %= bits;
+            E2(ror_tab[sz], e, right ? count : (bits - count) % bits);
+        }
+        set_flags(c, HF_NONE, -1);
+        rmw_end(c, d, sz, true);
+        return NEXT;
+    }
+    e = rmw_begin(c, d, sz);
+    E4(G(call_c), aok_x86_helper_rot, c->off, e,
+       sz | (right ? 4 : 0) | (cl ? 8 : 0) | count << 8);
+    set_flags(c, HF_NONE, cl ? -1 : CC_OP_EFLAGS);
+    rmw_end(c, d, sz, false);
+    return NEXT;
+}
+
+/* The shifts and rotates of E, by an immediate or by cl. */
+static int shift(Ctx *c, const Insn *d, int sz, bool cl, unsigned count)
+{
+    unsigned mask = sz == 3 ? 63 : 31;
+    uint64_t e;
+    int k;
+
+    count &= mask;
+    if (!cl && !count) {
+        return UNKNOWN;
+    }
+    switch (d->reg & 7) {
+    case 0:
+    case 1:
+        return rotate(c, d, sz, cl, count, d->reg & 1);
+    case 4:
+    case 6:
+        k = 0;
+        break;
+    case 5:
+        k = 1;
+        break;
+    case 7:
+        k = 2;
+        break;
+    default:            /* through the carry */
+        return UNKNOWN;
+    }
+    e = rmw_begin(c, d, sz);
+    if (cl) {
+        /* By nothing it changes no flag, and what the host's say is lost. */
+        E2(shift_cl_tab[k][sz], e, mask);
+        set_flags(c, HF_NONE, -1);
+    } else {
+        E2(shift_tab[k][sz], e, count);
+        set_flags(c, HF_NZ, (k == 0 ? CC_OP_SHLB : CC_OP_SARB) + sz);
+    }
+    rmw_end(c, d, sz, true);
+    return NEXT;
+}
+
+/* shld and shrd of E by G, in C. */
+static int shiftd(Ctx *c, const Insn *d, int sz, bool right, bool cl,
+                  unsigned count)
+{
+    uint64_t e;
+
+    count &= sz == 3 ? 63 : 31;
+    if (sz < 2 || (!cl && !count)) {
+        return UNKNOWN;
+    }
+    e = rmw_begin(c, d, sz);
+    E4(G(call_c), aok_x86_helper_shiftd, c->off, e,
+       sz | (right ? 4 : 0) | (cl ? 8 : 0) | count << 8 | d->reg << 16);
+    set_flags(c, HF_NONE, cl ? -1 : (right ? CC_OP_SARB : CC_OP_SHLB) + sz);
+    rmw_end(c, d, sz, false);
+    return NEXT;
+}
+
+/*
+ * bt, bts, btr, btc (@op) of E, the bit an immediate or G's. They change
+ * the carry alone: see the gadgets for how the lazy flags say that.
+ */
+static int bittest(Ctx *c, const Insn *d, int sz, int op, bool has_imm,
+                   int64_t imm)
+{
+    uint64_t e, ccop = 0;
+
+    /* With a register's bit number memory is a bit string of any length. */
+    if (sz < 2 || (!has_imm && d->mod != 3)) {
+        return UNKNOWN;
+    }
+    if (d->lock) {
+        if (op == 0 || d->mod == 3) {
+            return UNKNOWN;
+        }
+        if (c->mp) {
+            return atomic(c, d, AT_BTS + op - 1, sz, imm, true, true);
+        }
+    }
+    if (cc_class(c->cc) >= 0) {
+        ccop = CC_OP_SARB + (c->cc & 3);
+    } else if (c->cc != CC_OP_EFLAGS) {
+        E0(G(flush_cc));
+    }
+    e = op ? rmw_begin(c, d, sz) : src_e(c, d, sz);
+    E3(bt_tab[op][sz == 3][!has_imm], e,
+       has_imm ? imm & ((8 << sz) - 1) : R(d->reg), ccop);
+    set_flags(c, HF_BT, ccop ? ccop : CC_OP_EFLAGS);
+    if (op) {
+        rmw_end(c, d, sz, true);
+    }
+    return NEXT;
+}
+
+/* F6 and F7 but for test: not, neg, mul, imul, div, idiv of E. */
+static int group3(Ctx *c, const Insn *d, int sz)
+{
+    int op = d->reg & 7;
+    uint64_t e;
+
+    if (d->lock) {
+        if ((op != 2 && op != 3) || d->mod == 3) {
+            return UNKNOWN;
+        }
+        if (c->mp) {
+            return atomic(c, d, op == 2 ? AT_NOT : AT_NEG, sz, 0, true, true);
+        }
+    }
+    switch (op) {
+    case 2:
+        e = rmw_begin(c, d, sz);
+        E1(not_tab[sz], e);
+        rmw_end(c, d, sz, true);
+        return NEXT;
+    case 3:
+        e = rmw_begin(c, d, sz);
+        E1(neg_tab[sz], e);
+        set_flags(c, HF_SUB, CC_OP_SUBB + sz);
+        rmw_end(c, d, sz, true);
+        return NEXT;
+    case 4:
+    case 5:
+        e = src_e(c, d, sz);
+        E4(G(call_c), op == 4 ? aok_x86_helper_mul : aok_x86_helper_imul,
+           c->off, e, sz);
+        set_flags(c, HF_NONE, CC_OP_MULB + sz);
+        return NEXT;
+    default:
+        e = src_e(c, d, sz);
+        E4(G(call_c), aok_x86_helper_div, c->off, e, sz + (op == 7 ? 4 : 0));
+        c->hf = HF_NONE;
+        return NEXT;
+    }
+}
+
+/* FE and FF: inc, dec, call, jmp and push of E. */
+static int group5(Ctx *c, const Insn *d, int sz, bool ff)
+{
+    int op = d->reg & 7;
+    uint64_t e, cf;
+
+    if (d->lock) {
+        if (op >= 2 || d->mod == 3) {
+            return UNKNOWN;
+        }
+        if (c->mp) {
+            return atomic(c, d, op ? AT_DEC : AT_INC, sz, 0, true, true);
+        }
+    }
+    if (op < 2) {
+        if (d->mod == 3 && sz >= 2 && flags_dead(c)) {
+            /* Nothing wants its flags, the carry it keeps included. */
+            E5(sz == 3 ? G(lea64) : G(lea32), R(d->rm), R(d->rm), ZERO, 0,
+               op ? -1 : 1);
+            set_flags(c, HF_NONE, -1);
+            return NEXT;
+        }
+        cf = emit_cf(c);
+        e = rmw_begin(c, d, sz);
+        E2(incdec_tab[op][sz], e, cf);
+        set_flags(c, HF_INCDEC, (op ? CC_OP_DECB : CC_OP_INCB) + sz);
+        rmw_end(c, d, sz, true);
+        return NEXT;
+    }
+    if (!ff || d->o16) {
+        return UNKNOWN;
+    }
+    switch (op) {
+    case 2:
+        if (c->no_goto_ptr) {
+            return UNKNOWN;
+        }
+        e = src_e(c, d, 3);
+        E3(calli_tab[c->mp], e, c->off + c->len, word(c, 3));
+        aok_emit_lookup_operands(&c->g);
+        return END;
+    case 4:
+        if (c->no_goto_ptr) {
+            return UNKNOWN;
+        }
+        e = src_e(c, d, 3);
+        E1(G(jmpi), e);
+        aok_emit_lookup_operands(&c->g);
+        return END;
+    case 6:
+        e = src_e(c, d, 3);
+        E2(push_tab[c->mp], e, word(c, 3));
+        c->hf = HF_NONE;
+        return NEXT;
+    default:            /* the far ones */
+        return UNKNOWN;
+    }
+}
+
+static int jcc(Ctx *c, unsigned cc, int64_t rel)
+{
+    int a = cond_arm(c, cc);
+
+    aok_emit_gadget(&c->g, jcc_tab[a]);
+    way(c, 0, (int64_t)c->off + c->len + rel);
+    way(c, 1, c->off + c->len);
+    return END;
+}
+
+/* Opcodes this translator is told to leave to TCG: QEMU_AOK_X86_SKIP. */
+static bool x86_skip[512];
+
+static void __attribute__((constructor)) x86_aok_init(void)
+{
+    const char *s = getenv("QEMU_AOK_X86_NOHF");
+
+    if (s) {
+        x86_nohf = strtoul(s, NULL, 16);
+    }
+    x86_nolive = getenv("QEMU_AOK_X86_NOLIVE");
+    s = getenv("QEMU_AOK_X86_SKIP");
+
+    /* "88,89,1af": one-byte opcodes, and 0F ones as 1xx */
+    while (s && *s) {
+        char *end;
+        unsigned long v = strtoul(s, &end, 16);
+
+        if (end == s) {
+            break;
+        }
+        if (v < ARRAY_SIZE(x86_skip)) {
+            x86_skip[v] = true;
+        }
+        s = *end ? end + 1 : end;
+    }
+}
+
+#define FIN() do {                      \
+        if (d->bad) {                   \
+            c->cut = !d->a32;           \
+            return UNKNOWN;             \
+        }                               \
+        c->len = d->p - code;           \
+        c->next = d->p;                 \
+        c->end = d->end;                \
+    } while (0)
+
+/* The opcodes after 0F. */
+static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
+{
+    unsigned b = f8(d);
+    int64_t imm;
+    uint64_t e;
+    int a;
+
+    c->op = 0x100 | b;
+    if (x86_skip[c->op]) {
+        return UNKNOWN;
+    }
+    if ((d->rep || d->repne) && (b & 0xf0) != 0x80 && b != 0x1e &&
+        b != 0x1f && b != 0xbc && b != 0xbd) {
+        return UNKNOWN;
+    }
+    if (d->lock && b != 0xb0 && b != 0xb1 && b != 0xc0 && b != 0xc1 &&
+        b != 0xab && b != 0xb3 && b != 0xbb && b != 0xba) {
+        return UNKNOWN;
+    }
+    switch (b) {
+    case 0x31:              /* rdtsc */
+        FIN();
+        E4(G(call_c), aok_x86_helper_rdtsc, c->off, 0, 0);
+        c->hf = HF_NONE;
+        return NEXT;
+
+    case 0xa3:              /* bt, bts, btr, btc of E by G */
+    case 0xab:
+    case 0xb3:
+    case 0xbb:
+        modrm(d);
+        FIN();
+        return bittest(c, d, sz, (b >> 3) & 3, false, 0);
+
+    case 0xba:              /* and by an immediate */
+        modrm(d);
+        imm = fimm(d, 1);
+        FIN();
+        if ((d->reg & 7) < 4) {
+            return UNKNOWN;
+        }
+        return bittest(c, d, sz, d->reg & 3, true, imm);
+
+    case 0xa4:              /* shld and shrd, by an immediate and by cl */
+    case 0xac:
+        modrm(d);
+        imm = fimm(d, 1);
+        FIN();
+        return shiftd(c, d, sz, b == 0xac, false, imm);
+    case 0xa5:
+    case 0xad:
+        modrm(d);
+        FIN();
+        return shiftd(c, d, sz, b == 0xad, true, 0);
+
+    case 0xae:              /* lfence, mfence, sfence: an order of accesses */
+        modrm(d);
+        FIN();
+        if (d->mod != 3 || (d->reg & 7) < 5 || d->o16) {
+            return UNKNOWN;
+        }
+        if (c->mp) {
+            E0((d->reg & 7) == 5 ? G(mb_ld) : (d->reg & 7) == 6 ? G(mb) :
+               G(mb_st));
+        }
+        return NEXT;
+
+    case 0xb0:              /* cmpxchg, xadd: one step on memory */
+    case 0xb1:
+    case 0xc0:
+    case 0xc1:
+        modrm(d);
+        FIN();
+        if (d->mod == 3) {
+            return UNKNOWN;
+        }
+        return atomic(c, d, b < 0xc0 ? AT_CMPXCHG : AT_XADD, b & 1 ? sz : 0,
+                      rn(d, d->reg, b & 1 ? sz : 0), false,
+                      d->lock && c->mp);
+
+    case 0xbc:              /* bsf and bsr; after f3, tzcnt and lzcnt */
+    case 0xbd: {
+        static const Gadget scan[2][2][2] = {
+            { { G(bsf32), G(bsf64) }, { G(tzcnt32), G(tzcnt64) } },
+            { { G(bsr32), G(bsr64) }, { G(lzcnt32), G(lzcnt64) } },
+        };
+        /* (The feature each asks for is the other's: decode_0FBC().) */
+        bool cnt = d->rep && (b == 0xbc ? c->abm : c->bmi1);
+
+        modrm(d);
+        FIN();
+        if (sz < 2) {
+            return UNKNOWN;
+        }
+        e = src_e(c, d, sz);
+        E2(scan[b & 1][cnt][sz == 3], R(d->reg), e);
+        if (cnt) {
+            set_flags(c, HF_NONE, CC_OP_BMILGB + sz);
+        } else {
+            set_flags(c, HF_LOGIC, CC_OP_LOGICB + sz);
+        }
+        return NEXT;
+    }
+
+    case 0xc8 ... 0xcf:     /* bswap */
+        FIN();
+        if (sz < 2) {
+            return UNKNOWN;
+        }
+        E1(sz == 3 ? G(bswap64) : G(bswap32), R((b & 7) | d->rb));
+        return NEXT;
+
+    case 0x0d:              /* prefetch, and the nops with an operand */
+    case 0x18 ... 0x19:
+    case 0x1c ... 0x1f:
+        modrm(d);
+        FIN();
+        return NEXT;
+
+    case 0x40 ... 0x4f:     /* cmov */
+        modrm(d);
+        FIN();
+        if (sz < 2) {
+            return UNKNOWN;
+        }
+        e = src_e(c, d, sz);
+        a = cond_arm(c, b & 15);
+        E2(cmov_tab[sz == 3][a], R(d->reg), e);
+        return NEXT;
+
+    case 0x80 ... 0x8f: {
+        int64_t rel = fimm(d, 4);
+
+        FIN();
+        if (d->o16) {
+            return UNKNOWN;
+        }
+        return jcc(c, b & 15, rel);
+    }
+
+    case 0x90 ... 0x9f:     /* setcc */
+        modrm(d);
+        FIN();
+        a = cond_arm(c, b & 15);
+        if (d->mod == 3) {
+            E1(set_tab[a], r8(d, d->rm));
+        } else {
+            E1(set_tab[a], T0);
+            mem(c, d, store_tab[0], T0, 0);
+        }
+        return NEXT;
+
+    case 0xaf:              /* imul G, E */
+        modrm(d);
+        FIN();
+        if (sz < 2) {
+            return UNKNOWN;
+        }
+        e = src_e(c, d, sz);
+        E3(sz == 3 ? G(imul64_rr) : G(imul32_rr), R(d->reg), R(d->reg), e);
+        set_flags(c, HF_NONE, CC_OP_MULB + sz);
+        return NEXT;
+
+    case 0xb6:              /* movzx G, Eb and G, Ew */
+    case 0xb7:
+    case 0xbe:              /* movsx */
+    case 0xbf: {
+        int ssz = b & 1;
+        bool sign = b & 8;
+
+        modrm(d);
+        FIN();
+        if (sz < 2) {
+            return UNKNOWN;
+        }
+        if (d->mod == 3) {
+            static const Gadget zx[2] = { G(movzx8), G(movzx16) };
+            static const Gadget sx[2][2] = {
+                { G(movsx8_32), G(movsx8_64) },
+                { G(movsx16_32), G(movsx16_64) },
+            };
+
+            E2(sign ? sx[ssz][sz == 3] : zx[ssz], R(d->reg),
+               rn(d, d->rm, ssz));
+        } else {
+            mem(c, d, sign ? loadsx_tab[ssz][sz == 3] : loadzx_tab[ssz],
+                R(d->reg), ssz);
+        }
+        return NEXT;
+    }
+
+    default:
+        return UNKNOWN;
+    }
+}
+
+/*
+ * One instruction at @code, which has bytes up to @end. Whatever is not
+ * recognised here returns UNKNOWN with nothing emitted that matters: the
+ * caller takes the stream back to where the insn began.
+ */
+static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
+{
+    Insn dd = { .p = code, .end = end, .seg = -1 }, *d = &dd;
+    unsigned b;
+    int64_t imm;
+    int sz, bsz, r;
+    uint64_t e;
+
+    for (;;) {
+        b = f8(d);
+        switch (b) {
+        case 0x66:
+            d->o16 = true;
+            continue;
+        case 0xf0:
+            d->lock = true;
+            continue;
+        case 0xf2:
+            d->repne = true;
+            d->rep = false;
+            continue;
+        case 0xf3:
+            d->rep = true;
+            d->repne = false;
+            continue;
+        case 0x26:          /* es, cs, ss, ds: nothing in 64-bit code */
+        case 0x2e:
+        case 0x36:
+        case 0x3e:
+            continue;
+        case 0x64:
+            d->seg = R_FS;
+            continue;
+        case 0x65:
+            d->seg = R_GS;
+            continue;
+        case 0x67:
+            d->a32 = true;
+            continue;
+        }
+        break;
+    }
+    if (b >= 0x40 && b <= 0x4f) {
+        /* REX, which counts only as the last prefix: any other is no opcode */
+        d->rex = true;
+        d->w = b & 8;
+        d->rr = (b & 4) << 1;
+        d->rx = (b & 2) << 2;
+        d->rb = (b & 1) << 3;
+        b = f8(d);
+    }
+    c->op = b;
+    if (d->bad || x86_skip[b]) {
+        c->cut = d->bad;
+        return UNKNOWN;
+    }
+    /* A lock prefix is for an insn that writes memory: each checks that. */
+    if (d->lock && !((b < 0x40 && (b & 7) < 2) || b == 0x80 || b == 0x81 ||
+                     b == 0x83 || b == 0x86 || b == 0x87 || b == 0xf6 ||
+                     b == 0xf7 || b == 0xfe || b == 0xff || b == 0x0f)) {
+        return UNKNOWN;
+    }
+    sz = d->w ? 3 : d->o16 ? 1 : 2;
+    bsz = b & 1 ? sz : 0;       /* where bit 0 says "not a byte" */
+    if (b == 0x0f) {
+        return insn_0f(c, d, code, sz);
+    }
+    /* rep ret, and bnd before a branch, are that ret and that branch. */
+    if ((d->rep || d->repne) &&
+        !(b == 0xc2 || b == 0xc3 || b == 0xe8 || b == 0xe9 || b == 0xeb ||
+          b == 0xff || (b & 0xf0) == 0x70 || (b >= 0xa4 && b <= 0xa7) ||
+          (b >= 0xaa && b <= 0xaf))) {
+        return UNKNOWN;
+    }
+
+    switch (b) {
+    case 0x00 ... 0x3f:     /* add or adc sbb and sub xor cmp */
+        switch (b & 7) {
+        case 0:
+        case 1:
+            modrm(d);
+            FIN();
+            return alu_modrm(c, d, b >> 3, bsz, false);
+        case 2:
+        case 3:
+            modrm(d);
+            FIN();
+            return alu_modrm(c, d, b >> 3, bsz, true);
+        case 4:
+        case 5:
+            imm = fimmz(d, bsz);
+            FIN();
+            d->mod = 3;
+            d->rm = R_EAX;
+            return alu_imm(c, d, b >> 3, bsz, imm);
+        default:
+            return UNKNOWN;
+        }
+
+    case 0x50 ... 0x57:
+        FIN();
+        if (d->o16) {
+            return UNKNOWN;
+        }
+        E2(push_tab[c->mp], R((b & 7) | d->rb), word(c, 3));
+        c->hf = HF_NONE;
+        return NEXT;
+
+    case 0x58 ... 0x5f:
+        FIN();
+        if (d->o16) {
+            return UNKNOWN;
+        }
+        E2(pop_tab[c->mp], R((b & 7) | d->rb), word(c, 3));
+        c->hf = HF_NONE;
+        return NEXT;
+
+    case 0x63:              /* movsxd */
+        modrm(d);
+        FIN();
+        if (!d->w) {
+            return UNKNOWN;
+        }
+        if (d->mod == 3) {
+            E2(G(movsx32_64), R(d->reg), R(d->rm));
+        } else {
+            mem(c, d, loadsx_tab[2][1], R(d->reg), 2);
+        }
+        return NEXT;
+
+    case 0x68:
+    case 0x6a:
+        imm = fimm(d, b == 0x68 ? 4 : 1);
+        FIN();
+        if (d->o16) {
+            return UNKNOWN;
+        }
+        E2(pushi_tab[c->mp], imm, word(c, 3));
+        c->hf = HF_NONE;
+        return NEXT;
+
+    case 0x69:              /* imul G, E, immediate */
+    case 0x6b:
+        modrm(d);
+        imm = b == 0x69 ? fimmz(d, sz) : fimm(d, 1);
+        FIN();
+        if (sz < 2) {
+            return UNKNOWN;
+        }
+        e = src_e(c, d, sz);
+        E3(sz == 3 ? G(imul64_ri) : G(imul32_ri), R(d->reg), e, imm);
+        set_flags(c, HF_NONE, CC_OP_MULB + sz);
+        return NEXT;
+
+    case 0x70 ... 0x7f:
+        imm = fimm(d, 1);
+        FIN();
+        return jcc(c, b & 15, imm);
+
+    case 0x80:
+    case 0x81:
+    case 0x83:
+        modrm(d);
+        imm = b == 0x81 ? fimmz(d, sz) : fimm(d, 1);
+        FIN();
+        return alu_imm(c, d, d->reg & 7, bsz, imm);
+
+    case 0x84:
+    case 0x85:
+        modrm(d);
+        FIN();
+        return alu_modrm(c, d, ALU_TEST, bsz, false);
+
+    case 0x86:              /* xchg, which with memory is one step */
+    case 0x87:
+        modrm(d);
+        FIN();
+        if (d->mod != 3) {
+            return atomic(c, d, AT_XCHG, bsz, rn(d, d->reg, bsz), false,
+                          c->mp);
+        }
+        if (d->lock || bsz < 2) {
+            return UNKNOWN;
+        }
+        E2(bsz == 3 ? G(xchg64) : G(xchg32), R(d->rm), R(d->reg));
+        return NEXT;
+
+    case 0x88:              /* mov E, G */
+    case 0x89:
+        modrm(d);
+        FIN();
+        if (d->mod == 3) {
+            E2(mov_tab[bsz], rn(d, d->rm, bsz), rn(d, d->reg, bsz));
+        } else {
+            mem(c, d, store_tab[bsz], rn(d, d->reg, bsz), bsz);
+        }
+        return NEXT;
+
+    case 0x8a:              /* mov G, E */
+    case 0x8b:
+        modrm(d);
+        FIN();
+        if (d->mod == 3) {
+            E2(mov_tab[bsz], rn(d, d->reg, bsz), rn(d, d->rm, bsz));
+        } else {
+            mem(c, d, load_tab[bsz], rn(d, d->reg, bsz), bsz);
+        }
+        return NEXT;
+
+    case 0x8d:              /* lea: no segment's base, whatever the prefix */
+        modrm(d);
+        FIN();
+        if (d->mod == 3 || sz < 2) {
+            return UNKNOWN;
+        }
+        if (d->m.riprel) {
+            uint64_t delta = (int64_t)c->off + c->len + d->m.disp;
+
+            if (sz == 3) {
+                E2(G(pcrel), R(d->reg), delta);
+            } else {
+                E1(G(ea_pc), delta);
+                E1(G(lea_ea32), R(d->reg));
+            }
+        } else {
+            E5(sz == 3 ? G(lea64) : G(lea32), R(d->reg), ro(d->m.base),
+               ro(d->m.index), d->m.scale, d->m.disp);
+        }
+        return NEXT;
+
+    case 0x90 ... 0x97:     /* xchg with rax; 90 itself is nop */
+        FIN();
+        r = (b & 7) | d->rb;
+        if (r == R_EAX) {
+            return NEXT;
+        }
+        if (sz < 2) {
+            return UNKNOWN;
+        }
+        E2(sz == 3 ? G(xchg64) : G(xchg32), R(R_EAX), R(r));
+        return NEXT;
+
+    case 0x98:
+        FIN();
+        if (sz < 2) {
+            return UNKNOWN;
+        }
+        E0(sz == 3 ? G(cdqe) : G(cwde));
+        return NEXT;
+
+    case 0x99:
+        FIN();
+        if (sz < 2) {
+            return UNKNOWN;
+        }
+        E0(sz == 3 ? G(cqo) : G(cdq));
+        return NEXT;
+
+    case 0x9c:              /* pushf */
+        FIN();
+        if (d->o16) {
+            return UNKNOWN;
+        }
+        E4(G(call_c), aok_x86_helper_pushf, c->off, 0, 0);
+        E2(push_tab[c->mp], T0, word(c, 3));
+        set_flags(c, HF_NONE, CC_OP_EFLAGS);
+        return NEXT;
+
+    case 0xa4 ... 0xa7:     /* movs, cmps, stos, lods, scas */
+    case 0xaa ... 0xaf: {
+        static const uint8_t kind[6] = { S_MOVS, S_CMPS, 0, S_STOS, S_LODS,
+                                         S_SCAS };
+        int k = kind[(b - 0xa4) >> 1], rp = d->rep ? 1 : d->repne ? 2 : 0;
+
+        FIN();
+        if (d->a32) {
+            return UNKNOWN;
+        }
+        E4(G(call_c_stop), aok_x86_helper_string, c->off,
+           k | bsz << 4 | rp << 8, d->seg >= 0 ? SEGBASE(d->seg) : 0);
+        c->hf = HF_NONE;
+        if (k == S_CMPS || k == S_SCAS) {
+            c->cc = rp ? -1 : CC_OP_SUBB + bsz;
+        }
+        return NEXT;
+    }
+
+    case 0xa8:
+    case 0xa9:
+        imm = fimmz(d, bsz);
+        FIN();
+        d->mod = 3;
+        d->rm = R_EAX;
+        return alu_imm(c, d, ALU_TEST, bsz, imm);
+
+    case 0xb0 ... 0xb7:
+        imm = fimm(d, 1);
+        FIN();
+        E2(G(movi8), r8(d, (b & 7) | d->rb), imm);
+        return NEXT;
+
+    case 0xb8 ... 0xbf:
+        imm = fimm(d, sz == 3 ? 8 : sz == 1 ? 2 : 4);
+        FIN();
+        r = (b & 7) | d->rb;
+        if (sz == 1) {
+            E2(G(movi16), R(r), imm);
+        } else {
+            E2(G(movi64), R(r), sz == 3 ? imm : (uint32_t)imm);
+        }
+        return NEXT;
+
+    case 0xc0:              /* shifts by an immediate, by one, by cl */
+    case 0xc1:
+        modrm(d);
+        imm = fimm(d, 1);
+        FIN();
+        return shift(c, d, bsz, false, imm);
+    case 0xd0:
+    case 0xd1:
+        modrm(d);
+        FIN();
+        return shift(c, d, bsz, false, 1);
+    case 0xd2:
+    case 0xd3:
+        modrm(d);
+        FIN();
+        return shift(c, d, bsz, true, 0);
+
+    case 0xc2:
+    case 0xc3:
+        imm = b == 0xc2 ? (uint16_t)fimm(d, 2) : 0;
+        FIN();
+        if (d->o16 || c->no_goto_ptr) {
+            return UNKNOWN;
+        }
+        E2(ret_tab[c->mp], imm, word(c, 3));
+        aok_emit_lookup_operands(&c->g);
+        return END;
+
+    case 0xc6:              /* mov E, immediate */
+    case 0xc7:
+        modrm(d);
+        imm = fimmz(d, bsz);
+        FIN();
+        if (d->reg & 7) {
+            return UNKNOWN;
+        }
+        if (d->mod != 3) {
+            mem(c, d, storei_tab[bsz], imm, bsz);
+        } else if (bsz == 0) {
+            E2(G(movi8), r8(d, d->rm), imm);
+        } else if (bsz == 1) {
+            E2(G(movi16), R(d->rm), imm);
+        } else {
+            E2(G(movi64), R(d->rm), bsz == 3 ? imm : (uint32_t)imm);
+        }
+        return NEXT;
+
+    case 0xc9:
+        FIN();
+        if (d->o16) {
+            return UNKNOWN;
+        }
+        E1(leave_tab[c->mp], word(c, 3));
+        c->hf = HF_NONE;
+        return NEXT;
+
+    case 0xe8:
+        imm = fimm(d, 4);
+        FIN();
+        if (d->o16) {
+            return UNKNOWN;
+        }
+        E2(call_tab[c->mp], c->off + c->len, word(c, 3));
+        way(c, 0, (int64_t)c->off + c->len + imm);
+        return END;
+
+    case 0xe9:
+    case 0xeb:
+        imm = fimm(d, b == 0xe9 ? 4 : 1);
+        FIN();
+        if (d->o16) {
+            return UNKNOWN;
+        }
+        E0(G(jmp));
+        way(c, 0, (int64_t)c->off + c->len + imm);
+        return END;
+
+    case 0xfa:              /* cli and sti, where IOPL allows them */
+        FIN();
+        if (!c->iopl_ok) {
+            return UNKNOWN;
+        }
+        E0(G(cli));
+        return NEXT;
+    case 0xfb:
+        FIN();
+        if (!c->iopl_ok) {
+            return UNKNOWN;
+        }
+        E0(G(sti));
+        c->sti = true;
+        return NEXT;
+
+    case 0xf6:
+    case 0xf7:
+        modrm(d);
+        if ((d->reg & 7) < 2) {
+            imm = fimmz(d, bsz);
+            FIN();
+            return alu_imm(c, d, ALU_TEST, bsz, imm);
+        }
+        FIN();
+        return group3(c, d, bsz);
+
+    case 0xfe:
+    case 0xff:
+        modrm(d);
+        FIN();
+        return group5(c, d, bsz, b == 0xff);
+
+    default:
+        return UNKNOWN;
+    }
+}
+
+/*
+ * One attempt at the TB. Returns false if an insn that flags_dead() counted
+ * on did not get into it: then what was emitted is wrong, and the TB is
+ * translated again with every flag computed.
+ */
+static bool translate(Ctx *c, CPUState *cs, TranslationBlock *tb,
+                      int max_insns, vaddr pc, const uint8_t *code, int *r)
+{
+    uint64_t *sti_start = NULL;
+    unsigned sti_off = 0;
+    int sti_fix = 0;
+
+    c->off = 0;
+    c->hf = HF_NONE;
+    c->cc = -1;
+    c->must = 0;
+    c->sti = false;
+    *r = NEXT;
+    aok_gen_begin(&c->g, cs, tb, max_insns, cpu_mmu_index(cs, false));
+    c->g.lookup = G(lookup);
+
+    /* A TB stays in its page, and so does each of its insns. */
+    while (aok_gen_room(&c->g, 24) && c->page_off + c->off < TARGET_PAGE_SIZE) {
+        uint64_t *start = c->g.p;
+        int n_fix = c->g.n_fix;
+        unsigned owed = c->must;
+        bool after_sti = c->sti;
+
+        c->must = 0;
+        c->sti = false;
+        c->cut = false;
+        *r = insn(c, code + c->off, code + (TARGET_PAGE_SIZE - c->page_off));
+        if (*r == UNKNOWN && c->cut && c->off == 0) {
+            /*
+             * The TB's first insn runs into the next page: then it is the
+             * whole TB, as it is TCG's (which ends a TB before such an insn,
+             * so that a fault of the fetch is this insn's).
+             */
+            unsigned rem = TARGET_PAGE_SIZE - c->page_off;
+            const uint8_t *next = aok_gen_next_page(&c->g, cs, pc + rem);
+            bool live = c->live;
+            uint8_t buf[32];
+
+            if (!next) {
+                return true;
+            }
+            memcpy(buf, code, rem);
+            memcpy(buf + rem, next, 16);
+            c->g.p = start;
+            c->g.n_fix = n_fix;
+            c->live = false;
+            *r = insn(c, buf, buf + rem + 16);
+            c->live = live;
+            if (*r == UNKNOWN || c->sti) {
+                c->g.p = start;
+                c->g.n_fix = n_fix;
+                c->sti = false;
+                *r = UNKNOWN;
+                return true;
+            }
+            aok_gen_insn_end(&c->g, c->page_off, CC_OP_DYNAMIC);
+            c->off = c->len;
+            return true;
+        }
+        if (after_sti && (*r != NEXT || c->sti)) {
+            /*
+             * sti takes effect after the insn that follows it, and here that
+             * is done by keeping the two in one TB that ends in the main
+             * loop. This insn cannot be that one, so the sti is not ours.
+             */
+            c->g.p = sti_start;
+            c->g.n_fix = sti_fix;
+            c->g.n_insns--;
+            c->off = sti_off;
+            c->sti = false;
+            *r = UNKNOWN;
+            return !owed;
+        }
+        if (*r == UNKNOWN) {
+            c->g.p = start;
+            c->g.n_fix = n_fix;
+            return !owed;
+        }
+        aok_gen_insn_end(&c->g, c->page_off + c->off, CC_OP_DYNAMIC);
+        if (c->sti) {
+            sti_start = start;
+            sti_fix = n_fix;
+            sti_off = c->off;
+        }
+        c->off += c->len;
+        if (owed > 1) {
+            c->must = MAX(c->must, owed - 1);
+        }
+        if (after_sti) {
+            /* Interrupts are enabled from here: the main loop looks. */
+            E1(G(exit), c->off);
+            *r = END;
+        }
+        if (*r == END) {
+            return !c->must;
+        }
+    }
+    if (c->sti) {
+        /* Nothing after it fits: as above. */
+        c->g.p = sti_start;
+        c->g.n_fix = sti_fix;
+        c->g.n_insns--;
+        c->off = sti_off;
+        c->sti = false;
+        *r = UNKNOWN;
+    }
+    return !c->must;
+}
+
+int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
+                           int *max_insns, vaddr pc, void *host_pc)
+{
+    uint32_t flags = tb->flags, cflags = tb_cflags(tb);
+    CPUX86State *env = cpu_env(cs);
+    Ctx cc = { 0 }, *c = &cc;
+    int r;
+
+    /*
+     * The state this translator knows: 64-bit code that is not being
+     * stepped, is not in the shadow of a mov to ss, in system management
+     * mode or a guest of SVM, and has no bound registers to reset at each
+     * branch. And an ordinary TB: one in RAM that may check for interrupts
+     * and need not stop after a set number of insns.
+     */
+    if (!host_pc || !(cflags & CF_PCREL) || TARGET_PAGE_BITS != 12 ||
+        (cflags & (CF_COUNT_MASK | CF_SINGLE_STEP | CF_MEMI_ONLY |
+                   CF_USE_ICOUNT | CF_NOIRQ | CF_BP_PAGE | CF_STEP_ATOMIC)) ||
+        !(flags & HF_CS64_MASK) ||
+        (flags & (HF_INHIBIT_IRQ_MASK | HF_TF_MASK | HF_RF_MASK | HF_VM_MASK |
+                  HF_SMM_MASK | HF_GUEST_MASK | HF_MPX_EN_MASK))) {
+        return 0;
+    }
+
+    c->page_off = pc & ~TARGET_PAGE_MASK;
+    c->mp = cflags & CF_PARALLEL;
+    c->no_goto_ptr = cflags & CF_NO_GOTO_PTR;
+    c->iopl_ok = (flags & HF_CPL_MASK) <= ((flags >> IOPL_SHIFT) & 3);
+    c->abm = env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_ABM;
+    c->bmi1 = env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_BMI1;
+    c->live = !x86_nolive;
+    if (!translate(c, cs, tb, *max_insns, pc, host_pc, &r)) {
+        c->live = false;
+        translate(c, cs, tb, *max_insns, pc, host_pc, &r);
+    }
+    if (c->g.n_insns == 0) {
+        aok_stats.declined_first++;
+        aok_stats.declined_op[(c->op >> 1) & 0x7f]++;
+        return 0;
+    }
+    if (r != END) {
+        E0(G(jmp));
+        way(c, 0, c->off);
+    }
+    return aok_gen_finish(&c->g, c->off);
+}

@@ -160,6 +160,13 @@ void aok_gen_pair(AokGen *g, uint64_t *from, const AokPairSet *set);
 
 void aok_gen_begin(AokGen *g, CPUState *cpu, TranslationBlock *tb,
                    int max_insns, int mmu_idx);
+/*
+ * For a TB whose first insn runs into the next page, at @addr: that page's
+ * code, the page having been made the TB's second, or NULL if it is not RAM.
+ * It may not return: the fetch faults, as it should, or the page's lock
+ * has to be taken in another order and the translation starts again.
+ */
+const void *aok_gen_next_page(AokGen *g, CPUState *cpu, vaddr addr);
 /* Record that the words emitted since the last call are one guest insn. */
 void aok_gen_insn_end(AokGen *g, uint64_t pc_page_offset, uint64_t insn);
 uint64_t aok_slot(AokGen *g, int n);
@@ -222,6 +229,9 @@ typedef struct AokStats {
     uint64_t enter_aok, enter_tcg;
     /* aok_lookup_tb_ptr: found a stream, found TCG's TB, found nothing. */
     uint64_t lookup_aok, lookup_tcg, lookup_none;
+    /* Of those, the TB's pc was in the jump cache; with other flags. */
+    uint64_t lookup_cached, lookup_cached_flags, lookup_cached_cflags;
+    uint64_t lookup_flag_bit[32];   /* which bits of the flags differed */
     /* TBs left to TCG, by the major opcode of their first insn. */
     uint64_t declined_op[128], declined_c;
     /* Pairs fused, and how many of them forward a register. */

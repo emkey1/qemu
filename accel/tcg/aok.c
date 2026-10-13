@@ -12,6 +12,8 @@
 #include "tcg/tcg.h"
 #include "tcg/insn-start-words.h"
 #include "accel/tcg/aok.h"
+#include "internal-common.h"
+#include "tb-internal.h"
 
 bool aok_enabled = true;
 bool aok_stats_enabled;
@@ -22,8 +24,9 @@ AokStats aok_stats;
  * first insn. Each such entry is a stream that could not go on, so this is
  * the list of what a front end should learn next.
  */
-#define AOK_PROF_SIZE 8192
+#define AOK_PROF_SIZE 65536
 static bool aok_prof_enabled;
+static uint64_t aok_prof_dropped;
 static struct AokProf {
     uint64_t pc, n;
     uint32_t insn;
@@ -53,6 +56,7 @@ void aok_stats_tcg_entry(CPUState *cpu)
             return;
         }
     }
+    aok_prof_dropped++;
 }
 
 static int aok_prof_cmp(const void *a, const void *b)
@@ -68,11 +72,17 @@ static void aok_print_stats(void)
 
     if (aok_prof_enabled) {
         qsort(aok_prof, AOK_PROF_SIZE, sizeof(aok_prof[0]), aok_prof_cmp);
-        for (int i = 0; i < 400 && aok_prof[i].n; i++) {
+        /* The head of the list, and of the tail whatever is not noise. */
+        for (int i = 0; i < AOK_PROF_SIZE && aok_prof[i].n; i++) {
+            if (i >= 400 && aok_prof[i].n < 100) {
+                break;
+            }
             fprintf(stderr, "aok: tcg-entry %10" PRIu64 " %016" PRIx64
                     " %08x\n", aok_prof[i].n, aok_prof[i].pc,
                     aok_prof[i].insn);
         }
+        fprintf(stderr, "aok: %" PRIu64 " entries into TCG's code went "
+                "uncounted\n", aok_prof_dropped);
     }
 
     fprintf(stderr, "aok: %" PRIu64 " of %" PRIu64 " TBs (%.1f%%), "
@@ -85,6 +95,20 @@ static void aok_print_stats(void)
             PRIu64 ", TCG's TB %" PRIu64 ", nothing %" PRIu64 "\n",
             aok_stats.enter_aok, aok_stats.enter_tcg, aok_stats.lookup_aok,
             aok_stats.lookup_tcg, aok_stats.lookup_none);
+    fprintf(stderr, "aok: of those lookups %" PRIu64 " were for a pc the "
+            "jump cache had, %" PRIu64 " of them under other flags and %"
+            PRIu64 " other cflags\n", aok_stats.lookup_cached,
+            aok_stats.lookup_cached_flags, aok_stats.lookup_cached_cflags);
+    if (aok_stats.lookup_cached_flags) {
+        fprintf(stderr, "aok: the flags that differed, by bit:");
+        for (int i = 0; i < 32; i++) {
+            if (aok_stats.lookup_flag_bit[i]) {
+                fprintf(stderr, " %d:%" PRIu64, i,
+                        aok_stats.lookup_flag_bit[i]);
+            }
+        }
+        fprintf(stderr, "\n");
+    }
     fprintf(stderr, "aok: first insns left to TCG, by major opcode:");
     for (int i = 0; i < 128; i++) {
         if (aok_stats.declined_op[i]) {
@@ -219,6 +243,29 @@ void aok_gen_pair(AokGen *g, uint64_t *from, const AokPairSet *set)
         return;                 /* a pair is not the head of another */
     }
     g->pair_prev = from;
+}
+
+const void *aok_gen_next_page(AokGen *g, CPUState *cpu, vaddr addr)
+{
+    TranslationBlock *tb = g->tb;
+    tb_page_addr_t page0, old_page1, new_page1;
+    void *host;
+
+    /* As translator_access() takes a TB into its second page. */
+    new_page1 = get_page_addr_code_hostp(cpu_env(cpu), addr, &host);
+    if (new_page1 == -1) {
+        return NULL;
+    }
+    old_page1 = tb_page_addr1(tb);
+    if (new_page1 != old_page1) {
+        page0 = tb_page_addr0(tb);
+        if (old_page1 != -1) {
+            tb_unlock_page1(page0, old_page1);
+        }
+        tb_set_page_addr1(tb, new_page1);
+        tb_lock_page1(page0, new_page1);
+    }
+    return host;
 }
 
 void aok_gen_insn_end(AokGen *g, uint64_t pc_page_offset, uint64_t insn)

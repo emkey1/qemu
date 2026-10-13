@@ -718,6 +718,29 @@ const void *aok_lookup_tb_ptr(CPUArchState *env)
         cpu_loop_exit(cpu);
     }
 
+    if (unlikely(aok_stats_enabled)) {
+        /* Why did the lookup gadget not find it: was it there to find? */
+        uint32_t h = tb_jmp_cache_hash_func(s.pc);
+
+        for (int way = 0; way < 2; way++) {
+            TranslationBlock *t = cpu->tb_jmp_cache->array[h ^ way].tb;
+
+            if (t && cpu->tb_jmp_cache->array[h ^ way].pc == s.pc) {
+                aok_stats.lookup_cached++;
+                if (t->flags != s.flags || t->cs_base != s.cs_base) {
+                    aok_stats.lookup_cached_flags++;
+                    for (int b = 0; b < 32; b++) {
+                        if ((t->flags ^ s.flags) >> b & 1) {
+                            aok_stats.lookup_flag_bit[b]++;
+                        }
+                    }
+                } else if (tb_cflags(t) != s.cflags) {
+                    aok_stats.lookup_cached_cflags++;
+                }
+                break;
+            }
+        }
+    }
     tb = tb_lookup(cpu, s);
     if (unlikely(aok_stats_enabled)) {
         *(tb == NULL ? &aok_stats.lookup_none :

@@ -333,9 +333,15 @@ AES, SHA-1, SHA-256, PMULL and CRC32 where guest and host both have them.
   good and every TB is flushed. FP is also TCG's while it traps, in
   streaming mode, and wherever SVE is enabled with vectors longer than 128
   bits, whose upper part a write would have to clear.
-* Left to TCG: the other exceptions, the LSE atomics, the structure loads
-  and stores (``ld1`` and the like), SVE and SME; and with LSE2, whose
-  alignment rule is another, the exclusives and ordered accesses.
+* **The structure loads and stores**: ``ld1`` and ``st1`` of one to four
+  whole registers are gadgets (in a little-endian guest they are that many
+  loads or stores of 8 or 16 bytes, whatever the arrangement); the
+  interleaved ones, a single lane and the replicating loads are a call to C
+  that reads and writes an element at a time as ``trans_LD_mult()`` and its
+  kin do.
+* Left to TCG: the other exceptions, the LSE atomics, SVE and SME; and with
+  LSE2, whose alignment rule is another, the exclusives and ordered
+  accesses.
 
 A TB is translated only in AArch64 state with a little-endian guest and
 4 KiB pages, with no single-step, alignment checking, MTE, GCS, nested

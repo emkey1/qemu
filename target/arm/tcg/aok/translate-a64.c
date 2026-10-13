@@ -116,6 +116,10 @@ VLDST(DECL, 5) DECL(vload32_6) DECL(vload64_6) DECL(vload128_6)
 #define VPAIRS(X, m) X(vldp32_##m) X(vldp64_##m) X(vldp128_##m) \
     X(vstp32_##m) X(vstp64_##m) X(vstp128_##m)
 VPAIRS(DECL, 0) VPAIRS(DECL, 1) VPAIRS(DECL, 2)
+#define VSTRUCT(X, n) X(vld1_##n##_q) X(vld1_##n##_d) X(vst1_##n##_q) \
+    X(vst1_##n##_d)
+VSTRUCT(DECL, 1) VSTRUCT(DECL, 2) VSTRUCT(DECL, 3) VSTRUCT(DECL, 4)
+DECL(ldpsw_fast) DECL(ldpsw_post) DECL(ldpsw_pre)
 /* ... and the shapes of everything else, with the thunks (gadgets-simd.S) */
 DECL(v2) DECL(v3) DECL(v4) DECL(xv) DECL(vx)
 DECL(v2_fp) DECL(v3_fp) DECL(v4_fp) DECL(xv_fp) DECL(vx_fp)
@@ -830,6 +834,208 @@ void aok_a64_helper_vst(CPUARMState *env, uint64_t addr, uint64_t pc,
     if (a.pair) {
         a64_vst1(env, a.rt2, addr + (1 << a.size), a.size, idx);
     }
+}
+
+/*
+ * The structure loads and stores, as trans_LD_mult(), trans_ST_mult(),
+ * trans_LD_single(), trans_ST_single() and trans_LD_single_repl(): memory is
+ * read and written an element at a time, in the order they do it, and a
+ * register gets each element as it arrives. The translator has checked the
+ * encoding (struct_shape() below is the one decoder for both).
+ */
+typedef struct A64Struct {
+    bool valid, single, repl, load, post, q;
+    unsigned rpt, selem, scale, index, rm, rn, rt, total;
+} A64Struct;
+
+static A64Struct struct_shape(uint32_t insn)
+{
+    A64Struct a = {
+        .q = insn & (1 << 30), .post = insn & (1 << 23),
+        .load = insn & (1 << 22), .rm = (insn >> 16) & 31,
+        .rn = (insn >> 5) & 31, .rt = insn & 31,
+    };
+    unsigned size = (insn >> 10) & 3;
+
+    if ((insn >> 31) || (!a.post && a.rm)) {
+        return a;
+    }
+    if (!(insn & (1 << 24))) {
+        static const uint8_t shape[16][2] = {       /* opcode: rpt, selem */
+            [0] = { 1, 4 }, [2] = { 4, 1 }, [4] = { 1, 3 }, [6] = { 3, 1 },
+            [7] = { 1, 1 }, [8] = { 1, 2 }, [10] = { 2, 1 },
+        };
+        unsigned opcode = (insn >> 12) & 15;
+
+        a.rpt = shape[opcode][0];
+        a.selem = shape[opcode][1];
+        if ((insn & (1 << 21)) || !a.rpt || (size == 3 && !a.q && a.selem != 1)) {
+            return a;
+        }
+        /* A whole register is as many doublewords, in a little-endian guest. */
+        a.scale = a.selem == 1 ? 3 : size;
+        a.total = a.rpt * a.selem * (a.q ? 16 : 8);
+    } else {
+        unsigned opc = (insn >> 14) & 3, s = (insn >> 12) & 1;
+
+        a.single = true;
+        a.selem = (((insn >> 13) & 1) << 1 | ((insn >> 21) & 1)) + 1;
+        a.rpt = 1;
+        if (opc == 3) {
+            if (!a.load || s) {
+                return a;
+            }
+            a.repl = true;
+            a.scale = size;
+        } else if (opc == 0) {
+            a.index = a.q << 3 | s << 2 | size;
+        } else if (opc == 1) {
+            if (size & 1) {
+                return a;
+            }
+            a.scale = 1;
+            a.index = a.q << 2 | s << 1 | size >> 1;
+        } else if (size == 0) {
+            a.scale = 2;
+            a.index = a.q << 1 | s;
+        } else if (size == 1 && !s) {
+            a.scale = 3;
+            a.index = a.q;
+        } else {
+            return a;
+        }
+        a.total = a.selem << a.scale;
+    }
+    a.valid = true;
+    return a;
+}
+
+static uint64_t a64_ld_elem(CPUARMState *env, uint64_t addr, unsigned scale,
+                            int idx)
+{
+    switch (scale) {
+    case 0:
+        return cpu_ldb_mmu(env, addr, make_memop_idx(MO_UB, idx), 0);
+    case 1:
+        return cpu_ldw_mmu(env, addr, make_memop_idx(MO_LEUW, idx), 0);
+    case 2:
+        return cpu_ldl_mmu(env, addr, make_memop_idx(MO_LEUL, idx), 0);
+    default:
+        return cpu_ldq_mmu(env, addr, make_memop_idx(MO_LEUQ, idx), 0);
+    }
+}
+
+static void a64_st_elem(CPUARMState *env, uint64_t addr, uint64_t v,
+                        unsigned scale, int idx)
+{
+    switch (scale) {
+    case 0:
+        cpu_stb_mmu(env, addr, v, make_memop_idx(MO_UB, idx), 0);
+        break;
+    case 1:
+        cpu_stw_mmu(env, addr, v, make_memop_idx(MO_LEUW, idx), 0);
+        break;
+    case 2:
+        cpu_stl_mmu(env, addr, v, make_memop_idx(MO_LEUL, idx), 0);
+        break;
+    default:
+        cpu_stq_mmu(env, addr, v, make_memop_idx(MO_LEUQ, idx), 0);
+        break;
+    }
+}
+
+/* Element @e of a V register, of 1 << @scale bytes. */
+static uint64_t a64_velem(CPUARMState *env, unsigned r, unsigned e,
+                          unsigned scale)
+{
+    unsigned bit = (e << scale) * 8;
+
+    return extract64(aa64_vfp_qreg(env, r)[bit / 64], bit % 64, 8 << scale);
+}
+
+static void a64_set_velem(CPUARMState *env, unsigned r, unsigned e,
+                          unsigned scale, uint64_t v)
+{
+    unsigned bit = (e << scale) * 8;
+    uint64_t *q = &aa64_vfp_qreg(env, r)[bit / 64];
+
+    *q = deposit64(*q, bit % 64, 8 << scale, v);
+}
+
+static void a64_struct(CPUARMState *env, uint64_t pc, uint32_t insn,
+                       bool writeback)
+{
+    A64Struct a = struct_shape(insn);
+    int idx = EX_TBFLAG_ANY(env->hflags, MMUIDX);
+    uint64_t addr = a64_clean_addr(env, env->xregs[a.rn]);
+
+    a64_sync_pc(env, pc, 0);
+    if (a.single) {
+        for (unsigned xs = 0; xs < a.selem; xs++, addr += 1 << a.scale) {
+            unsigned r = (a.rt + xs) % 32;
+
+            if (!a.load) {
+                a64_st_elem(env, addr, a64_velem(env, r, a.index, a.scale),
+                            a.scale, idx);
+            } else if (a.repl) {
+                static const uint64_t ones[4] = {
+                    0x0101010101010101ull, 0x0001000100010001ull,
+                    0x0000000100000001ull, 1,
+                };
+                uint64_t v = a64_ld_elem(env, addr, a.scale, idx) * ones[a.scale];
+
+                aa64_vfp_qreg(env, r)[0] = v;
+                aa64_vfp_qreg(env, r)[1] = a.q ? v : 0;
+            } else {
+                a64_set_velem(env, r, a.index, a.scale,
+                              a64_ld_elem(env, addr, a.scale, idx));
+            }
+        }
+    } else {
+        unsigned elements = (a.q ? 16 : 8) >> a.scale;
+
+        for (unsigned r = 0; r < a.rpt; r++) {
+            for (unsigned e = 0; e < elements; e++) {
+                for (unsigned xs = 0; xs < a.selem; xs++, addr += 1 << a.scale) {
+                    unsigned tt = (a.rt + r + xs) % 32;
+
+                    if (a.load) {
+                        a64_set_velem(env, tt, e, a.scale,
+                                      a64_ld_elem(env, addr, a.scale, idx));
+                    } else {
+                        a64_st_elem(env, addr, a64_velem(env, tt, e, a.scale),
+                                    a.scale, idx);
+                    }
+                }
+            }
+        }
+        if (a.load && !a.q) {
+            for (unsigned r = 0; r < a.rpt * a.selem; r++) {
+                aa64_vfp_qreg(env, (a.rt + r) % 32)[1] = 0;
+            }
+        }
+    }
+    if (writeback && a.post) {
+        env->xregs[a.rn] += a.rm == 31 ? a.total : env->xregs[a.rm];
+    }
+}
+
+/* From the call gadget: the whole insn. */
+void aok_a64_helper_struct(CPUARMState *env, uint64_t pc, uint64_t insn,
+                           void *unused);
+void aok_a64_helper_struct(CPUARMState *env, uint64_t pc, uint64_t insn,
+                           void *unused)
+{
+    a64_struct(env, pc, insn, true);
+}
+
+/* The slow path of the ld1 and st1 gadgets, which write the base back. */
+void aok_a64_helper_struct_slow(CPUARMState *env, uint64_t addr, uint64_t pc,
+                                uint32_t insn);
+void aok_a64_helper_struct_slow(CPUARMState *env, uint64_t addr, uint64_t pc,
+                                uint32_t insn)
+{
+    a64_struct(env, pc, insn, false);
 }
 
 /*
@@ -2258,7 +2464,29 @@ static int vldst(Ctx *c, uint32_t insn)
     }
     case 7:
         break;
-    default:                /* the structure loads and stores */
+    case 1: {               /* the structure loads and stores */
+#define STAB(n) { { G(vst1_##n##_d), G(vst1_##n##_q) }, \
+                  { G(vld1_##n##_d), G(vld1_##n##_q) } }
+        static const Gadget stab[4][2][2] = { STAB(1), STAB(2), STAB(3), STAB(4) };
+        A64Struct a = struct_shape(insn);
+        uint64_t regs = 0;
+
+        if ((insn & (1 << 29)) || ((insn >> 25) & 1) || !a.valid) {
+            return UNKNOWN;
+        }
+        if (a.single || a.selem != 1) {
+            return call(c, G(call), aok_a64_helper_struct, NULL);
+        }
+        for (unsigned r = 0; r < a.rpt; r++) {
+            regs |= (uint64_t)VOFF((a.rt + r) % 32) << (16 * r);
+        }
+        emit(c, stab[a.rpt - 1][a.load][a.q], 5, regs, (uint64_t)rsp(rn),
+             (uint64_t)(a.post && a.rm == 31 ? a.total : 0),
+             (uint64_t)(a.post && a.rm != 31 ? XOFF(a.rm)
+                        : offsetof(CPUARMState, aok_zero)), word);
+        return NEXT;
+    }
+    default:
         return UNKNOWN;
     }
 
@@ -2365,8 +2593,19 @@ static int ldst(Ctx *c, uint32_t insn)
         bool load = insn & (1 << 22), wb = mode & 1;
         int64_t imm = sextract64(insn, 15, 7) * (size ? 8 : 4);
 
+        if (size == 1 && load) {
+            /* ldpsw */
+            static const Gadget sw[3] = { G(ldpsw_fast), G(ldpsw_post), G(ldpsw_pre) };
+
+            if (rt == rt2 || (wb && rn != 31 && (rn == rt || rn == rt2))) {
+                return UNKNOWN;
+            }
+            E4(sw[mode == 1 ? 1 : mode == 3 ? 2 : 0], wz(rt) | wz(rt2) << 16,
+               rsp(rn), sextract64(insn, 15, 7) * 4, word);
+            return NEXT;
+        }
         if (size & 1) {
-            return UNKNOWN; /* ldpsw, stgp */
+            return UNKNOWN; /* stgp */
         }
         /* What the architecture leaves open is TCG's to decide. */
         if ((load && rt == rt2) || (wb && rn != 31 && (rn == rt || rn == rt2))) {

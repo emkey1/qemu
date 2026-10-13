@@ -175,6 +175,7 @@ static const Gadget hf_add_tab[4] = { SIZES(ENTRY, hf_add) };
 static const Gadget hf_logic_tab[4] = { SIZES(ENTRY, hf_logic) };
 DECL(cond) DECL(cf_sub) DECL(cf_add) DECL(cf_zero) DECL(cf) DECL(cf_bt)
 DECL(flush_cc)
+DECL(clr_rf)
 
 /* The host's conditions, in the order of the tables there is one of each in. */
 enum { A_EQ, A_NE, A_CS, A_CC, A_MI, A_PL, A_VS, A_VC, A_HI, A_LS, A_GE, A_LT,
@@ -3995,6 +3996,15 @@ static bool translate(Ctx *c, CPUState *cs, TranslationBlock *tb,
     *r = NEXT;
     aok_gen_begin(&c->g, cs, tb, max_insns, cpu_mmu_index(cs, false));
     c->g.lookup = G(lookup);
+    if (tb->flags & HF_RF_MASK) {
+        /*
+         * The insn a fault is returned to: the resume flag is what tells this
+         * TB from the one that will be run there next time, and no more than
+         * that here (breakpoints are found before a TB is entered). It is
+         * cleared at once, where TCG clears it at the TB's end.
+         */
+        E0(G(clr_rf));
+    }
 
     /* A TB stays in its page, and so does each of its insns. */
     while (aok_gen_room(&c->g, 24) && c->page_off + c->off < TARGET_PAGE_SIZE) {
@@ -4111,7 +4121,7 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     if (!host_pc || !(cflags & CF_PCREL) || TARGET_PAGE_BITS != 12 ||
         (cflags & (CF_COUNT_MASK | CF_SINGLE_STEP | CF_MEMI_ONLY |
                    CF_USE_ICOUNT | CF_NOIRQ | CF_BP_PAGE | CF_STEP_ATOMIC)) ||
-        (flags & (HF_INHIBIT_IRQ_MASK | HF_TF_MASK | HF_RF_MASK | HF_VM_MASK |
+        (flags & (HF_INHIBIT_IRQ_MASK | HF_TF_MASK | HF_VM_MASK |
                   HF_SMM_MASK | HF_GUEST_MASK | HF_MPX_EN_MASK))) {
         return 0;
     }

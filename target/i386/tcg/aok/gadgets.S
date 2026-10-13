@@ -1432,6 +1432,13 @@ g_hf hf_logic\bits, logic, \bits
     strb w9, [_cpu, #AOK_X86_ENV_TMP1]
     gret
 
+/* The resume flag, cleared: the head of a TB a fault was returned to. */
+.gadget clr_rf
+    ldr w9, [_cpu, #AOK_X86_ENV_EFLAGS]
+    and w9, w9, #0xfffeffff
+    str w9, [_cpu, #AOK_X86_ENV_EFLAGS]
+    gret
+
 /* Make the lazy flags the flags themselves (CC_OP_EFLAGS), in C. */
 .gadget flush_cc
     aok_fp_end

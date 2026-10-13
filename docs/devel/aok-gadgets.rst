@@ -531,9 +531,13 @@ with the gadgets.
   operations, 16-bit addressing, a bit string addressed by a register, and
   anything with VEX or EVEX.
 
-A TB is translated only with no single-step or resume flag pending, outside
-the shadow of a ``mov`` to ``ss``, system management mode and SVM guests,
-with MPX off. Self-modifying code is found as TCG finds it,
+A TB is translated only with no single-step flag pending, outside the shadow
+of a ``mov`` to ``ss``, system management mode and SVM guests, with MPX off.
+The resume flag is no bar: a TB entered with it (the instruction a fault was
+returned to) clears it in its first gadget. Before that such TBs were TCG's,
+and whatever followed a page fault in its block was run by another engine
+than the time before, which for the x87 means other answers.
+Self-modifying code is found as TCG finds it,
 with one difference: a store into the page of the TB that is running does
 not stop that TB at the store, so an instruction that rewrites one further
 on in its own TB still runs the old one once.
@@ -621,8 +625,7 @@ hardware: ``x87kat`` is iSH-AOK's three known-answer programs (every D8-DF
 form under the four rounding and four precision settings from stacks that
 overflow and underflow, the same with exceptions unmasked, and the
 transcendentals), 167,517 answers recorded on an AMD Ryzen. Both PC guests
-pass all of them but one or two in a run, which differ from run to run (the
-next commit). The same n-body program
+pass all of them, three times over in one boot. The same n-body program
 compiled for the x87 (``nbody87``, in the 32-bit guest) takes 107 G host
 cycles under TCG and 39 G under the gadgets.
 

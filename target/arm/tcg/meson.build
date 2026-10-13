@@ -39,6 +39,7 @@ if get_option('aok_gadgets')
   arm_system_ss.add(when: 'TARGET_AARCH64', if_true: files(
     'aok/gadgets.S',
     'aok/gadgets-shared.S',
+    'aok/gadgets-simd.S',
     'aok/translate-a64.c',
   ), if_false: files('aok/stub.c'))
 endif

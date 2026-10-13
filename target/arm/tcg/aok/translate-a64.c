@@ -1,13 +1,13 @@
 /*
  * AOK gadgets for AArch64 guests: the translator.
  *
- * Turns A64 integer, load/store, branch and system instructions into a
- * gadget stream (include/accel/tcg/aok.h). It translates what it is sure of
- * and stops in front of anything else -- floating point and SIMD, the LSE
- * atomics, an encoding it does not know, a feature it does not model -- so
- * that the next TB starts there and TCG translates it, raising whatever
- * exception is due. A TB whose first insn is one of those is declined
- * outright.
+ * Turns A64 instructions into a gadget stream (include/accel/tcg/aok.h):
+ * integer, loads and stores, branches, system instructions, and the base
+ * architecture's floating point and SIMD. It translates what it is sure of
+ * and stops in front of anything else -- the LSE atomics, a later extension,
+ * an encoding it does not know, a feature it does not model -- so that the
+ * next TB starts there and TCG translates it, raising whatever exception is
+ * due. A TB whose first insn is one of those is declined outright.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -24,6 +24,11 @@
 #include "helper-a64.h"
 #include "qemu/atomic.h"
 #include "qemu/atomic128.h"
+#include "host/cpuinfo.h"
+#include "exec/tb-flush.h"
+#ifdef CONFIG_DARWIN
+#include <sys/sysctl.h>
+#endif
 #include "exec/target_page.h"
 #include "exec/translation-block.h"
 #include "accel/tcg/aok.h"
@@ -102,6 +107,29 @@ DECL(b) DECL(bl) D2(cbz) D2(cbnz) DECL(tbz) DECL(tbnz)
 DECL(br) DECL(blr) DECL(br_exit) DECL(blr_exit) DECL(lookup) DECL(barrier)
 DECL(call) DECL(call_exit) DECL(mrs_sp_el0)
 
+/* FP and SIMD registers: loads and stores (gadgets-shared.S) ... */
+#define VLDST(X, m) X(vload8_##m) X(vload16_##m) X(vload32_##m) \
+    X(vload64_##m) X(vload128_##m) X(vstore8_##m) X(vstore16_##m) \
+    X(vstore32_##m) X(vstore64_##m) X(vstore128_##m)
+VLDST(DECL, 0) VLDST(DECL, 1) VLDST(DECL, 2) VLDST(DECL, 3) VLDST(DECL, 4)
+VLDST(DECL, 5) DECL(vload32_6) DECL(vload64_6) DECL(vload128_6)
+#define VPAIRS(X, m) X(vldp32_##m) X(vldp64_##m) X(vldp128_##m) \
+    X(vstp32_##m) X(vstp64_##m) X(vstp128_##m)
+VPAIRS(DECL, 0) VPAIRS(DECL, 1) VPAIRS(DECL, 2)
+/* ... and the shapes of everything else, with the thunks (gadgets-simd.S) */
+DECL(v2) DECL(v3) DECL(v4) DECL(xv) DECL(vx)
+DECL(v2_fp) DECL(v3_fp) DECL(v4_fp) DECL(xv_fp) DECL(vx_fp)
+DECL(vtbl) DECL(vconst) DECL(vorr_const) DECL(vand_const)
+DECL(vcmp) DECL(vccmp) DECL(vccmp_nf) DECL(vcsel) DECL(vcsel_nf) DECL(xcrc)
+#define THUNKS(name) extern const uint64_t aok_a64_thunks_##name[];
+THUNKS(v3same) THUNKS(v3diff) THUNKS(s3same) THUNKS(s3diff) THUNKS(v2misc)
+THUNKS(s2misc) THUNKS(vlanes) THUNKS(spair) THUNKS(copy) THUNKS(shift)
+THUNKS(elem) THUNKS(perm) THUNKS(ext) THUNKS(tbl) THUNKS(fp1) THUNKS(fp2)
+THUNKS(fp3) THUNKS(fpint) THUNKS(fpfix) THUNKS(fcmp) THUNKS(fccmp)
+THUNKS(fcsel) THUNKS(aes) THUNKS(sha3) THUNKS(sha2) THUNKS(crc)
+/* The i-th thunk of a table: eight bytes each. */
+#define TH(name, i) ((uint64_t)(uintptr_t)&aok_a64_thunks_##name[i])
+
 /* The gadgets there are one of for each condition, and their tables. */
 #define CONDS(X, p, s) X(p##eq##s) X(p##ne##s) X(p##cs##s) X(p##cc##s) \
     X(p##mi##s) X(p##pl##s) X(p##vs##s) X(p##vc##s) X(p##hi##s) X(p##ls##s) \
@@ -141,6 +169,11 @@ QEMU_BUILD_BUG_ON(offsetof(CPUARMState, ZF) != AOK_A64_ENV_ZF);
 QEMU_BUILD_BUG_ON(offsetof(CPUARMState, xregs[30]) != AOK_A64_ENV_X30);
 QEMU_BUILD_BUG_ON(offsetof(CPUARMState, pstate) != AOK_A64_ENV_PSTATE);
 QEMU_BUILD_BUG_ON(PSTATE_SP != 1);
+QEMU_BUILD_BUG_ON(offsetof(CPUARMState, vfp.zregs[0]) != AOK_A64_ENV_V0);
+QEMU_BUILD_BUG_ON(sizeof(ARMVectorReg) != AOK_A64_V_STRIDE);
+QEMU_BUILD_BUG_ON(offsetof(CPUARMState, vfp.fpcr) != AOK_A64_ENV_FPCR);
+/* A pair's two V register offsets share a word too. */
+QEMU_BUILD_BUG_ON(offsetof(CPUARMState, vfp.zregs[32]) >= 0x10000);
 /* A pair's two register offsets share a word, sixteen bits each. */
 QEMU_BUILD_BUG_ON(offsetof(CPUARMState, aok_sink) >= 0x10000);
 
@@ -162,12 +195,14 @@ typedef struct Ctx {
     int el, fp_excp_el;
     bool bti, pauth_active, pauth, fgt, no_goto_ptr;
     bool unpriv, trap_eret, fgt_svc, lse2, ras, gcs;
+    bool fp;                /* FP and SIMD run on the host's unit here */
     bool no_sys, no_exc, no_atomic;     /* QEMU_AOK_NO_*, for bisecting */
 } Ctx;
 
 /* ---- Operands --------------------------------------------------------- */
 
 #define XOFF(r) offsetof(CPUARMState, xregs[r])
+#define VOFF(r) offsetof(CPUARMState, vfp.zregs[r])
 
 /* A register as a source and as a destination, where 31 is XZR. */
 static inline uint64_t rz(unsigned r)
@@ -680,10 +715,184 @@ void aok_a64_helper_stx(CPUARMState *env, uint64_t pc, uint64_t insn,
     env->exclusive_addr = -1;
 }
 
-/* No gadget computes on the host's FP unit yet. */
+/* ---- FP and SIMD: what is done in C -----------------------------------------
+ *
+ * The slow path of a load or store of V registers (gadgets-shared.S): the
+ * whole access, registers and all, as do_fp_ld() and do_fp_st() make it.
+ */
+typedef struct A64VAccess {
+    unsigned size, rt, rt2;     /* size: log2 of the bytes of one register */
+    bool pair;
+} A64VAccess;
+
+static A64VAccess a64_vaccess(uint32_t insn)
+{
+    A64VAccess a = { .rt = insn & 31 };
+
+    if ((insn & 0x3a000000) == 0x28000000) {
+        a.pair = true;
+        a.size = 2 + (insn >> 30);
+        a.rt2 = (insn >> 10) & 31;
+    } else if ((insn & 0x3b000000) == 0x18000000) {
+        a.size = 2 + (insn >> 30);
+    } else {
+        a.size = insn & (1 << 23) ? 4 : insn >> 30;
+    }
+    return a;
+}
+
+static void a64_vld1(CPUARMState *env, unsigned rt, uint64_t addr,
+                     unsigned size, int idx)
+{
+    uint64_t *q = aa64_vfp_qreg(env, rt);
+    uint64_t lo, hi = 0;
+
+    switch (size) {
+    case 0:
+        lo = cpu_ldb_mmu(env, addr, make_memop_idx(MO_UB, idx), 0);
+        break;
+    case 1:
+        lo = cpu_ldw_mmu(env, addr, make_memop_idx(MO_LEUW, idx), 0);
+        break;
+    case 2:
+        lo = cpu_ldl_mmu(env, addr, make_memop_idx(MO_LEUL, idx), 0);
+        break;
+    case 3:
+        lo = cpu_ldq_mmu(env, addr, make_memop_idx(MO_LEUQ, idx), 0);
+        break;
+    default: {
+        Int128 v = cpu_ld16_mmu(env, addr,
+                                make_memop_idx(MO_128 | MO_LE |
+                                               MO_ATOM_IFALIGN_PAIR, idx), 0);
+
+        lo = int128_getlo(v);
+        hi = int128_gethi(v);
+        break;
+    }
+    }
+    q[0] = lo;
+    q[1] = hi;
+}
+
+static void a64_vst1(CPUARMState *env, unsigned rt, uint64_t addr,
+                     unsigned size, int idx)
+{
+    uint64_t *q = aa64_vfp_qreg(env, rt);
+
+    switch (size) {
+    case 0:
+        cpu_stb_mmu(env, addr, q[0], make_memop_idx(MO_UB, idx), 0);
+        break;
+    case 1:
+        cpu_stw_mmu(env, addr, q[0], make_memop_idx(MO_LEUW, idx), 0);
+        break;
+    case 2:
+        cpu_stl_mmu(env, addr, q[0], make_memop_idx(MO_LEUL, idx), 0);
+        break;
+    case 3:
+        cpu_stq_mmu(env, addr, q[0], make_memop_idx(MO_LEUQ, idx), 0);
+        break;
+    default:
+        cpu_st16_mmu(env, addr, int128_make128(q[0], q[1]),
+                     make_memop_idx(MO_128 | MO_LE | MO_ATOM_IFALIGN_PAIR,
+                                    idx), 0);
+        break;
+    }
+}
+
+void aok_a64_helper_vld(CPUARMState *env, uint64_t addr, uint64_t pc,
+                        uint32_t insn);
+void aok_a64_helper_vld(CPUARMState *env, uint64_t addr, uint64_t pc,
+                        uint32_t insn)
+{
+    A64VAccess a = a64_vaccess(insn);
+    int idx = EX_TBFLAG_ANY(env->hflags, MMUIDX);
+
+    addr = a64_clean_addr(env, addr);
+    a64_sync_pc(env, pc, 0);
+    a64_vld1(env, a.rt, addr, a.size, idx);
+    if (a.pair) {
+        a64_vld1(env, a.rt2, addr + (1 << a.size), a.size, idx);
+    }
+}
+
+void aok_a64_helper_vst(CPUARMState *env, uint64_t addr, uint64_t pc,
+                        uint32_t insn);
+void aok_a64_helper_vst(CPUARMState *env, uint64_t addr, uint64_t pc,
+                        uint32_t insn)
+{
+    A64VAccess a = a64_vaccess(insn);
+    int idx = EX_TBFLAG_ANY(env->hflags, MMUIDX);
+
+    addr = a64_clean_addr(env, addr);
+    a64_sync_pc(env, pc, 0);
+    a64_vst1(env, a.rt, addr, a.size, idx);
+    if (a.pair) {
+        a64_vst1(env, a.rt2, addr + (1 << a.size), a.size, idx);
+    }
+}
+
+/*
+ * TCGCPUOps.aok_fold_fpsr: what a run of FP gadgets raised in the host's
+ * FPSR. It is the guest's FPSR, bit for bit.
+ */
 void arm_aok_fold_fpsr(CPUState *cs, uint32_t fpsr)
 {
-    g_assert_not_reached();
+    CPUARMState *env = cpu_env(cs);
+
+    env->vfp.fpsr |= fpsr & FPSR_CEXC_MASK;
+    if (fpsr & FPSR_QC) {
+        env->vfp.qc[0] = 1;
+    }
+}
+
+/*
+ * The gadgets compute under the guest's FPCR by giving it to the host
+ * (gadgets-simd.S, fp_on). That is sound for the rounding mode, FZ and DN,
+ * which every host has and QEMU models as the architecture has them. A TB
+ * does not say what the FPCR is, and is every CPU's: so the first time any
+ * CPU's FPCR gets another bit -- alternative half precision, FZ16, the AFP
+ * modes, EBF -- FP and SIMD become TCG's for good, and what was translated
+ * is thrown away.
+ */
+static bool aok_a64_fp_odd;
+
+void arm_aok_fpcr_changed(CPUARMState *env)
+{
+    if (!qatomic_read(&aok_a64_fp_odd) &&
+        (env->vfp.fpcr & ~(FPCR_RMODE_MASK | FPCR_FZ | FPCR_DN))) {
+        qatomic_set(&aok_a64_fp_odd, true);
+        queue_tb_flush(env_cpu(env));
+    }
+}
+
+/* Whether this host has an instruction set extension the base does not. */
+enum { HOST_CRC32, HOST_SHA1, HOST_SHA256, HOST_N };
+
+static bool a64_host_has(int what)
+{
+    static int known[HOST_N];   /* 1: no, 2: yes */
+
+    if (!known[what]) {
+        bool yes = false;
+#ifdef CONFIG_DARWIN
+        static const char *const name[HOST_N] = {
+            "hw.optional.armv8_crc32", "hw.optional.arm.FEAT_SHA1",
+            "hw.optional.arm.FEAT_SHA256",
+        };
+        int val = 0;
+        size_t len = sizeof(val);
+
+        yes = sysctlbyname(name[what], &val, &len, NULL, 0) == 0 && val;
+#elif defined(CONFIG_LINUX)
+        /* HWCAP_CRC32, HWCAP_SHA1, HWCAP_SHA2 */
+        static const unsigned long bit[HOST_N] = { 1 << 7, 1 << 5, 1 << 6 };
+
+        yes = qemu_getauxval(AT_HWCAP) & bit[what];
+#endif
+        known[what] = 1 + yes;
+    }
+    return known[what] == 2;
 }
 
 /* ---- Data processing, immediate -------------------------------------------- */
@@ -1032,8 +1241,15 @@ static int dp_reg(Ctx *c, uint32_t insn)
                      : imm6 == 8 ? SF(lslv) : imm6 == 9 ? SF(lsrv)
                      : imm6 == 10 ? SF(asrv) : imm6 == 11 ? SF(rorv) : NULL;
 
+            if (!g && (imm6 & 0x38) == 0x10 && sf == ((imm6 & 3) == 3) &&
+                cpu_isar_feature(aa64_crc32, c->cpu) &&
+                a64_host_has(HOST_CRC32)) {
+                /* crc32 and crc32c, on the host's own */
+                E4(G(xcrc), wz(rd), rz(rn), rz(rm), TH(crc, imm6 & 7));
+                return NEXT;
+            }
             if (!g) {
-                return UNKNOWN; /* crc32, pacga, the MTE and CSSC ones */
+                return UNKNOWN; /* pacga, the MTE and CSSC ones */
             }
             E3(g, wz(rd), rz(rn), rz(rm));
         } else {
@@ -1311,6 +1527,781 @@ static int branch_sys(Ctx *c, uint32_t insn)
     return UNKNOWN;
 }
 
+/* ---- Floating point and SIMD -----------------------------------------------------
+ *
+ * An instruction of this class is computed by itself (gadgets-simd.S): a
+ * gadget loads the registers, calls the thunk that is the same encoding on
+ * fixed registers, and stores the result. So the work here is not what an
+ * instruction does but whether it exists: for a guest of the base
+ * architecture, the tables of "Data processing -- scalar floating-point and
+ * Advanced SIMD", as a64.decode and its trans_ functions have them, without
+ * half-precision arithmetic and every later extension. What is not listed is
+ * TCG's, to raise what is due or to compute it.
+ *
+ * Each table answers V_NO, V_YES, or V_FP for an instruction that rounds,
+ * raises an FP exception or saturates, whose gadget begins with fp_on.
+ */
+enum { V_NO, V_YES, V_FP };
+#define SAT 0x10            /* in a size mask: V_FP */
+
+/* The plain shape, or its twin that begins with fp_on. */
+#define SHAPE(name, kind) ((kind) == V_FP ? G(name##_fp) : G(name))
+
+/* An integer row: @mask has a bit for each element size the row has. */
+static int int_row(unsigned mask, unsigned size)
+{
+    return !(mask >> size & 1) ? V_NO : mask & SAT ? V_FP : V_YES;
+}
+
+/*
+ * An FP row is four instructions, by U and the top bit of size, and @rows
+ * has a bit for each: bit (U * 2 + size<1>). The low bit of size chooses
+ * single or double precision.
+ */
+static int fp_row(unsigned rows, unsigned u, unsigned size)
+{
+    return rows >> (u * 2 + (size >> 1)) & 1 ? V_FP : V_NO;
+}
+
+static int v3same_ok(unsigned u, unsigned size, unsigned op, bool scalar,
+                     bool q)
+{
+    static const uint8_t vec[24][2] = {
+        [0x00] = { 7, 7 }, [0x01] = { 15 | SAT, 15 | SAT },
+        [0x02] = { 7, 7 }, [0x04] = { 7, 7 },
+        [0x05] = { 15 | SAT, 15 | SAT }, [0x06] = { 15, 15 },
+        [0x07] = { 15, 15 }, [0x08] = { 15, 15 },
+        [0x09] = { 15 | SAT, 15 | SAT }, [0x0a] = { 15, 15 },
+        [0x0b] = { 15 | SAT, 15 | SAT }, [0x0c] = { 7, 7 },
+        [0x0d] = { 7, 7 }, [0x0e] = { 7, 7 }, [0x0f] = { 7, 7 },
+        [0x10] = { 15, 15 }, [0x11] = { 15, 15 }, [0x12] = { 7, 7 },
+        [0x13] = { 7, 1 }, [0x14] = { 7, 7 }, [0x15] = { 7, 7 },
+        [0x16] = { 6 | SAT, 6 | SAT }, [0x17] = { 15, 0 },
+    };
+    static const uint8_t sca[24][2] = {
+        [0x01] = { 15 | SAT, 15 | SAT }, [0x05] = { 15 | SAT, 15 | SAT },
+        [0x06] = { 8, 8 }, [0x07] = { 8, 8 }, [0x08] = { 8, 8 },
+        [0x09] = { 15 | SAT, 15 | SAT }, [0x0a] = { 8, 8 },
+        [0x0b] = { 15 | SAT, 15 | SAT }, [0x10] = { 8, 8 },
+        [0x11] = { 8, 8 }, [0x16] = { 6 | SAT, 6 | SAT },
+    };
+    static const uint8_t vec_fp[8] = { 0xf, 0x3, 0xf, 0x5, 0xd, 0xc, 0xf, 0x7 };
+    static const uint8_t sca_fp[8] = { 0, 0, 0x8, 0x1, 0xd, 0xc, 0, 0x3 };
+
+    if (op >= 0x18) {
+        if (!scalar && (size & 1) && !q) {
+            return V_NO;        /* doubles come in twos */
+        }
+        return fp_row((scalar ? sca_fp : vec_fp)[op - 0x18], u, size);
+    }
+    if (scalar) {
+        return int_row(sca[op][u], size);
+    }
+    if (op == 3) {
+        return V_YES;           /* and, bic, orr, orn, eor, bsl, bit, bif */
+    }
+    if (size == 3 && !q) {
+        return V_NO;
+    }
+    return int_row(vec[op][u], size);
+}
+
+static int v3diff_ok(Ctx *c, unsigned u, unsigned size, unsigned op,
+                     bool scalar)
+{
+    switch (op) {
+    case 9: case 11: case 13:       /* sqdmlal, sqdmlsl, sqdmull */
+        return u ? V_NO : int_row(6 | SAT, size);
+    case 14:                        /* pmull */
+        if (scalar || u) {
+            return V_NO;
+        }
+        if (size == 3) {
+            return cpu_isar_feature(aa64_pmull, c->cpu) &&
+                   (cpuinfo & CPUINFO_PMULL) ? V_YES : V_NO;
+        }
+        return size == 0 ? V_YES : V_NO;
+    case 15:
+        return V_NO;
+    default:                        /* the lengthening, widening, narrowing */
+        return scalar ? V_NO : int_row(7, size);
+    }
+}
+
+static int v2misc_ok(unsigned u, unsigned size, unsigned op, bool scalar,
+                     bool q)
+{
+    static const uint8_t vec[32][2] = {
+        [0x00] = { 7, 3 }, [0x01] = { 1, 0 }, [0x02] = { 7, 7 },
+        [0x03] = { 15 | SAT, 15 | SAT }, [0x04] = { 7, 7 },
+        [0x05] = { 1, 3 }, [0x06] = { 7, 7 },
+        [0x07] = { 15 | SAT, 15 | SAT }, [0x08] = { 15, 15 },
+        [0x09] = { 15, 15 }, [0x0a] = { 15, 0 }, [0x0b] = { 15, 15 },
+        [0x12] = { 7, 7 | SAT }, [0x13] = { 0, 7 },
+        [0x14] = { 7 | SAT, 7 | SAT },
+    };
+    static const uint8_t sca[32][2] = {
+        [0x03] = { 15 | SAT, 15 | SAT }, [0x07] = { 15 | SAT, 15 | SAT },
+        [0x08] = { 8, 8 }, [0x09] = { 8, 8 }, [0x0a] = { 8, 0 },
+        [0x0b] = { 8, 8 }, [0x12] = { 0, 7 | SAT },
+        [0x14] = { 7 | SAT, 7 | SAT },
+    };
+    /* FP rows, from opcode 0x0c: 0xff marks the ones with rules of their own */
+    static const uint8_t vec_fp[20] = {
+        [0x0c - 0x0c] = 0xa, 0xa, 0x2, 0xa,
+        [0x16 - 0x0c] = 0xff, 0xff, 0x7, 0xf, 0xf, 0xf, 0xff, 0xf, 0, 0x8,
+    };
+    static const uint8_t sca_fp[20] = {
+        [0x0c - 0x0c] = 0xa, 0xa, 0x2, 0,
+        [0x16 - 0x0c] = 0xff, 0, 0, 0, 0xf, 0xf, 0x5, 0xf, 0, 0x2,
+    };
+    unsigned rows;
+
+    if (op < 0x0c || (op >= 0x10 && op < 0x16)) {
+        if (!scalar && size == 3 && !q) {
+            return V_NO;
+        }
+        return int_row((scalar ? sca : vec)[op][u], size);
+    }
+    rows = (scalar ? sca_fp : vec_fp)[op - 0x0c];
+    if (rows != 0xff) {
+        if (!scalar && (size & 1) && !q) {
+            return V_NO;
+        }
+        return fp_row(rows, u, size);
+    }
+    switch (op) {
+    case 0x16:      /* fcvtn (not a scalar), fcvtxn */
+        return u ? (size == 1 ? V_FP : V_NO)
+                 : (!scalar && size < 2 ? V_FP : V_NO);
+    case 0x17:      /* fcvtl */
+        return !u && size < 2 ? V_FP : V_NO;
+    default:        /* 0x1c: fcvtas, fcvtau; urecpe, ursqrte on words */
+        if (size < 2) {
+            return size == 1 && !q ? V_NO : V_FP;
+        }
+        return size == 2 ? V_YES : V_NO;
+    }
+}
+
+static int vlanes_ok(unsigned u, unsigned size, unsigned op, bool q)
+{
+    switch (op) {
+    case 0x03: case 0x0a: case 0x1a:    /* addlv, maxv, minv */
+        return size < 2 || (size == 2 && q) ? V_YES : V_NO;
+    case 0x1b:                          /* addv */
+        return !u && (size < 2 || (size == 2 && q)) ? V_YES : V_NO;
+    case 0x0c: case 0x0f:               /* fmaxnmv, fminnmv; fmaxv, fminv */
+        return u && q && !(size & 1) ? V_FP : V_NO;
+    default:
+        return V_NO;
+    }
+}
+
+static int spair_ok(unsigned u, unsigned size, unsigned op)
+{
+    switch (op) {
+    case 0x1b:                          /* addp */
+        return !u && size == 3 ? V_YES : V_NO;
+    case 0x0c: case 0x0f:               /* fmaxnmp, fminnmp; fmaxp, fminp */
+        return u ? V_FP : V_NO;
+    case 0x0d:                          /* faddp */
+        return u && size < 2 ? V_FP : V_NO;
+    default:
+        return V_NO;
+    }
+}
+
+static int shift_ok(unsigned u, unsigned immh, unsigned op, bool scalar,
+                    bool q)
+{
+    bool wide = immh & 8;
+
+    if (!scalar && wide && !q && (op < 0x10 || op >= 0x1c)) {
+        return V_NO;
+    }
+    switch (op) {
+    case 0x00: case 0x02: case 0x04: case 0x06:     /* shr, sra, rshr, rsra */
+    case 0x0a:                                      /* shl, sli */
+        return scalar && !wide ? V_NO : V_YES;
+    case 0x08:                                      /* sri */
+        return !u || (scalar && !wide) ? V_NO : V_YES;
+    case 0x0c:                                      /* sqshlu */
+        return u ? V_FP : V_NO;
+    case 0x0e:                                      /* sqshl, uqshl */
+        return V_FP;
+    case 0x10: case 0x11:               /* shrn, rshrn; sqshrun, sqrshrun */
+        return wide || (scalar && !u) ? V_NO : u ? V_FP : V_YES;
+    case 0x12: case 0x13:               /* sqshrn, sqrshrn and the unsigned */
+        return wide ? V_NO : V_FP;
+    case 0x14:                                      /* sshll, ushll */
+        return wide || scalar ? V_NO : V_YES;
+    case 0x1c: case 0x1f:               /* scvtf, ucvtf; fcvtzs, fcvtzu */
+        return immh >= 4 ? V_FP : V_NO;
+    default:
+        return V_NO;
+    }
+}
+
+static int elem_ok(unsigned u, unsigned size, unsigned op, bool l, bool scalar,
+                   bool q)
+{
+    if (op == 1 || op == 5 || op == 9) {
+        /* fmla, fmls, fmul, and fmulx: singles, or doubles by two */
+        if ((u && op != 9) || size < 2 || (size == 3 && (l || (!scalar && !q)))) {
+            return V_NO;
+        }
+        return V_FP;
+    }
+    if (size != 1 && size != 2) {
+        return V_NO;
+    }
+    switch (op) {
+    case 0x2: case 0x6: case 0xa:           /* mlal, mlsl, mull */
+        return scalar ? V_NO : V_YES;
+    case 0x3: case 0x7: case 0xb:           /* sqdmlal, sqdmlsl, sqdmull */
+    case 0xc: case 0xd:                     /* sqdmulh, sqrdmulh */
+        return u ? V_NO : V_FP;
+    case 0x8:                               /* mul */
+        return u || scalar ? V_NO : V_YES;
+    case 0x0: case 0x4:                     /* mla, mls */
+        return !u || scalar ? V_NO : V_YES;
+    default:
+        return V_NO;
+    }
+}
+
+/* VFPExpandImm(): the eight bits of an FP immediate as a single or a double. */
+static uint64_t vfp_expand_imm(bool dbl, unsigned imm8)
+{
+    uint64_t sign = imm8 >> 7, b = (imm8 >> 6) & 1, frac = imm8 & 0x3f;
+
+    if (dbl) {
+        return sign << 63 | (b ? 0x3fc0ull : 0x4000ull) << 48 | frac << 48;
+    }
+    return sign << 31 | (b ? 0x3e000000u : 0x40000000u) | frac << 19;
+}
+
+/* AdvSIMDExpandImm(): a modified immediate, replicated over 64 bits. */
+static uint64_t simd_expand_imm(unsigned op, unsigned cmode, unsigned imm8)
+{
+    uint64_t imm;
+
+    switch (cmode >> 1) {
+    case 0: case 1: case 2: case 3:
+        imm = (uint64_t)imm8 << (8 * (cmode >> 1));
+        return imm << 32 | imm;
+    case 4: case 5:
+        imm = imm8 << (8 * ((cmode >> 1) & 1));
+        return imm * 0x0001000100010001ull;
+    case 6:
+        imm = cmode & 1 ? imm8 << 16 | 0xffff : imm8 << 8 | 0xff;
+        return imm << 32 | imm;
+    default:
+        if (!(cmode & 1)) {
+            if (!op) {
+                return imm8 * 0x0101010101010101ull;
+            }
+            imm = 0;
+            for (int i = 0; i < 8; i++) {
+                imm |= imm8 & (1 << i) ? 0xffull << (8 * i) : 0;
+            }
+            return imm;
+        }
+        if (op) {
+            return vfp_expand_imm(true, imm8);
+        }
+        imm = vfp_expand_imm(false, imm8);
+        return imm << 32 | imm;
+    }
+}
+
+/* A scalar FP instruction: bits 28:25 are 1111, 30 and 29 clear. */
+static int fp_scalar(Ctx *c, uint32_t insn)
+{
+    unsigned rd = insn & 31, rn = (insn >> 5) & 31, rm = (insn >> 16) & 31;
+    unsigned type = (insn >> 22) & 3, sf = insn >> 31;
+    unsigned rmode = (insn >> 19) & 3, opc = (insn >> 16) & 7;
+    bool to_int;
+
+    if (insn & (1 << 24)) {                     /* fmadd and its kin */
+        if (sf || type > 1) {
+            return UNKNOWN;
+        }
+        emit(c, G(v4_fp), 5, (uint64_t)VOFF(rd), (uint64_t)VOFF(rn),
+             (uint64_t)VOFF(rm), (uint64_t)VOFF((insn >> 10) & 31),
+             TH(fp3, type << 2 | ((insn >> 21) & 1) << 1 | ((insn >> 15) & 1)));
+        return NEXT;
+    }
+    if (!(insn & (1 << 21))) {                  /* to and from fixed point */
+        unsigned scale = (insn >> 10) & 63;
+
+        if (type > 1 || (!sf && scale < 32)) {
+            return UNKNOWN;
+        }
+        if (rmode == 0 && (opc == 2 || opc == 3)) {
+            to_int = false;
+        } else if (rmode == 3 && opc < 2) {
+            to_int = true;
+        } else {
+            return UNKNOWN;
+        }
+        E3(to_int ? G(xv_fp) : G(vx_fp), to_int ? wz(rd) : VOFF(rd),
+           to_int ? VOFF(rn) : rz(rn),
+           TH(fpfix, sf << 13 | type << 11 | rmode << 9 | opc << 6 | scale));
+        return NEXT;
+    }
+    switch ((insn >> 10) & 3) {
+    case 1: {                                   /* fccmp, fccmpe */
+        unsigned cond = (insn >> 12) & 15;
+
+        if (sf || type > 1) {
+            return UNKNOWN;
+        }
+        E3(c->nf ? G(vccmp_nf) : G(vccmp), VOFF(rn), VOFF(rm),
+           TH(fccmp, type << 9 | cond << 5 | (insn & 0x1f)));
+        c->nf = true;
+        return NEXT;
+    }
+    case 2: {                                   /* two sources */
+        unsigned op = (insn >> 12) & 15;
+
+        if (sf || type > 1 || op > 8) {
+            return UNKNOWN;
+        }
+        E4(G(v3_fp), VOFF(rd), VOFF(rn), VOFF(rm), TH(fp2, type << 4 | op));
+        return NEXT;
+    }
+    case 3:                                     /* fcsel */
+        if (sf || type > 1) {
+            return UNKNOWN;
+        }
+        E4(c->nf ? G(vcsel_nf) : G(vcsel), VOFF(rd), VOFF(rn), VOFF(rm),
+           TH(fcsel, type << 4 | ((insn >> 12) & 15)));
+        c->nf = true;
+        return NEXT;
+    }
+
+    if (!(insn & 0xfc00)) {                     /* to and from an integer */
+        unsigned idx = sf << 7 | type << 5 | rmode << 3 | opc;
+        bool fmov = opc >= 6;
+
+        if (type == 2) {
+            /* fmov between X and the top half of a V register */
+            if (!sf || rmode != 1 || !fmov) {
+                return UNKNOWN;
+            }
+        } else if (type == 3) {
+            return UNKNOWN;
+        } else if (fmov) {
+            if (rmode || sf != type) {
+                return UNKNOWN;
+            }
+        } else if (rmode && opc > 1) {
+            return UNKNOWN;
+        }
+        to_int = opc < 2 || opc == 4 || opc == 5 || opc == 6;
+        if (to_int) {
+            E3(fmov ? G(xv) : G(xv_fp), wz(rd), VOFF(rn), TH(fpint, idx));
+        } else {
+            E3(fmov ? G(vx) : G(vx_fp), VOFF(rd), rz(rn), TH(fpint, idx));
+        }
+        return NEXT;
+    }
+    if (sf) {
+        return UNKNOWN;
+    }
+    if ((insn & 0x1c00) == 0x1000) {            /* fmov with an immediate */
+        if (type > 1 || rn) {
+            return UNKNOWN;
+        }
+        E3(G(vconst), VOFF(rd), vfp_expand_imm(type, (insn >> 13) & 0xff), 0);
+        return NEXT;
+    }
+    if ((insn & 0x3c00) == 0x2000) {            /* fcmp, fcmpe */
+        if (type > 1 || (insn & 0xc007)) {
+            return UNKNOWN;
+        }
+        E3(G(vcmp), VOFF(rn), VOFF(rm), TH(fcmp, type << 2 | ((insn >> 3) & 3)));
+        c->nf = true;
+        return NEXT;
+    }
+    if ((insn & 0x7c00) == 0x4000) {            /* one source */
+        unsigned op = (insn >> 15) & 63;
+        bool ok;
+
+        if (type == 3) {
+            ok = op == 4 || op == 5;            /* a half made wider */
+        } else if (type == 2) {
+            ok = false;
+        } else {
+            ok = op < 4 || (op == 4 && type == 1) || (op == 5 && type == 0) ||
+                 op == 7 || (op >= 8 && op <= 15 && op != 13);
+        }
+        if (!ok) {
+            return UNKNOWN;
+        }
+        E3(op < 3 ? G(v2) : G(v2_fp), VOFF(rd), VOFF(rn),
+           TH(fp1, type << 6 | op));
+        return NEXT;
+    }
+    return UNKNOWN;
+}
+
+static int fpsimd(Ctx *c, uint32_t insn)
+{
+    unsigned rd = insn & 31, rn = (insn >> 5) & 31, rm = (insn >> 16) & 31;
+    unsigned size = (insn >> 22) & 3, q = (insn >> 30) & 1;
+    unsigned u = (insn >> 29) & 1;
+    bool scalar = insn & (1 << 28);
+    int k;
+
+    if (!c->fp) {
+        return UNKNOWN;
+    }
+    if (scalar && !(insn & (3 << 29))) {
+        return fp_scalar(c, insn);
+    }
+    /* Advanced SIMD: 0 Q U 0111 ..., and its scalar forms, 01 U 1111 ... */
+    if ((insn >> 31) || (scalar && !q)) {
+        return UNKNOWN;
+    }
+
+    if (insn & (1 << 24)) {
+        unsigned immh = (insn >> 19) & 15, op = (insn >> 11) & 31;
+
+        if (insn & (1 << 10)) {
+            if (insn & (1 << 23)) {
+                return UNKNOWN;
+            }
+            if (immh) {                         /* a shift by an immediate */
+                k = shift_ok(u, immh, op, scalar, q);
+                if (!k) {
+                    return UNKNOWN;
+                }
+                E3(SHAPE(v2, k), VOFF(rd), VOFF(rn),
+                   TH(shift, scalar << 14 | q << 13 | u << 12 |
+                             ((insn >> 16) & 0x7f) << 5 | op));
+                return NEXT;
+            } else {                            /* a modified immediate */
+                unsigned cmode = (insn >> 12) & 15;
+                uint64_t imm = simd_expand_imm(u, cmode,
+                                               ((insn >> 16) & 7) << 5 | rn);
+
+                if (scalar || (insn & (1 << 11)) ||
+                    (cmode == 15 && u && !q)) {
+                    return UNKNOWN;
+                }
+                if (cmode < 12 && (cmode & 1)) {
+                    /* orr and bic; a 64-bit vector's upper half is cleared */
+                    if (u) {
+                        E3(G(vand_const), VOFF(rd), ~imm, q ? ~imm : 0);
+                    } else {
+                        if (!q) {
+                            E3(G(vand_const), VOFF(rd), -1, 0);
+                        }
+                        E3(G(vorr_const), VOFF(rd), imm, q ? imm : 0);
+                    }
+                } else {
+                    if (u && cmode < 14) {
+                        imm = ~imm;             /* mvni */
+                    }
+                    E3(G(vconst), VOFF(rd), imm, q ? imm : 0);
+                }
+                return NEXT;
+            }
+        } else {                                /* by an element */
+            bool l = insn & (1 << 21), m = insn & (1 << 20);
+            unsigned eop = (insn >> 12) & 15;
+
+            k = elem_ok(u, size, eop, l, scalar, q);
+            if (!k) {
+                return UNKNOWN;
+            }
+            /* Words and doublewords have a five-bit Rm; the thunk's is v2. */
+            E4(SHAPE(v3, k), VOFF(rd), VOFF(rn),
+               VOFF(size == 1 ? rm & 15 : rm),
+               TH(elem, scalar << 11 | q << 10 | u << 9 |
+                        size << 7 | l << 6 | (size == 1 && m) << 5 | eop << 1 |
+                        ((insn >> 11) & 1)));
+            return NEXT;
+        }
+    }
+
+    if (!(insn & (1 << 21))) {
+        bool perm = !(insn & (1 << 10)) && (insn & (1 << 11)) && !scalar && !u;
+
+        if ((size && !perm) || (insn & (1 << 15))) {
+            /* half-precision arithmetic, and extensions */
+            return UNKNOWN;
+        }
+        if (insn & (1 << 10)) {                 /* copy */
+            unsigned imm5 = rm, imm4 = (insn >> 11) & 15;
+            unsigned esz = ctz32(imm5);
+            uint64_t th = TH(copy, scalar << 11 | q << 10 | u << 9 |
+                                   imm5 << 4 | imm4);
+
+            if (!(imm5 & 15)) {
+                return UNKNOWN;
+            }
+            if (scalar) {
+                if (u || imm4) {
+                    return UNKNOWN;
+                }
+                E3(G(v2), VOFF(rd), VOFF(rn), th);      /* mov from a lane */
+                return NEXT;
+            }
+            if (u) {                                    /* ins, lane to lane */
+                if (!q) {
+                    return UNKNOWN;
+                }
+                E3(G(v2), VOFF(rd), VOFF(rn), th);
+                return NEXT;
+            }
+            switch (imm4) {
+            case 0:                                     /* dup of a lane */
+                if (esz == 3 && !q) {
+                    return UNKNOWN;
+                }
+                E3(G(v2), VOFF(rd), VOFF(rn), th);
+                return NEXT;
+            case 1:                                     /* dup of a register */
+                if (esz == 3 && !q) {
+                    return UNKNOWN;
+                }
+                E3(G(vx), VOFF(rd), rz(rn), th);
+                return NEXT;
+            case 3:                                     /* ins of a register */
+                if (!q) {
+                    return UNKNOWN;
+                }
+                E3(G(vx), VOFF(rd), rz(rn), th);
+                return NEXT;
+            case 5:                                     /* smov */
+                if (esz > (q ? 2 : 1)) {
+                    return UNKNOWN;
+                }
+                E3(G(xv), wz(rd), VOFF(rn), th);
+                return NEXT;
+            case 7:                                     /* umov */
+                if (q ? esz != 3 : esz == 3) {
+                    return UNKNOWN;
+                }
+                E3(G(xv), wz(rd), VOFF(rn), th);
+                return NEXT;
+            default:
+                return UNKNOWN;
+            }
+        }
+        if (scalar) {
+            /* SHA with three registers */
+            unsigned op = (insn >> 12) & 7;
+
+            if (u || (insn & (1 << 11)) || op == 7 ||
+                !(op < 4 ? cpu_isar_feature(aa64_sha1, c->cpu) &&
+                           a64_host_has(HOST_SHA1)
+                         : cpu_isar_feature(aa64_sha256, c->cpu) &&
+                           a64_host_has(HOST_SHA256))) {
+                return UNKNOWN;
+            }
+            E4(G(v3), VOFF(rd), VOFF(rn), VOFF(rm), TH(sha3, op));
+            return NEXT;
+        }
+        if (u) {                                        /* ext */
+            unsigned imm4 = (insn >> 11) & 15;
+
+            if (!q && imm4 >= 8) {
+                return UNKNOWN;
+            }
+            E4(G(v3), VOFF(rd), VOFF(rn), VOFF(rm), TH(ext, q << 4 | imm4));
+            return NEXT;
+        }
+        if (insn & (1 << 11)) {                         /* uzp, trn, zip */
+            unsigned op = (insn >> 12) & 7;
+
+            if (!(op & 3) || (size == 3 && !q)) {
+                return UNKNOWN;
+            }
+            E4(G(v3), VOFF(rd), VOFF(rn), VOFF(rm),
+               TH(perm, q << 5 | size << 3 | op));
+            return NEXT;
+        }
+        /* tbl, tbx: the table is one to four registers from Vn */
+        emit(c, G(vtbl), 7, (uint64_t)VOFF(rd), (uint64_t)VOFF(rm),
+             TH(tbl, q << 3 | ((insn >> 12) & 7)), (uint64_t)VOFF(rn),
+             (uint64_t)VOFF((rn + 1) & 31), (uint64_t)VOFF((rn + 2) & 31),
+             (uint64_t)VOFF((rn + 3) & 31));
+        return NEXT;
+    }
+
+    /* Bit 21 is set: three registers, or two and an opcode where Rm was. */
+    if (insn & (1 << 10)) {
+        unsigned op = (insn >> 11) & 31;
+
+        k = v3same_ok(u, size, op, scalar, q);
+        if (!k) {
+            return UNKNOWN;
+        }
+        E4(SHAPE(v3, k), VOFF(rd), VOFF(rn), VOFF(rm),
+           scalar ? TH(s3same, u << 7 | size << 5 | op)
+                  : TH(v3same, q << 8 | u << 7 | size << 5 | op));
+        return NEXT;
+    }
+    if (!(insn & (1 << 11))) {
+        unsigned op = (insn >> 12) & 15;
+
+        k = v3diff_ok(c, u, size, op, scalar);
+        if (!k) {
+            return UNKNOWN;
+        }
+        E4(SHAPE(v3, k), VOFF(rd), VOFF(rn), VOFF(rm),
+           scalar ? TH(s3diff, u << 6 | size << 4 | op)
+                  : TH(v3diff, q << 7 | u << 6 | size << 4 | op));
+        return NEXT;
+    }
+    {
+        unsigned op = (insn >> 12) & 31;
+
+        switch ((insn >> 17) & 15) {
+        case 0:                                 /* two registers */
+            k = v2misc_ok(u, size, op, scalar, q);
+            if (!k) {
+                return UNKNOWN;
+            }
+            E3(SHAPE(v2, k), VOFF(rd), VOFF(rn),
+               scalar ? TH(s2misc, u << 7 | size << 5 | op)
+                      : TH(v2misc, q << 8 | u << 7 | size << 5 | op));
+            return NEXT;
+        case 8:                                 /* across lanes; pairwise */
+            k = scalar ? spair_ok(u, size, op) : vlanes_ok(u, size, op, q);
+            if (!k) {
+                return UNKNOWN;
+            }
+            E3(SHAPE(v2, k), VOFF(rd), VOFF(rn),
+               scalar ? TH(spair, u << 7 | size << 5 | op)
+                      : TH(vlanes, q << 8 | u << 7 | size << 5 | op));
+            return NEXT;
+        case 4:                                 /* AES; SHA with two registers */
+            if (u || size) {
+                return UNKNOWN;
+            }
+            if (scalar) {
+                if (op > 2 ||
+                    !(op == 2 ? cpu_isar_feature(aa64_sha256, c->cpu) &&
+                                a64_host_has(HOST_SHA256)
+                              : cpu_isar_feature(aa64_sha1, c->cpu) &&
+                                a64_host_has(HOST_SHA1))) {
+                    return UNKNOWN;
+                }
+                E3(G(v2), VOFF(rd), VOFF(rn), TH(sha2, op));
+                return NEXT;
+            }
+            if (!q || op < 4 || op > 7 ||
+                !cpu_isar_feature(aa64_aes, c->cpu) ||
+                !(cpuinfo & CPUINFO_AES)) {
+                return UNKNOWN;
+            }
+            E3(G(v2), VOFF(rd), VOFF(rn), TH(aes, op - 4));
+            return NEXT;
+        default:
+            return UNKNOWN;
+        }
+    }
+}
+
+/* Loads and stores of FP and SIMD registers. */
+static int vldst(Ctx *c, uint32_t insn)
+{
+#define VTAB(m) { G(vload8_##m), G(vload16_##m), G(vload32_##m), \
+                  G(vload64_##m), G(vload128_##m) }, \
+                { G(vstore8_##m), G(vstore16_##m), G(vstore32_##m), \
+                  G(vstore64_##m), G(vstore128_##m) }
+    /* [mode][store][log2 of the bytes] */
+    static const Gadget tab[6][2][5] = {
+        { VTAB(0) }, { VTAB(1) }, { VTAB(2) }, { VTAB(3) }, { VTAB(4) },
+        { VTAB(5) },
+    };
+    static const Gadget lit[3] = { G(vload32_6), G(vload64_6), G(vload128_6) };
+#define VPTAB(m) { G(vldp32_##m), G(vldp64_##m), G(vldp128_##m) }, \
+                 { G(vstp32_##m), G(vstp64_##m), G(vstp128_##m) }
+    static const Gadget ptab[3][2][3] = {
+        { VPTAB(0) }, { VPTAB(1) }, { VPTAB(2) },
+    };
+    unsigned rt = insn & 31, rn = (insn >> 5) & 31, opc = insn >> 30;
+    uint64_t word = (uint64_t)c->off << 32 | insn;
+    unsigned lsz;
+    bool store;
+
+    if (!c->fp) {
+        return UNKNOWN;
+    }
+    c->nf = false;          /* (the fast path compares) */
+
+    switch ((insn >> 27) & 7) {
+    case 3:                 /* a literal */
+        if ((insn & (1 << 24)) || opc == 3) {
+            return UNKNOWN;
+        }
+        E4(lit[opc], VOFF(rt), c->off + (sextract64(insn, 5, 19) << 2), 0,
+           word);
+        return NEXT;
+    case 5: {               /* a pair */
+        unsigned mode = (insn >> 23) & 3, rt2 = (insn >> 10) & 31;
+
+        if (opc == 3) {
+            return UNKNOWN;
+        }
+        E4(ptab[mode == 1 ? 1 : mode == 3 ? 2 : 0][!(insn & (1 << 22))][opc],
+           VOFF(rt) | VOFF(rt2) << 16, rsp(rn),
+           sextract64(insn, 15, 7) * (4 << opc), word);
+        return NEXT;
+    }
+    case 7:
+        break;
+    default:                /* the structure loads and stores */
+        return UNKNOWN;
+    }
+
+    /* One register: opc<1> makes it a Q, which the size bits must agree to. */
+    store = !(insn & (1 << 22));
+    if (insn & (1 << 23)) {
+        if (opc) {
+            return UNKNOWN;
+        }
+        lsz = 4;
+    } else {
+        lsz = opc;
+    }
+    if (insn & (1 << 24)) {                             /* unsigned offset */
+        E4(tab[0][store][lsz], VOFF(rt), rsp(rn),
+           (uint64_t)extract32(insn, 10, 12) << lsz, word);
+        return NEXT;
+    }
+    if (insn & (1 << 21)) {                             /* register offset */
+        unsigned option = (insn >> 13) & 7, rm = (insn >> 16) & 31;
+
+        if (((insn >> 10) & 3) != 2 || !(option & 2)) {
+            return UNKNOWN;
+        }
+        emit(c, tab[option == 6 ? 4 : option == 2 ? 5 : 3][store][lsz], 5,
+             (uint64_t)VOFF(rt), (uint64_t)rsp(rn), (uint64_t)rz(rm),
+             (uint64_t)(insn & (1 << 12) ? lsz : 0), word);
+        return NEXT;
+    }
+    switch ((insn >> 10) & 3) {
+    case 0:                                             /* unscaled offset */
+        E4(tab[0][store][lsz], VOFF(rt), rsp(rn), sextract64(insn, 12, 9),
+           word);
+        return NEXT;
+    case 2:
+        return UNKNOWN;
+    default:                                            /* post- and pre-index */
+        E4(tab[1 + ((insn >> 11) & 1)][store][lsz], VOFF(rt), rsp(rn),
+           sextract64(insn, 12, 9), word);
+        return NEXT;
+    }
+}
+
 /* ---- Loads and stores ---------------------------------------------------------- */
 
 #define TAB13(s) { LOADS(ENTRY, s) STORES(ENTRY, s) }
@@ -1345,7 +2336,7 @@ static int ldst(Ctx *c, uint32_t insn)
     int kind;
 
     if (insn & (1 << 26)) {
-        return UNKNOWN;     /* FP and SIMD registers */
+        return vldst(c, insn);
     }
     c->nf = false;          /* (the fast path compares) */
 
@@ -1521,6 +2512,16 @@ int arm_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     c.no_sys = getenv("QEMU_AOK_NO_SYS");
     c.no_exc = getenv("QEMU_AOK_NO_EXC");
     c.no_atomic = getenv("QEMU_AOK_NO_ATOMIC");
+    /*
+     * FP and SIMD on the host's unit: enabled, with vectors of 128 bits (a
+     * longer one's upper part would need clearing), not in streaming mode,
+     * and under an FPCR the host can be given (arm_aok_fpcr_changed).
+     */
+    c.fp = !getenv("QEMU_AOK_NO_FP") && !qatomic_read(&aok_a64_fp_odd) &&
+           !EX_TBFLAG_ANY(f, FPEXC_EL) && !EX_TBFLAG_A64(f, VL) &&
+           !EX_TBFLAG_A64(f, PSTATE_SM) &&
+           !EX_TBFLAG_A64(f, SME_TRAP_NONSTREAMING) &&
+           !EX_TBFLAG_A64(f, AH) && !EX_TBFLAG_A64(f, NEP);
     c.fp_excp_el = EX_TBFLAG_ANY(f, FPEXC_EL);
     c.unpriv = EX_TBFLAG_A64(f, UNPRIV);
     c.trap_eret = EX_TBFLAG_A64(f, TRAP_ERET);
@@ -1563,7 +2564,10 @@ int arm_aok_translate_code(CPUState *cs, TranslationBlock *tb,
         case 5: case 13:
             r = dp_reg(&c, insn);
             break;
-        default:        /* FP and SIMD, SVE, SME, the unallocated */
+        case 7: case 15:
+            r = fpsimd(&c, insn);
+            break;
+        default:        /* SVE, SME, the unallocated */
             r = UNKNOWN;
             break;
         }

@@ -16,41 +16,10 @@
 #include "accel/tcg/aok-asm.h"
 #include "aok-arm-asm.h"
 
-.macro .gadget name
-    .balign 16
-    .globl SYM(aok_gadget_a64_\name)
-SYM(aok_gadget_a64_\name):
-.endm
 
 /* As gadgets-shared.S: the flags, and the softmmu fast path. */
 _addr   .req x7
 
-.macro store_flags
-    mrs x17, nzcv
-    ubfx w16, w17, #29, #1
-    str w16, [_cpu, #AOK_A64_ENV_CF]
-    lsl w16, w17, #3
-    str w16, [_cpu, #AOK_A64_ENV_VF]
-    str w17, [_cpu, #AOK_A64_ENV_NF]
-    mvn w16, w17
-    and w16, w16, #0x40000000
-    str w16, [_cpu, #AOK_A64_ENV_ZF]
-.endm
-
-.macro load_flags
-    ldr w16, [_cpu, #AOK_A64_ENV_NF]
-    ldr w17, [_cpu, #AOK_A64_ENV_ZF]
-    and w16, w16, #0x80000000
-    cmp w17, #0
-    orr w17, w16, #0x40000000
-    csel w16, w17, w16, eq
-    ldr w17, [_cpu, #AOK_A64_ENV_CF]
-    orr w16, w16, w17, lsl #29
-    ldr w17, [_cpu, #AOK_A64_ENV_VF]
-    lsr w17, w17, #31
-    orr w16, w16, w17, lsl #28
-    msr nzcv, x16
-.endm
 
     .text
 

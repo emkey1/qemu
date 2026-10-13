@@ -20,12 +20,6 @@
 #include "accel/tcg/aok-asm.h"
 #include "aok-arm-asm.h"
 
-/* aok_gadget_a64_NAME, as gadgets.S names its own. */
-.macro .gadget name
-    .balign 16
-    .globl SYM(aok_gadget_a64_\name)
-SYM(aok_gadget_a64_\name):
-.endm
 
 /*
  * The address of an access, and what a load or store body keeps across the
@@ -47,40 +41,7 @@ _fval2  .req x1
     br x9
 .endm
 
-/* ---- The flags ---------------------------------------------------------------
- *
- * iSH-AOK keeps a guest's NZCV as the one word mrs and msr move. QEMU keeps
- * four: CF is 0 or 1, VF and NF have their flag in bit 31, and ZF is zero when
- * Z is set. Neither macro changes the host's own flags, so after store_flags
- * they are still the guest's, which is what a translator relies on when it
- * gives the next conditional gadget its no-reload form.
- */
-.macro store_flags
-    mrs x17, nzcv
-    ubfx w16, w17, #29, #1
-    str w16, [_cpu, #AOK_A64_ENV_CF]
-    lsl w16, w17, #3
-    str w16, [_cpu, #AOK_A64_ENV_VF]
-    str w17, [_cpu, #AOK_A64_ENV_NF]
-    mvn w16, w17
-    and w16, w16, #0x40000000
-    str w16, [_cpu, #AOK_A64_ENV_ZF]
-.endm
-
-.macro load_flags
-    ldr w16, [_cpu, #AOK_A64_ENV_NF]
-    ldr w17, [_cpu, #AOK_A64_ENV_ZF]
-    and w16, w16, #0x80000000
-    cmp w17, #0
-    orr w17, w16, #0x40000000
-    csel w16, w17, w16, eq
-    ldr w17, [_cpu, #AOK_A64_ENV_CF]
-    orr w16, w16, w17, lsl #29
-    ldr w17, [_cpu, #AOK_A64_ENV_VF]
-    lsr w17, w17, #31
-    orr w16, w16, w17, lsl #28
-    msr nzcv, x16
-.endm
+/* (store_flags and load_flags, the flags a body asks for: aok-arm-asm.h) */
 
 /* ---- Guest memory ----------------------------------------------------------
  *
@@ -370,3 +331,152 @@ f_gadget store16_ord, f_store, 16, strh, w17, _, _
 f_gadget store32_ord, f_store, 32, str,  w17, _, _
 f_gadget store64_ord, f_store, 64, str,  x17, _, _
 .set A64_ALIGNED, 0
+
+/* ---- FP and SIMD registers ----------------------------------------------------
+ *
+ * Loads and stores of B, H, S, D and Q registers, with the operands of the
+ * X ones. A load writes the whole V register, the bytes it read zero-extended,
+ * as do_fp_ld() does. cputlb's way makes the whole access, registers and all
+ * (aok_a64_helper_vld and _vst): a pair of loads commits its first register
+ * before the second can fault, as two do_fp_ld() do. The gadget then goes on
+ * at done_NAME, with the write-back.
+ */
+.macro a64_vslow fn, id
+    stp x1, x2, [sp, #-64]!
+    stp x3, x4, [sp, #16]
+    stp x5, x6, [sp, #32]
+    stp x8, x17, [sp, #48]
+    aok_fp_end
+    ldr x2, [_ip, #-16]         /* the host's word: _ip is past the next gadget */
+    mov x0, _cpu
+    mov x1, _addr
+    and x3, x2, #0xffffffff
+    add x2, _pc, x2, lsr #32
+    bl SYM(\fn)
+    ldp x3, x4, [sp, #16]
+    ldp x5, x6, [sp, #32]
+    ldp x8, x17, [sp, #48]
+    ldp x1, x2, [sp], #64
+    b done_\id
+.endm
+
+/*
+ * \mode: 0 [vt][rn][offset][word]; 1 the same, post-index; 2 pre-index;
+ * 3, 4, 5 [vt][rn][rm][shift][word], rm as it is, sign- and zero-extended
+ * from 32 bits; 6 a literal, [vt][delta from the entry pc][unused][word].
+ */
+.macro v_addr mode
+    ldp x8, _frn, [_ip]
+    .if \mode >= 3 && \mode <= 5
+    ldp x11, x12, [_ip, #16]
+    add _ip, _ip, #48
+    ldr x10, [_cpu, _frn]
+    ldr x11, [_cpu, x11]
+    .if \mode == 4
+    sxtw x11, w11
+    .elseif \mode == 5
+    mov w11, w11
+    .endif
+    lsl x11, x11, x12
+    add _addr, x10, x11
+    .elseif \mode == 6
+    add _ip, _ip, #40
+    add _addr, _pc, _frn
+    .else
+    ldr _fofs, [_ip, #16]
+    add _ip, _ip, #40
+    ldr x10, [_cpu, _frn]
+    add _fnewb, x10, _fofs
+    .if \mode == 1
+    mov _addr, x10
+    .else
+    mov _addr, _fnewb
+    .endif
+    .endif
+.endm
+.macro v_tail name, mode
+done_\name:
+    .if \mode == 1 || \mode == 2
+    str _fnewb, [_cpu, _frn]
+    .endif
+    gret_ahead
+.endm
+
+.macro v_load name, bits, reg, mode
+.gadget \name
+    v_addr \mode
+    a64_tlb_probe \bits, \name, TLBE_READ
+    ldr \reg, [_addr]
+    str q0, [_cpu, x8]
+    v_tail \name, \mode
+handle_miss_\name:
+    a64_unaligned \bits, \name
+    a64_vslow aok_a64_helper_vld, \name
+.endm
+.macro v_store name, bits, reg, mode
+.gadget \name
+    v_addr \mode
+    ldr q0, [_cpu, x8]
+    a64_tlb_probe \bits, \name, TLBE_WRITE
+    str \reg, [_addr]
+    v_tail \name, \mode
+handle_miss_\name:
+    a64_unaligned \bits, \name
+    a64_vslow aok_a64_helper_vst, \name
+.endm
+/* A pair: [vt | vt2 << 16][rn][offset][word] */
+.macro v_ldp name, bytes, reg1, reg2, mode
+.gadget \name
+    v_addr \mode
+    a64_tlb_probe (\bytes * 16), \name, TLBE_READ
+    ldr \reg1, [_addr]
+    ldr \reg2, [_addr, #\bytes]
+    and x9, x8, #0xffff
+    lsr x10, x8, #16
+    str q0, [_cpu, x9]
+    str q1, [_cpu, x10]
+    v_tail \name, \mode
+handle_miss_\name:
+    a64_unaligned (\bytes * 16), \name
+    a64_vslow aok_a64_helper_vld, \name
+.endm
+.macro v_stp name, bytes, reg1, reg2, mode
+.gadget \name
+    v_addr \mode
+    and x9, x8, #0xffff
+    lsr x10, x8, #16
+    ldr q0, [_cpu, x9]
+    ldr q1, [_cpu, x10]
+    a64_tlb_probe (\bytes * 16), \name, TLBE_WRITE
+    str \reg1, [_addr]
+    str \reg2, [_addr, #\bytes]
+    v_tail \name, \mode
+handle_miss_\name:
+    a64_unaligned (\bytes * 16), \name
+    a64_vslow aok_a64_helper_vst, \name
+.endm
+
+/* vload8_0 ... vstore128_5: by size in bits and by mode */
+.irp mode, 0, 1, 2, 3, 4, 5
+v_load  vload8_\mode,     8, b0, \mode
+v_load  vload16_\mode,   16, h0, \mode
+v_load  vload32_\mode,   32, s0, \mode
+v_load  vload64_\mode,   64, d0, \mode
+v_load  vload128_\mode, 128, q0, \mode
+v_store vstore8_\mode,     8, b0, \mode
+v_store vstore16_\mode,   16, h0, \mode
+v_store vstore32_\mode,   32, s0, \mode
+v_store vstore64_\mode,   64, d0, \mode
+v_store vstore128_\mode, 128, q0, \mode
+.endr
+v_load vload32_6,   32, s0, 6
+v_load vload64_6,   64, d0, 6
+v_load vload128_6, 128, q0, 6
+.irp mode, 0, 1, 2
+v_ldp vldp32_\mode,   4, s0, s1, \mode
+v_ldp vldp64_\mode,   8, d0, d1, \mode
+v_ldp vldp128_\mode, 16, q0, q1, \mode
+v_stp vstp32_\mode,   4, s0, s1, \mode
+v_stp vstp64_\mode,   8, d0, d1, \mode
+v_stp vstp128_\mode, 16, q0, q1, \mode
+.endr

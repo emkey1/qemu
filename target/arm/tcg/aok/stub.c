@@ -17,3 +17,7 @@ int arm_aok_translate_code(CPUState *cs, TranslationBlock *tb,
 void arm_aok_fold_fpsr(CPUState *cs, uint32_t fpsr)
 {
 }
+
+void arm_aok_fpcr_changed(CPUARMState *env)
+{
+}

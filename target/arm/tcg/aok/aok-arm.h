@@ -10,5 +10,7 @@
 int arm_aok_translate_code(CPUState *cs, TranslationBlock *tb,
                            int *max_insns, vaddr pc, void *host_pc);
 void arm_aok_fold_fpsr(CPUState *cs, uint32_t fpsr);
+/* After any write of the FPCR (vfp_fpscr.c). */
+void arm_aok_fpcr_changed(CPUARMState *env);
 
 #endif

@@ -66,6 +66,17 @@ void tlb_init(CPUState *cpu);
  */
 void tlb_destroy(CPUState *cpu);
 
+/*
+ * tlb_notdirty_redo - invalidate again what this thread's stores overlapped
+ * @cpu: the CPU whose thread this is
+ *
+ * For the main loop, before a TB is looked up, when tlb_notdirty_redo_n says
+ * that stores were made to pages with code since it last did: see
+ * notdirty_write().
+ */
+extern __thread unsigned tlb_notdirty_redo_n;
+void tlb_notdirty_redo(CPUState *cpu);
+
 bool tcg_exec_realizefn(CPUState *cpu, Error **errp);
 void tcg_exec_unrealizefn(CPUState *cpu);
 

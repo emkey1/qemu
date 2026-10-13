@@ -27,6 +27,8 @@
 #include "system/memory.h"
 
 #include "tcg/tcg-cpu.h"
+#include "accel/tcg/cpu-ops.h"
+#include "accel/tcg/aok.h"
 
 static void tcg_cpu_machine_done(Notifier *n, void *unused)
 {
@@ -44,9 +46,35 @@ static void tcg_cpu_machine_done(Notifier *n, void *unused)
     }
 }
 
+#ifdef CONFIG_AOK_GADGETS
+/*
+ * Which engine runs the guest: a PC has no device tree to say it in, and the
+ * fw_cfg file (accel/tcg/aok-system.c) takes a driver to read. The
+ * processor's name takes none, in any system: with the gadgets on it ends in
+ * "(AOK gadgets)" where there is room for that.
+ */
+static void x86_aok_name(X86CPU *cpu)
+{
+    static const char tag[] = " (AOK gadgets)";
+    char *name = (char *)cpu->env.cpuid_model;
+    size_t len = strnlen(name, CPUID_MODEL_ID_SZ);
+
+    /* (On a little-endian host, as the gadgets' is, the words are the string.) */
+    QEMU_BUILD_BUG_ON(sizeof(cpu->env.cpuid_model) != CPUID_MODEL_ID_SZ);
+    if (aok_enabled && CPU(cpu)->cc->tcg_ops->aok_translate_code &&
+        len && len + sizeof(tag) <= CPUID_MODEL_ID_SZ) {
+        memcpy(name + len, tag, sizeof(tag) - 1);
+    }
+}
+#endif
+
 bool tcg_cpu_realizefn(CPUState *cs, Error **errp)
 {
     X86CPU *cpu = X86_CPU(cs);
+
+#ifdef CONFIG_AOK_GADGETS
+    x86_aok_name(cpu);
+#endif
 
     /*
      * The realize order is important, since x86_cpu_realize() checks if

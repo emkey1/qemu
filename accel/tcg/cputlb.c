@@ -1337,6 +1337,79 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
     return false;
 }
 
+/*
+ * A store to a page that has translated code invalidates the TBs it overlaps
+ * before it is made, and the page's lock is not held from there to the store
+ * itself. A TB that another CPU translates in that gap is made of the old
+ * bytes and outlives them, as nothing will invalidate it again. An x86 guest
+ * patching its kernel shows it: Linux writes a breakpoint, then the new
+ * bytes, and counts on no CPU meeting the breakpoint once every CPU has
+ * answered an interrupt; a CPU that goes on executing a TB with the
+ * breakpoint in it is an oops.
+ *
+ * So such a store is noted here and its CPU asked to leave the TB when the
+ * TB ends. Before it executes another, the main loop invalidates the range
+ * once more: the store is in memory by then, and the page's lock orders this
+ * against every translation, so that a TB is either invalidated here or made
+ * of the new bytes. Only with several CPUs' threads is there a gap to be in.
+ */
+#define NOTDIRTY_REDO_MAX 8
+
+static __thread struct {
+    ram_addr_t start;
+    unsigned size;
+} notdirty_redo[NOTDIRTY_REDO_MAX];
+__thread unsigned tlb_notdirty_redo_n;
+
+static void notdirty_redo_some(CPUState *cpu, unsigned n)
+{
+    for (unsigned i = 0; i < n; i++) {
+        tb_invalidate_phys_range_fast(cpu, notdirty_redo[i].start,
+                                      notdirty_redo[i].size, 0);
+    }
+    tlb_notdirty_redo_n -= n;
+    memmove(notdirty_redo, notdirty_redo + n,
+            tlb_notdirty_redo_n * sizeof(notdirty_redo[0]));
+}
+
+void tlb_notdirty_redo(CPUState *cpu)
+{
+    notdirty_redo_some(cpu, tlb_notdirty_redo_n);
+}
+
+static void notdirty_redo_note(CPUState *cpu, ram_addr_t start, unsigned size)
+{
+    unsigned n = tlb_notdirty_redo_n;
+
+    if (n) {
+        ram_addr_t prev = notdirty_redo[n - 1].start;
+        unsigned prev_size = notdirty_redo[n - 1].size;
+
+        /* More of the same: a loop of stores, a byte or a word at a time. */
+        if (start >= prev && start + size <= prev + prev_size) {
+            return;
+        }
+        if (start == prev + prev_size &&
+            !((start ^ prev) & TARGET_PAGE_MASK)) {
+            notdirty_redo[n - 1].size += size;
+            return;
+        }
+    }
+    if (n == NOTDIRTY_REDO_MAX) {
+        /*
+         * The oldest are in memory: no operation looks up this many pages
+         * before it writes the first of them.
+         */
+        notdirty_redo_some(cpu, NOTDIRTY_REDO_MAX / 2);
+        n = tlb_notdirty_redo_n;
+    }
+    notdirty_redo[n].start = start;
+    notdirty_redo[n].size = size;
+    tlb_notdirty_redo_n = n + 1;
+    /* As cpu_exit() has a TB left, with nothing for cpu_exec() to return for. */
+    qatomic_set(&cpu->neg.icount_decr.u16.high, -1);
+}
+
 static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
                            CPUTLBEntryFull *full, uintptr_t retaddr)
 {
@@ -1345,6 +1418,10 @@ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
     trace_memory_notdirty_write_access(mem_vaddr, ram_addr, size);
 
     if (!physical_memory_get_dirty_flag(ram_addr, DIRTY_MEMORY_CODE)) {
+        if (cpu->tcg_cflags & CF_PARALLEL) {
+            /* (First: the invalidation may leave by a longjmp.) */
+            notdirty_redo_note(cpu, ram_addr, size);
+        }
         tb_invalidate_phys_range_fast(cpu, ram_addr, size, retaddr);
     }
 

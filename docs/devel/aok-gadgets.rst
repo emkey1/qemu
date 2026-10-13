@@ -91,6 +91,10 @@ Outside those, the changes to TCG are small:
 * TCG's code and a stream cannot jump into each other. The main loop links
   two TBs only when the same translator made both, and
   ``helper_lookup_tb_ptr`` sends TCG back to the main loop for a stream.
+* A store to a page that has translated code invalidates the TBs it
+  overlaps a second time, once it has been made (``notdirty_write`` and the
+  main loop). This one is for TCG's own TBs as much as for streams: see
+  *Stores into code* below.
 
 A stream
 ========
@@ -508,6 +512,52 @@ with one difference: a store into the page of the TB that is running does
 not stop that TB at the store, so an instruction that rewrites one further
 on in its own TB still runs the old one once.
 
+Stores into code
+================
+
+With one thread per guest CPU, a store to a page that has TBs goes through
+``notdirty_write``, which invalidates the TBs the store overlaps and returns;
+the store is made after that, and the page's lock is not held in between.
+Another CPU that translates there in the gap reads the old bytes, and its TB
+is valid from then on: the store that should have invalidated it has already
+looked.
+
+Linux on x86 walks into this. To patch an instruction that other CPUs may be
+executing it writes a breakpoint over the first byte, then the rest, then
+the first byte, with an interrupt to every CPU after each step; a CPU that
+meets the breakpoint meanwhile is helped over it, and after the last
+interrupt none may meet it, so the handler stops knowing the address. A TB
+translated in the gap of that last store has the breakpoint in it for good,
+and the next CPU to run it is ``Oops: int3``.
+
+TCG has the gap too and seldom loses in it: its TB there begins some
+instructions earlier, and by the time its translator reaches the patched
+byte the store is in memory. The x86 front end ends its TB before a
+breakpoint, so the TB that is translated again after the store's
+invalidation begins at the very byte, and that byte is the first thing read.
+On an Apple M5 with four guest CPUs, a 32-bit Alpine guest died at boot in 9
+of 180 runs beside other load, and in none of 72 with ``QEMU_AOK=0``; under
+``poke`` (below) in 16 of 16 against none of 8. With the gap made a few
+microseconds wider by a loop in ``notdirty_write``, ``QEMU_AOK=0`` died in 5
+of 6.
+
+So ``notdirty_write`` notes such a store, when CPUs have threads of their
+own, and asks its CPU to leave the TB at the TB's end, as ``cpu_exit`` does.
+The main loop then invalidates the noted ranges once more before it looks up
+another TB, and before ``cpu_exec`` returns. By then the store is in memory,
+and the page's lock orders that invalidation against every translation: a
+TB is either invalidated by it or made of the new bytes. With that, ``poke``
+ran 16 of 16 on the gadgets (and 8 of 8 in a 64-bit guest), 6 of 6 with
+``QEMU_AOK=0`` and the widened gap, and the guest that died at boot came up
+100 times of 100. What it costs is a turn of the main loop and a second look
+at the page
+for each store into a page with code, a path that already takes the page's
+lock and walks its TBs.
+
+One gap of the same kind is left as it was, because nothing sees it: a store
+to a page with no TBs takes the fast path, and a first TB can be made on
+that page between the fast path's look at the TLB and its store.
+
 Testing
 =======
 
@@ -540,6 +590,10 @@ direction flag set, ``repne scas`` and ``repe cmps``, ``loop``,
 loaded, and every condition after every kind of instruction that sets flags,
 with a load or a store in between. The first three and this one are
 identical for a 64-bit guest and for a 32-bit one.
+
+A fifth is not a transcript but a guest that must stay up, ``poke``: three
+CPUs busy in the scheduler while the fourth flips one of the scheduler's
+static keys three thousand times. *Stores into code* has what it found.
 
 An x86 guest needs a source of entropy to be measured at all: without one a
 Linux guest spends a quarter of a minute in its scheduler making some before

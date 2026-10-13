@@ -502,9 +502,28 @@ with the gadgets.
   ``gadgets.S`` lists what differs between SSE and AArch64 (denormal
   operands, which NaN, tininess) and what that leaves, which is normal
   numbers and zeros under a plain MXCSR, raising at most inexact.
+* **The x87** is not softfloat's here. The 80-bit arithmetic, the register
+  stack with its tags and faults, every D8-DF instruction's register form,
+  the transcendentals and what a memory form does once it has its operand
+  are the aok-gadgets repository's ``x87/``, in integer registers, which
+  iSH-AOK's JIT builds too (``shared/``, copies; ``x87-host.S`` is this
+  host's side: QEMU keeps TOP beside the status word and a tag byte a
+  register, and the shared code is told so in four macros). Their answers
+  are the hardware's, which softfloat's are not: of iSH-AOK's 167,517
+  recorded on an AMD Ryzen (``x87kat`` below) the gadgets give every one,
+  and TCG's x87 misses 59,159, most of them where a real x87 raises a stack
+  fault, reports a denormal operand or sets C1, and half of the
+  transcendentals (``fsin``, ``fcos`` and ``fptan`` are a double's there). A
+  load reads its operand through the softmmu path first; a store converts,
+  writes, and only then pops and updates the status word, so a fault leaves
+  the instruction to be run again. ``fldcw`` goes through QEMU's helper as
+  well, which sets softfloat's modes for the instructions that are still
+  TCG's, and ``ldmxcsr`` and ``stmxcsr`` are a call each.
 * **A TB stays in its page.** One whose first instruction runs into the next
   page is that one instruction, as TCG makes it.
-* Left to TCG: everything outside those two kinds of code, x87 and MMX,
+* Left to TCG: everything outside those two kinds of code, MMX, the x87's
+  environment (``fldenv``, ``fnstenv``, ``frstor``, ``fnsave``, ``fxsave``,
+  ``fxrstor``, ``fninit``),
   single-precision arithmetic on the host (it is softfloat's, called from
   the stream), the system calls, interrupts and the returns from them, the
   control and debug registers, loads of ``ss`` and ``cs``, string I/O,
@@ -512,9 +531,13 @@ with the gadgets.
   operations, 16-bit addressing, a bit string addressed by a register, and
   anything with VEX or EVEX.
 
-A TB is translated only with no single-step or resume flag pending, outside
-the shadow of a ``mov`` to ``ss``, system management mode and SVM guests,
-with MPX off. Self-modifying code is found as TCG finds it,
+A TB is translated only with no single-step flag pending, outside the shadow
+of a ``mov`` to ``ss``, system management mode and SVM guests, with MPX off.
+The resume flag is no bar: a TB entered with it (the instruction a fault was
+returned to) clears it in its first gadget. Before that such TBs were TCG's,
+and whatever followed a page fault in its block was run by another engine
+than the time before, which for the x87 means other answers.
+Self-modifying code is found as TCG finds it,
 with one difference: a store into the page of the TB that is running does
 not stop that TB at the store, so an instruction that rewrites one further
 on in its own TB still runs the old one once.
@@ -596,6 +619,15 @@ direction flag set, ``repne scas`` and ``repe cmps``, ``loop``,
 loaded, and every condition after every kind of instruction that sets flags,
 with a load or a store in between. The first three and this one are
 identical for a 64-bit guest and for a 32-bit one.
+
+For the x87 the reference is not TCG, which is wrong there, but the
+hardware: ``x87kat`` is iSH-AOK's three known-answer programs (every D8-DF
+form under the four rounding and four precision settings from stacks that
+overflow and underflow, the same with exceptions unmasked, and the
+transcendentals), 167,517 answers recorded on an AMD Ryzen. Both PC guests
+pass all of them, three times over in one boot. The same n-body program
+compiled for the x87 (``nbody87``, in the 32-bit guest) takes 107 G host
+cycles under TCG and 39 G under the gadgets.
 
 A fifth is not a transcript but a guest that must stay up, ``poke``: three
 CPUs busy in the scheduler while the fourth flips one of the scheduler's

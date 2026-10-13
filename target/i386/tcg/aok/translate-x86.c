@@ -175,6 +175,7 @@ static const Gadget hf_add_tab[4] = { SIZES(ENTRY, hf_add) };
 static const Gadget hf_logic_tab[4] = { SIZES(ENTRY, hf_logic) };
 DECL(cond) DECL(cf_sub) DECL(cf_add) DECL(cf_zero) DECL(cf) DECL(cf_bt)
 DECL(flush_cc)
+DECL(clr_rf)
 
 /* The host's conditions, in the order of the tables there is one of each in. */
 enum { A_EQ, A_NE, A_CS, A_CC, A_MI, A_PL, A_VS, A_VC, A_HI, A_LS, A_GE, A_LT,
@@ -228,6 +229,17 @@ QEMU_BUILD_BUG_ON(CC_OP_SHLB != AOK_CC_OP_SHL);
 QEMU_BUILD_BUG_ON(CC_OP_SARB != AOK_CC_OP_SAR);
 QEMU_BUILD_BUG_ON(CC_OP_BMILGB != AOK_CC_OP_BMILG);
 QEMU_BUILD_BUG_ON(offsetof(CPUX86State, eflags) != AOK_X86_ENV_EFLAGS);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, aok_tmp) != AOK_X86_ENV_AOK_TMP);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fpstt) != AOK_X86_ENV_FPSTT);
+QEMU_BUILD_BUG_ON(sizeof(((CPUX86State *)0)->fpstt) != 4);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fpus) != AOK_X86_ENV_FPUS);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fpuc) != AOK_X86_ENV_FPUC);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fptags) != AOK_X86_ENV_FPTAGS);
+QEMU_BUILD_BUG_ON(sizeof(((CPUX86State *)0)->fptags) != 8);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fpregs) != AOK_X86_ENV_FPREGS);
+QEMU_BUILD_BUG_ON(sizeof(FPReg) != 16);
+QEMU_BUILD_BUG_ON(offsetof(floatx80, low) != 0 || offsetof(floatx80, high) != 8);
+QEMU_BUILD_BUG_ON(CC_OP_EFLAGS != AOK_CC_OP_EFLAGS);
 QEMU_BUILD_BUG_ON(IF_MASK != AOK_X86_IF);
 QEMU_BUILD_BUG_ON(offsetof(CPUX86State, df) != AOK_X86_ENV_DF);
 
@@ -255,6 +267,8 @@ typedef struct Ctx {
     bool abm, bmi1;         /* f3 before bsf and bsr makes tzcnt and lzcnt */
     bool lahf;              /* lahf and sahf exist here */
     bool sse;               /* SSE insns raise nothing here */
+    bool x87;               /* nor do x87 ones (no EM, no TS) */
+    bool sse3;              /* fisttp exists */
     bool fp;                /* doubles on the host's FP unit */
     int hf;
     int cc;                 /* the lazy cc_op, or -1 where it is not known */
@@ -603,6 +617,8 @@ static unsigned x86_nohf;
 static bool x86_nolive;
 /* QEMU_AOK_X86_NOFP: every floating-point insn is softfloat's. */
 static bool x86_nofp;
+/* QEMU_AOK_X86_NOX87: the x87 is TCG's (softfloat's). */
+static bool x86_nox87;
 /* QEMU_AOK_X86_NO32, QEMU_AOK_X86_NO64: that kind of code is TCG's. */
 static bool x86_no32, x86_no64;
 
@@ -2244,6 +2260,7 @@ static void __attribute__((constructor)) x86_aok_init(void)
     }
     x86_nolive = getenv("QEMU_AOK_X86_NOLIVE");
     x86_nofp = getenv("QEMU_AOK_X86_NOFP");
+    x86_nox87 = getenv("QEMU_AOK_X86_NOX87");
     x86_no32 = getenv("QEMU_AOK_X86_NO32");
     x86_no64 = getenv("QEMU_AOK_X86_NO64");
     s = getenv("QEMU_AOK_X86_SKIP");
@@ -2714,6 +2731,12 @@ static int sse(Ctx *c, const Insn *d, unsigned b, int pfx, int64_t imm)
 }
 
 /* The opcodes after 0F. */
+/* (with the x87's, below) */
+void aok_x86_helper_ldmxcsr(CPUX86State *env, uint64_t pc, uint64_t a,
+                            uint64_t b);
+void aok_x86_helper_stmxcsr(CPUX86State *env, uint64_t pc, uint64_t a,
+                            uint64_t b);
+
 static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
 {
     unsigned b = f8(d);
@@ -2784,9 +2807,24 @@ static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
         FIN();
         return shiftd(c, d, sz, b == 0xad, true, 0);
 
-    case 0xae:              /* lfence, mfence, sfence: an order of accesses */
+    case 0xae:              /* ldmxcsr, stmxcsr; the fences */
         modrm(d);
         FIN();
+        if (d->mod != 3 && ((d->reg & 7) == 2 || (d->reg & 7) == 3)) {
+            if (!c->sse || d->o16 || d->rep || d->repne || d->lock) {
+                return UNKNOWN;
+            }
+            if ((d->reg & 7) == 2) {
+                mem(c, d, load_tab[2], T0, 2);
+                E4(G(call_c), aok_x86_helper_ldmxcsr, c->off, 0, 0);
+            } else {
+                E4(G(call_c), aok_x86_helper_stmxcsr, c->off, 0, 0);
+                mem(c, d, store_tab[2], T0, 2);
+            }
+            c->hf = HF_NONE;
+            return NEXT;
+        }
+        /* lfence, mfence, sfence: an order of accesses */
         if (d->mod != 3 || (d->reg & 7) < 5 || d->o16) {
             return UNKNOWN;
         }
@@ -2947,6 +2985,384 @@ static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
  * with nothing emitted that matters: the caller takes the stream back to
  * where the insn began.
  */
+/* ---- The x87 (D8-DF) ----------------------------------------------------------
+ *
+ * The gadgets are the aok-gadgets repository's (x87-host.S): the hardware's
+ * answers in integer arithmetic, where TCG calls softfloat. What is decided
+ * here is which gadget an opcode and its ModRM are, and that follows iSH-AOK's
+ * jit/gen.c (x87_reg_gadget, X87M_TABLE), whose gadgets they are.
+ *
+ * A register form's word is [what the gadget wants in its low byte | the
+ * insn's distance from the TB's first << 32]; a memory form's is a memory
+ * gadget's, after an ea gadget. Left to TCG: fldenv, fnstenv, frstor, fnsave
+ * and fninit, which also sets what softfloat keeps.
+ */
+void aok_x86_helper_fwait(CPUX86State *env, uint64_t pc);
+void aok_x86_helper_fwait(CPUX86State *env, uint64_t pc)
+{
+    x86_sync(env, pc);
+    helper_fwait(env);
+}
+
+/* The ten-byte operands, to and from aok_tmp, as helper_fldt and fstt do. */
+void aok_x86_helper_ld80(CPUX86State *env, uint64_t addr, uint64_t pc);
+void aok_x86_helper_ld80(CPUX86State *env, uint64_t addr, uint64_t pc)
+{
+    uint64_t hi = env->hflags & HF_CS64_MASK ? addr + 8 : (uint32_t)(addr + 8);
+
+    x86_sync(env, pc);
+    env->aok_tmp[0] = x86_ld(env, addr, 3);
+    env->aok_tmp[1] = x86_ld(env, hi, 1);
+}
+
+void aok_x86_helper_st80(CPUX86State *env, uint64_t addr, uint64_t pc);
+void aok_x86_helper_st80(CPUX86State *env, uint64_t addr, uint64_t pc)
+{
+    uint64_t hi = env->hflags & HF_CS64_MASK ? addr + 8 : (uint32_t)(addr + 8);
+
+    x86_sync(env, pc);
+    x86_st(env, addr, 3, env->aok_tmp[0]);
+    x86_st(env, hi, 1, env->aok_tmp[1]);
+}
+
+/*
+ * MXCSR, through aok_tmp. A read wants every flag there is: what the host's
+ * FP unit raised in this stream is folded in first.
+ */
+void aok_x86_helper_ldmxcsr(CPUX86State *env, uint64_t pc, uint64_t a,
+                            uint64_t b);
+void aok_x86_helper_ldmxcsr(CPUX86State *env, uint64_t pc, uint64_t a,
+                            uint64_t b)
+{
+    x86_sync(env, pc);
+    helper_ldmxcsr(env, env->aok_tmp[0]);
+}
+
+void aok_x86_helper_stmxcsr(CPUX86State *env, uint64_t pc, uint64_t a,
+                            uint64_t b);
+void aok_x86_helper_stmxcsr(CPUX86State *env, uint64_t pc, uint64_t a,
+                            uint64_t b)
+{
+    CPUState *cs = env_cpu(env);
+
+    if (cs->aok_host_fpsr) {
+        x86_aok_fold_fpsr(cs, cs->aok_host_fpsr);
+        cs->aok_host_fpsr = 0;
+    }
+    update_mxcsr_from_sse_status(env);
+    env->aok_tmp[0] = env->mxcsr;
+}
+
+/*
+ * fldcw: the word is in aok_tmp. It waits, keeps the bits that exist (bit 6
+ * reads as 1) and makes ES and B follow the flags and the new masks, as the
+ * hardware does and iSH-AOK's gadget; through QEMU's helper, which sets
+ * softfloat's modes for the insns that are still TCG's.
+ */
+void aok_x86_helper_fldcw(CPUX86State *env, uint64_t pc, uint64_t a,
+                          uint64_t b);
+void aok_x86_helper_fldcw(CPUX86State *env, uint64_t pc, uint64_t a,
+                          uint64_t b)
+{
+    uint16_t cw = (env->aok_tmp[0] & 0x1f3f) | 0x40;
+
+    x86_sync(env, pc);
+    if (env->fpus & 0x80) {
+        helper_fwait(env);
+    }
+    helper_fldcw(env, cw);
+    env->fpus &= ~0x8080;
+    if (env->fpus & ~cw & 0x3f) {
+        env->fpus |= 0x8080;
+    }
+}
+
+#define X87_REG(X)                                                          \
+    X(fwait) X(add_rr) X(sub_rr) X(subr_rr) X(mul_rr) X(div_rr) X(divr_rr)  \
+    X(com_rr) X(ucom_rr) X(comi_rr) X(ucomi_rr) X(fld_rr) X(fst_rr)         \
+    X(fxch) X(ffree) X(fchs) X(fabs) X(ftst) X(fxam) X(fldc) X(fincstp)     \
+    X(fdecstp) X(fsqrt) X(frndint) X(fscale) X(fxtract) X(fprem) X(fprem1)  \
+    X(f2xm1) X(fyl2x) X(fptan) X(fpatan) X(fyl2xp1) X(fsincos) X(fsin)      \
+    X(fcos) X(fcmovb) X(fcmove) X(fcmovbe) X(fcmovu) X(fcmovnb) X(fcmovne)  \
+    X(fcmovnbe) X(fcmovnu) X(fnclex)
+#define X87_DECL(n) DECL(x87_##n)
+X87_REG(X87_DECL)
+#undef X87_DECL
+#define X87_MEM(X)                                                          \
+    X(add_f32) X(mul_f32) X(com_f32) X(comp_f32) X(sub_f32) X(subr_f32)     \
+    X(div_f32) X(divr_f32) X(add_f64) X(mul_f64) X(com_f64) X(comp_f64)     \
+    X(sub_f64) X(subr_f64) X(div_f64) X(divr_f64) X(add_i16) X(mul_i16)     \
+    X(com_i16) X(comp_i16) X(sub_i16) X(subr_i16) X(div_i16) X(divr_i16)    \
+    X(add_i32) X(mul_i32) X(com_i32) X(comp_i32) X(sub_i32) X(subr_i32)     \
+    X(div_i32) X(divr_i32) X(fld_f32) X(fst_f32) X(fstp_f32) X(fild_i32)    \
+    X(fisttp_i32) X(fist_i32) X(fistp_i32) X(fld_f64) X(fisttp_i64)         \
+    X(fst_f64) X(fstp_f64) X(fild_i16) X(fisttp_i16) X(fist_i16)            \
+    X(fistp_i16) X(fild_i64) X(fistp_i64) X(fld_f80) X(fstp_f80) X(fbld)    \
+    X(fbstp)
+#define X87_DECL(n) DECL(x87m_##n) DECL(x87m_##n##_mp)
+X87_MEM(X87_DECL)
+#undef X87_DECL
+DECL(x87h_fnstsw)
+DECL(x87h_fnstcw)
+
+typedef struct X87Mem {
+    Gadget g[2];            /* without barriers, with */
+    int sz;                 /* the log2 of the operand's bytes; 0: none */
+} X87Mem;
+#define XM(n, sz) { { G(x87m_##n), G(x87m_##n##_mp) }, sz }
+#define XA(k, sz) XM(add_##k, sz), XM(mul_##k, sz), XM(com_##k, sz),        \
+                  XM(comp_##k, sz), XM(sub_##k, sz), XM(subr_##k, sz),      \
+                  XM(div_##k, sz), XM(divr_##k, sz)
+#define XN { { NULL, NULL }, 0 }
+static const X87Mem x87_mem[8][8] = {
+    { XA(f32, 2) },
+    { XM(fld_f32, 2), XN, XM(fst_f32, 2), XM(fstp_f32, 2), XN, XN, XN, XN },
+    { XA(i32, 2) },
+    { XM(fild_i32, 2), XM(fisttp_i32, 2), XM(fist_i32, 2), XM(fistp_i32, 2),
+      XN, XM(fld_f80, 3), XN, XM(fstp_f80, 3) },
+    { XA(f64, 3) },
+    { XM(fld_f64, 3), XM(fisttp_i64, 3), XM(fst_f64, 3), XM(fstp_f64, 3),
+      XN, XN, XN, XN },
+    { XA(i16, 1) },
+    { XM(fild_i16, 1), XM(fisttp_i16, 1), XM(fist_i16, 1), XM(fistp_i16, 1),
+      XM(fbld, 3), XM(fild_i64, 3), XM(fbstp, 3), XM(fistp_i64, 3) },
+};
+#undef XM
+#undef XA
+#undef XN
+
+/* What x87_reg() found that is not a gadget with a word. */
+#define X87_UD      ((Gadget)0)
+#define X87_NOP     ((Gadget)1)     /* feni, fdisi, fsetpm: nothing since the 387 */
+#define X87_FNSTSW  ((Gadget)2)     /* fnstsw ax */
+
+/* A register form's gadget and what it wants: iSH-AOK's x87_reg_gadget(). */
+static Gadget x87_reg(unsigned b, unsigned reg, unsigned rm, uint64_t *imm)
+{
+    static const Gadget fcmov[8] = {
+        G(x87_fcmovb), G(x87_fcmove), G(x87_fcmovbe), G(x87_fcmovu),
+        G(x87_fcmovnb), G(x87_fcmovne), G(x87_fcmovnbe), G(x87_fcmovnu),
+    };
+    /*
+     * D8 /r is ST(0) op ST(i), DC /r ST(i) op ST(0) (whose sub and div pairs
+     * Intel names the other way round), DE the DC forms and a pop.
+     */
+    static const Gadget arith_d8[8] = {
+        G(x87_add_rr), G(x87_mul_rr), NULL, NULL,
+        G(x87_sub_rr), G(x87_subr_rr), G(x87_div_rr), G(x87_divr_rr),
+    };
+    static const Gadget arith_dc[8] = {
+        G(x87_add_rr), G(x87_mul_rr), NULL, NULL,
+        G(x87_subr_rr), G(x87_sub_rr), G(x87_divr_rr), G(x87_div_rr),
+    };
+
+    *imm = rm;
+    switch (b) {
+    case 0xd8:
+        if (reg == 2 || reg == 3) {
+            *imm = rm | (reg == 3 ? 1 << 6 : 0);
+            return G(x87_com_rr);
+        }
+        return arith_d8[reg];
+    case 0xd9:
+        switch (reg) {
+        case 0:
+            return G(x87_fld_rr);
+        case 1:
+            return G(x87_fxch);
+        case 2:
+            return rm == 0 ? G(x87_fwait) : X87_UD;     /* fnop waits */
+        case 3:
+            *imm = rm | 3 << 6;                         /* fstp1, an alias */
+            return G(x87_fst_rr);
+        case 4:
+            return rm == 0 ? G(x87_fchs) : rm == 1 ? G(x87_fabs) :
+                   rm == 4 ? G(x87_ftst) : rm == 5 ? G(x87_fxam) : X87_UD;
+        case 5:
+            return rm == 7 ? X87_UD : G(x87_fldc);
+        case 6:
+            switch (rm) {
+            case 0:
+                return G(x87_f2xm1);
+            case 1:
+                return G(x87_fyl2x);
+            case 2:
+                return G(x87_fptan);
+            case 4:
+                return G(x87_fxtract);
+            case 5:
+                return G(x87_fprem1);
+            case 6:
+                return G(x87_fdecstp);
+            case 7:
+                return G(x87_fincstp);
+            default:
+                return G(x87_fpatan);
+            }
+        default:
+            switch (rm) {
+            case 0:
+                return G(x87_fprem);
+            case 1:
+                return G(x87_fyl2xp1);
+            case 2:
+                return G(x87_fsqrt);
+            case 3:
+                return G(x87_fsincos);
+            case 4:
+                return G(x87_frndint);
+            case 5:
+                return G(x87_fscale);
+            case 6:
+                return G(x87_fsin);
+            default:
+                return G(x87_fcos);
+            }
+        }
+    case 0xda:
+        if (reg < 4) {
+            return fcmov[reg];
+        }
+        if (reg == 5 && rm == 1) {
+            *imm = 1 | 2 << 6;                          /* fucompp */
+            return G(x87_ucom_rr);
+        }
+        return X87_UD;
+    case 0xdb:
+        if (reg < 4) {
+            return fcmov[reg + 4];
+        }
+        if (reg == 4) {
+            /* (fninit, rm 3, is TCG's: it sets softfloat's modes as well) */
+            return rm == 0 || rm == 1 || rm == 4 ? X87_NOP :
+                   rm == 2 ? G(x87_fnclex) : X87_UD;
+        }
+        return reg == 5 ? G(x87_ucomi_rr) : reg == 6 ? G(x87_comi_rr) : X87_UD;
+    case 0xdc:
+        if (reg == 2 || reg == 3) {                     /* fcom2, fcomp3 */
+            *imm = rm | (reg == 3 ? 1 << 6 : 0);
+            return G(x87_com_rr);
+        }
+        *imm = rm << 3;
+        return arith_dc[reg];
+    case 0xdd:
+        switch (reg) {
+        case 0:
+            return G(x87_ffree);
+        case 1:
+            return G(x87_fxch);                         /* fxch4 */
+        case 2:
+            return G(x87_fst_rr);
+        case 3:
+            *imm = rm | 1 << 6;
+            return G(x87_fst_rr);
+        case 4:
+            return G(x87_ucom_rr);
+        case 5:
+            *imm = rm | 1 << 6;
+            return G(x87_ucom_rr);
+        default:
+            return X87_UD;
+        }
+    case 0xde:
+        if (reg == 2) {                                 /* fcomp5 */
+            *imm = rm | 1 << 6;
+            return G(x87_com_rr);
+        }
+        if (reg == 3) {
+            if (rm != 1) {
+                return X87_UD;
+            }
+            *imm = 1 | 2 << 6;                          /* fcompp */
+            return G(x87_com_rr);
+        }
+        *imm = rm << 3 | 1 << 6;
+        return arith_dc[reg];
+    default:
+        switch (reg) {
+        case 0:
+            *imm = rm | 1 << 6;                         /* ffreep */
+            return G(x87_ffree);
+        case 1:
+            return G(x87_fxch);                         /* fxch7 */
+        case 2:
+        case 3:
+            *imm = rm | 1 << 6;                         /* fstp8, fstp9 */
+            return G(x87_fst_rr);
+        case 4:
+            return rm == 0 ? X87_FNSTSW : X87_UD;
+        case 5:
+            *imm = rm | 1 << 6;
+            return G(x87_ucomi_rr);
+        case 6:
+            *imm = rm | 1 << 6;
+            return G(x87_comi_rr);
+        default:
+            return X87_UD;
+        }
+    }
+}
+
+static int x87(Ctx *c, Insn *d, const uint8_t *code, unsigned b)
+{
+    unsigned reg, rm;
+    uint64_t imm;
+    Gadget g;
+
+    modrm(d);
+    FIN();
+    if (!c->x87 || d->lock) {
+        return UNKNOWN;
+    }
+    reg = d->reg & 7;
+    rm = d->rm & 7;
+    if (d->mod != 3) {
+        const X87Mem *m = &x87_mem[b - 0xd8][reg];
+
+        if (b == 0xd9 && reg == 5) {            /* fldcw */
+            mem(c, d, load_tab[1], T0, 1);
+            E4(G(call_c), aok_x86_helper_fldcw, c->off, 0, 0);
+            c->hf = HF_NONE;
+            return NEXT;
+        }
+        if ((b == 0xd9 || b == 0xdd) && reg == 7) {     /* fnstcw, fnstsw */
+            E1(b == 0xd9 ? G(x87h_fnstcw) : G(x87h_fnstsw), T0);
+            mem(c, d, store_tab[1], T0, 1);
+            return NEXT;
+        }
+        if (!m->sz || (!c->sse3 && reg == 1 && (b & 1))) {      /* (fisttp) */
+            return UNKNOWN;
+        }
+        emit_ea(c, d);
+        E1(m->g[c->mp], word(c, m->sz));
+        c->hf = HF_NONE;
+        return NEXT;
+    }
+
+    g = x87_reg(b, reg, rm, &imm);
+    if (g == X87_UD) {
+        return UNKNOWN;
+    }
+    if (g == X87_NOP) {
+        return NEXT;
+    }
+    if (g == X87_FNSTSW) {
+        E1(G(x87h_fnstsw), R(R_EAX));
+        c->hf = HF_NONE;
+        return NEXT;
+    }
+    if ((b == 0xda || b == 0xdb) && reg < 4 && c->cc != CC_OP_EFLAGS) {
+        E0(G(flush_cc));                        /* fcmov reads cc_src */
+        c->cc = CC_OP_EFLAGS;
+    }
+    E1(g, imm | (uint64_t)c->off << 32);
+    c->hf = HF_NONE;
+    if (g == G(x87_comi_rr) || g == G(x87_ucomi_rr)) {
+        c->cc = CC_OP_EFLAGS;
+    }
+    return NEXT;
+}
+
 static int insn1(Ctx *c, Insn *d, const uint8_t *code)
 {
     unsigned b;
@@ -3198,6 +3614,17 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
         }
         e = src_e(c, d, 1);
         return load_seg(c, r, e);
+
+    case 0x9b:              /* fwait */
+        FIN();
+        if (!c->x87) {
+            return UNKNOWN;
+        }
+        E1(G(x87_fwait), (uint64_t)c->off << 32);
+        c->hf = HF_NONE;
+        return NEXT;
+    case 0xd8 ... 0xdf:
+        return x87(c, d, code, b);
 
     case 0x8f:              /* pop E */
         modrm(d);
@@ -3569,6 +3996,15 @@ static bool translate(Ctx *c, CPUState *cs, TranslationBlock *tb,
     *r = NEXT;
     aok_gen_begin(&c->g, cs, tb, max_insns, cpu_mmu_index(cs, false));
     c->g.lookup = G(lookup);
+    if (tb->flags & HF_RF_MASK) {
+        /*
+         * The insn a fault is returned to: the resume flag is what tells this
+         * TB from the one that will be run there next time, and no more than
+         * that here (breakpoints are found before a TB is entered). It is
+         * cleared at once, where TCG clears it at the TB's end.
+         */
+        E0(G(clr_rf));
+    }
 
     /* A TB stays in its page, and so does each of its insns. */
     while (aok_gen_room(&c->g, 24) && c->page_off + c->off < TARGET_PAGE_SIZE) {
@@ -3685,7 +4121,7 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     if (!host_pc || !(cflags & CF_PCREL) || TARGET_PAGE_BITS != 12 ||
         (cflags & (CF_COUNT_MASK | CF_SINGLE_STEP | CF_MEMI_ONLY |
                    CF_USE_ICOUNT | CF_NOIRQ | CF_BP_PAGE | CF_STEP_ATOMIC)) ||
-        (flags & (HF_INHIBIT_IRQ_MASK | HF_TF_MASK | HF_RF_MASK | HF_VM_MASK |
+        (flags & (HF_INHIBIT_IRQ_MASK | HF_TF_MASK | HF_VM_MASK |
                   HF_SMM_MASK | HF_GUEST_MASK | HF_MPX_EN_MASK))) {
         return 0;
     }
@@ -3718,6 +4154,8 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
               (env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_LAHF_LM);
     c->sse = !(flags & (HF_EM_MASK | HF_TS_MASK)) && (flags & HF_OSFXSR_MASK);
     c->fp = !x86_nofp;
+    c->x87 = !(flags & (HF_EM_MASK | HF_TS_MASK)) && !x86_nox87;
+    c->sse3 = env->features[FEAT_1_ECX] & CPUID_EXT_SSE3;
     c->live = !x86_nolive;
     if (!translate(c, cs, tb, *max_insns, pc, host_pc, &r)) {
         c->live = false;

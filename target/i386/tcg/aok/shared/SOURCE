@@ -1,0 +1,3 @@
+aok-gadgets x87 (x87-arith.S x87-mem.S x87-reg.S x87-stack.S x87-trans.S)
+commit 17181e5dac2dba6eb1aba13c4e6be36fb4af15ce
+licence: as target/riscv/tcg/aok/shared/SOURCE says of riscv64's

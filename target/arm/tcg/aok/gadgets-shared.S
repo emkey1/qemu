@@ -480,3 +480,117 @@ v_stp vstp32_\mode,   4, s0, s1, \mode
 v_stp vstp64_\mode,   8, d0, d1, \mode
 v_stp vstp128_\mode, 16, q0, q1, \mode
 .endr
+
+/* ldpsw: [rt | rt2 << 16][rn][offset][word]; \mode 0 offset, 1 post-index, 2 pre-index */
+.macro ldpsw_gadget name, mode
+.gadget \name
+    ldp x8, _frn, [_ip]
+    ldr _fofs, [_ip, #16]
+    add _ip, _ip, #40
+    ldr x10, [_cpu, _frn]
+    add _fnewb, x10, _fofs
+    .if \mode == 1
+    mov _addr, x10
+    .else
+    mov _addr, _fnewb
+    .endif
+    read_prep 64, \name, 8
+    ldpsw x17, x12, [_addr]
+    and x9, x8, #0xffff
+    lsr x10, x8, #16
+    str x17, [_cpu, x9]
+    str x12, [_cpu, x10]
+    .if \mode
+    str _fnewb, [_cpu, _frn]
+    .endif
+    gret_ahead
+    read_bullshit 64, \name, 8
+.endm
+ldpsw_gadget ldpsw_fast, 0
+ldpsw_gadget ldpsw_post, 1
+ldpsw_gadget ldpsw_pre, 2
+
+/*
+ * ld1 and st1 of one to four whole registers, which in a little-endian guest
+ * are that many loads or stores of 8 or 16 bytes whatever the arrangement:
+ * [vt | vt + 1 << 16 | ...][rn][post-index immediate][post-index register][word]
+ * The base is written back as it is plus the two, each nothing where the
+ * instruction has no post-index. Every other structure load and store is a
+ * call (aok_a64_helper_struct), as is the slow path here.
+ */
+.macro v_struct name, n, bytes, reg0, reg1, reg2, reg3, load
+.gadget \name
+    ldp x8, _frn, [_ip]
+    ldp _fofs, x11, [_ip, #16]
+    add _ip, _ip, #48
+    ldr x10, [_cpu, _frn]
+    ldr x11, [_cpu, x11]
+    add _fnewb, x10, _fofs
+    add _fnewb, _fnewb, x11
+    mov _addr, x10
+    .if \load
+    a64_tlb_probe (\n * \bytes * 8), \name, TLBE_READ
+    ldr \reg0, [_addr]
+    .if \n > 1
+    ldr \reg1, [_addr, #\bytes]
+    .endif
+    .if \n > 2
+    ldr \reg2, [_addr, #(2 * \bytes)]
+    .endif
+    .if \n > 3
+    ldr \reg3, [_addr, #(3 * \bytes)]
+    .endif
+    and x9, x8, #0xffff
+    str q0, [_cpu, x9]
+    .if \n > 1
+    ubfx x9, x8, #16, #16
+    str q1, [_cpu, x9]
+    .endif
+    .if \n > 2
+    ubfx x9, x8, #32, #16
+    str q2, [_cpu, x9]
+    .endif
+    .if \n > 3
+    lsr x9, x8, #48
+    str q3, [_cpu, x9]
+    .endif
+    .else
+    and x9, x8, #0xffff
+    ldr q0, [_cpu, x9]
+    .if \n > 1
+    ubfx x9, x8, #16, #16
+    ldr q1, [_cpu, x9]
+    .endif
+    .if \n > 2
+    ubfx x9, x8, #32, #16
+    ldr q2, [_cpu, x9]
+    .endif
+    .if \n > 3
+    lsr x9, x8, #48
+    ldr q3, [_cpu, x9]
+    .endif
+    a64_tlb_probe (\n * \bytes * 8), \name, TLBE_WRITE
+    str \reg0, [_addr]
+    .if \n > 1
+    str \reg1, [_addr, #\bytes]
+    .endif
+    .if \n > 2
+    str \reg2, [_addr, #(2 * \bytes)]
+    .endif
+    .if \n > 3
+    str \reg3, [_addr, #(3 * \bytes)]
+    .endif
+    .endif
+done_\name:
+    str _fnewb, [_cpu, _frn]
+    gret_ahead
+handle_miss_\name:
+    a64_unaligned (\n * \bytes * 8), \name
+    a64_vslow aok_a64_helper_struct_slow, \name
+.endm
+.irp n, 1, 2, 3, 4
+v_struct vld1_\n\()_q, \n, 16, q0, q1, q2, q3, 1
+v_struct vld1_\n\()_d, \n, 8, d0, d1, d2, d3, 1
+v_struct vst1_\n\()_q, \n, 16, q0, q1, q2, q3, 0
+v_struct vst1_\n\()_d, \n, 8, d0, d1, d2, d3, 0
+.endr

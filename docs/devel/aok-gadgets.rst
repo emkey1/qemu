@@ -159,7 +159,8 @@ that end in that.
 
 ``scripts/aok-gadgets-sync.sh [CHECKOUT]`` copies the three files from a
 checkout of iSH-AOK and writes ``shared/host-gadgets.h`` (which gadgets exist
-here, read off the assembled object) and ``shared/SOURCE`` (the commit).
+here, read off the assembled object) and ``shared/SOURCE`` (the commit). It
+does the same for AArch64's two files (see below).
 ``--check`` says whether the copies are current. **Do not edit the copies**:
 change iSH-AOK and copy again, so that a gadget improved or a pair added
 there arrives here with nothing ported by hand.
@@ -235,10 +236,16 @@ Run-time switches
   At exit, print how many TBs each translator made, how often the main loop
   entered each kind, what lookups done in C found, and the first opcodes of
   the TBs left to TCG.
+  With the value 2, also which of TCG's TBs the main loop entered most,
+  by pc and first instruction: every one is a stream that could not go on.
 
 ``QEMU_AOK_NO_CSR``, ``QEMU_AOK_NO_ATOMIC``, ``QEMU_AOK_NO_FP``, ``QEMU_AOK_NO_FPNATIVE``
   Leave that instruction class to TCG (or, for the last, to softfloat), for
   bisecting.
+
+``QEMU_AOK_NO_SYS``, ``QEMU_AOK_NO_EXC``, ``QEMU_AOK_NO_ATOMIC``, ``QEMU_AOK_NO_FP``
+  The same for AArch64: system register accesses; ``svc``, ``eret`` and the
+  DAIF immediates; exclusives and ordered accesses; floating point and SIMD.
 
 ``QEMU_AOK_NO_PAIRS``, ``QEMU_AOK_NO_FWD``
   Fuse no pairs; fuse them, but forward no register.
@@ -263,6 +270,78 @@ A TB is translated only for RV64 with a little-endian guest, not
 virtualized, with no pointer masking, CFI or instruction-count trigger, and
 with the C extension. It stays within its page.
 
+AArch64
+=======
+
+``target/arm/tcg/aok``. Here the guest is the architecture iSH-AOK's first
+64-bit engine was written for, and the host's own, so an instruction is most
+often the same instruction with its registers read from ``env`` and written
+back.
+
+Translated: data processing with immediates and registers (all of it but the
+tagged, pointer-authentication, CRC and CSSC instructions), conditional
+selects and compares, loads and stores of X and W registers in every
+addressing mode, pairs, literals, the unprivileged and the ordered ones,
+exclusives, direct, conditional and indirect branches, the hint space,
+barriers, system register accesses, ``msr daifset``/``daifclr``, ``svc`` and
+``eret``; and the base architecture's floating point and Advanced SIMD, with
+AES, SHA-1, SHA-256, PMULL and CRC32 where guest and host both have them.
+
+* **Shared with iSH-AOK:** ``shared/alu_spec.S`` and ``shared/frag.h`` are its
+  ``jit/guest-arm64`` files, unchanged: the operand-specialised integer
+  gadgets, and the bodies of loads, stores and pairs. ``gadgets-shared.S``
+  gives them this tree's host (``frag.h``, "A second host"): registers, the
+  split flags, and guest memory through the softmmu fast path.
+* **XZR** is two slots after ``pc`` in ``CPUARMState``: ``aok_zero``, which
+  nothing writes, and ``aok_sink``, which nothing reads. A gadget then takes
+  register 31 as any other, and the translator chooses SP or one of those by
+  the operand.
+* **Flags** are QEMU's four words. A gadget that sets them stores them from
+  the host's NZCV, and one that reads them loads the host's from them, unless
+  the translator knows the host's are still the guest's from the gadget
+  before (``Ctx.nf``), when the ``_nf`` variant is used.
+* **A fault** in a load or store is raised from C with the instruction's pc
+  and the syndrome template ``translate-a64.c`` would have left in the insn
+  start words, both made from the opcode, which is the access's last operand.
+* **System registers, exclusives, ``svc``, ``eret``** are one call to C each
+  (``call``, ``call_exit``), which does what ``handle_sys()`` and the
+  ``trans_*`` functions generate, with the same helpers. The translator makes
+  the decisions a TB's flags allow; a read of a plain field with no access
+  function is a move, and so is ``mrs xt, sp_el0`` once its gadget has seen
+  PSTATE.SP. A write ends the TB in the main loop, as with TCG. The register
+  is looked up at run time: a TB is every CPU's, an ``ARMCPRegInfo`` is one
+  CPU's.
+* **Hints** are NOPs only where QEMU's are. ``sev`` and ``sevl`` set the
+  event register a ``wfe`` waits for, and are TCG's with ``wfe``, ``wfi`` and
+  ``yield``.
+* **Floating point and SIMD** are computed by the instruction itself. The
+  guest's instruction set is the host's, so ``gadgets-simd.S`` holds every
+  encoding of the class assembled on fixed registers, as a two-instruction
+  thunk, in tables indexed by the bits that are not registers; a gadget is
+  one of a few shapes (which registers are loaded from ``env`` and what is
+  stored back) and calls the thunk it is given. What the translator decides
+  is therefore not what an instruction does but whether it exists for the
+  guest: the tables of the base architecture, without half-precision
+  arithmetic and every later extension, which are TCG's.
+
+  The host's FPCR is the guest's while such gadgets run, and the host's FPSR
+  collects what they raise (``fp_on``, ``aok_fp_end``): rounding mode,
+  flush-to-zero, default NaN, the cumulative flags and QC are the hardware's
+  own. That is sound only for those three FPCR fields, and a TB does not say
+  what the FPCR is: the first time any CPU's FPCR gets another bit
+  (alternative half precision, FZ16, the AFP modes), FP becomes TCG's for
+  good and every TB is flushed. FP is also TCG's while it traps, in
+  streaming mode, and wherever SVE is enabled with vectors longer than 128
+  bits, whose upper part a write would have to clear.
+* Left to TCG: the other exceptions, the LSE atomics, the structure loads
+  and stores (``ld1`` and the like), SVE and SME; and with LSE2, whose
+  alignment rule is another, the exclusives and ordered accesses.
+
+A TB is translated only in AArch64 state with a little-endian guest and
+4 KiB pages, with no single-step, alignment checking, MTE, GCS, nested
+virtualization or pending branch-target check. On a CPU with BTI the
+indirect branches are TCG's, since they set ``PSTATE.BTYPE``.
+
 Testing
 =======
 
@@ -284,3 +363,16 @@ guest-side transcripts have been used, each compared between the two:
 
 All three are identical with one guest CPU and with four, with pairs, without
 them, and with forwarding off.
+
+For AArch64 there is a fourth, ``simdtest``: every encoding of the scalar FP
+and Advanced SIMD data-processing space (560,640 of them, with fixed
+registers), each run on four sets of inputs, one under another rounding mode
+with flush-to-zero and default NaN, and the result, flags and FPSR hashed. An
+encoding that does not exist is a SIGILL and hashed as that, so the
+transcript checks both which instructions a guest CPU has and what each
+computes. The reference for this one is TCG with a JIT backend: against
+QEMU 11.0.3 on a ``cortex-a72`` the transcripts are identical. The threaded
+interpreter in this tree is not a reference here. It differs from the JIT,
+from the gadgets and from hardware (the same guest under HVF) in ``cmlt #0``
+and ``cmle #0`` on 8-, 16- and 32-bit lanes, and in ``sshl`` on 16- and
+32-bit lanes.

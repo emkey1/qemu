@@ -490,6 +490,7 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
 #ifdef CONFIG_AOK_GADGETS
         if (unlikely(aok_stats_enabled)) {
             aok_stats.enter_tcg++;
+            aok_stats_tcg_entry(cpu);
         }
         /* Flags from a stream that an exception left by longjmp. */
         aok_fold_fpsr(cpu);

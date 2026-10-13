@@ -188,6 +188,23 @@ awk                  5.02 G       4.65 G     1.080
 In a guest boot and those programs, 220,000 pairs were fused out of 697,000
 translated instructions, 66,000 of them forwarding a register.
 
+Which engine is running
+=======================
+
+A guest cannot tell which engine runs it, and neither can whoever sits at
+it, so a machine whose CPUs have a front end says so, as long as the gadgets
+are on (``accel/tcg/aok-system.c``):
+
+* in its device tree, where the machine makes one (the ``virt`` machines of
+  Arm and RISC-V call ``aok_fdt_announce()``): the property ``aok,engine`` of
+  ``/chosen``, which a Linux guest has as
+  ``/proc/device-tree/chosen/aok,engine`` with no driver;
+* in the fw_cfg file ``opt/aok/engine``, which in Linux is root's to read
+  and needs the ``qemu_fw_cfg`` module.
+
+Both hold one line, ``AOK gadgets (ARCH)``, and neither exists with
+``QEMU_AOK=0`` or for a guest architecture that has no front end.
+
 Rules a front end must keep
 ===========================
 

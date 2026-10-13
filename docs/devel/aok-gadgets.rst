@@ -210,6 +210,12 @@ are on (``accel/tcg/aok-system.c``):
 Both hold one line, ``AOK gadgets (ARCH)``, and neither exists with
 ``QEMU_AOK=0`` or for a guest architecture that has no front end.
 
+An x86 machine has no device tree, and a system that is not Linux has no way
+to the file at all. There the processor's name says it
+(``target/i386/tcg/system/tcg-cpu.c``): the CPUID brand string ends in
+``(AOK gadgets)``, which is ``model name`` in ``/proc/cpuinfo`` and the
+processor line of a Windows system's properties.
+
 Rules a front end must keep
 ===========================
 
@@ -471,8 +477,9 @@ with the gadgets.
   shifts, rotates whose flags are wanted, the string instructions (a ``rep``
   goes page by page on the host's memory where the pages are RAM, and comes
   back to the main loop if it is long), ``cmpxchg``, ``cmpxchg8b``, ``xadd``
-  and ``xchg`` with memory, ``pushf`` and ``popf``, ``rdtsc``, ``pause``,
-  and ``in`` and ``out`` where the CPL may use any port.
+  and ``xchg`` with memory, ``pushf`` and ``popf``, ``lahf`` and ``sahf``,
+  ``clc``, ``stc`` and ``cmc``, ``rdtsc``, ``pause``, and ``in`` and ``out``
+  where the CPL may use any port.
 * **Other CPUs.** Under multi-threaded TCG a guest's stores must stay in
   order and its loads before what follows them. Every memory gadget exists
   a second time with the barriers that give that, used in a ``CF_PARALLEL``
@@ -550,9 +557,8 @@ TB is either invalidated by it or made of the new bytes. With that, ``poke``
 ran 16 of 16 on the gadgets (and 8 of 8 in a 64-bit guest), 6 of 6 with
 ``QEMU_AOK=0`` and the widened gap, and the guest that died at boot came up
 100 times of 100. What it costs is a turn of the main loop and a second look
-at the page
-for each store into a page with code, a path that already takes the page's
-lock and walks its TBs.
+at the page for each store into a page with code, a path that already takes
+the page's lock and walks its TBs.
 
 One gap of the same kind is left as it was, because nothing sees it: a store
 to a page with no TBs takes the fast path, and a first TB can be made on

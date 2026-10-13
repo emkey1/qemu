@@ -19,6 +19,9 @@
  */
 
 #include "qemu/osdep.h"
+#ifdef CONFIG_AOK_GADGETS
+#include "accel/tcg/aok.h"
+#endif
 #include "qemu/units.h"
 #include "qemu/error-report.h"
 #include "qemu/guest-random.h"
@@ -1220,6 +1223,9 @@ static void virt_machine_done(Notifier *notifier, void *data)
      */
     if (machine->dtb == NULL) {
         finalize_fdt(s);
+#ifdef CONFIG_AOK_GADGETS
+        aok_fdt_announce(machine->fdt);
+#endif
     }
 
     /*

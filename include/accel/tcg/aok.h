@@ -229,6 +229,8 @@ typedef struct AokStats {
 } AokStats;
 extern AokStats aok_stats;
 extern bool aok_stats_enabled;
+/* A machine's device tree says which engine runs it (aok-system.c). */
+void aok_fdt_announce(void *fdt);
 /* The main loop is about to enter one of TCG's TBs (QEMU_AOK_STATS=2). */
 void aok_stats_tcg_entry(CPUState *cpu);
 

@@ -29,8 +29,8 @@ _ip      .req x28
 #define AOK_ENTER_WORDS 3
 
 /*
- * aok_tb_exec's frame, off x29: where it keeps AokCPU.host_fpsr, and eight
- * bytes that are any gadget's to use between two dispatches.
+ * aok_tb_exec's frame, off x29: where it keeps AokCPU.host_fpsr, and
+ * twenty-four bytes that are any gadget's to use between two dispatches.
  */
 #define AOK_FRAME_FPSR  96
 #define AOK_FRAME_SCRATCH 104

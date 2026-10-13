@@ -159,7 +159,8 @@ that end in that.
 
 ``scripts/aok-gadgets-sync.sh [CHECKOUT]`` copies the three files from a
 checkout of iSH-AOK and writes ``shared/host-gadgets.h`` (which gadgets exist
-here, read off the assembled object) and ``shared/SOURCE`` (the commit).
+here, read off the assembled object) and ``shared/SOURCE`` (the commit). It
+does the same for AArch64's two files (see below).
 ``--check`` says whether the copies are current. **Do not edit the copies**:
 change iSH-AOK and copy again, so that a gadget improved or a pair added
 there arrives here with nothing ported by hand.
@@ -262,6 +263,45 @@ stores, branches, ``jal`` and ``jalr``, CSR accesses, and F and D.
 A TB is translated only for RV64 with a little-endian guest, not
 virtualized, with no pointer masking, CFI or instruction-count trigger, and
 with the C extension. It stays within its page.
+
+AArch64
+=======
+
+``target/arm/tcg/aok``. Here the guest is the architecture iSH-AOK's first
+64-bit engine was written for, and the host's own, so an instruction is most
+often the same instruction with its registers read from ``env`` and written
+back.
+
+Translated: data processing with immediates and registers (all of it but the
+tagged, pointer-authentication, CRC and CSSC instructions), conditional
+selects and compares, loads and stores of X and W registers in every
+addressing mode, pairs, literals, direct, conditional and indirect branches,
+the hint space, ``dsb``/``dmb``, and ``mrs`` of the two thread-pointer
+registers.
+
+* **Shared with iSH-AOK:** ``shared/alu_spec.S`` and ``shared/frag.h`` are its
+  ``jit/guest-arm64`` files, unchanged: the operand-specialised integer
+  gadgets, and the bodies of loads, stores and pairs. ``gadgets-shared.S``
+  gives them this tree's host (``frag.h``, "A second host"): registers, the
+  split flags, and guest memory through the softmmu fast path.
+* **XZR** is two slots after ``pc`` in ``CPUARMState``: ``aok_zero``, which
+  nothing writes, and ``aok_sink``, which nothing reads. A gadget then takes
+  register 31 as any other, and the translator chooses SP or one of those by
+  the operand.
+* **Flags** are QEMU's four words. A gadget that sets them stores them from
+  the host's NZCV, and one that reads them loads the host's from them, unless
+  the translator knows the host's are still the guest's from the gadget
+  before (``Ctx.nf``), when the ``_nf`` variant is used.
+* **A fault** in a load or store is raised from C with the instruction's pc
+  and the syndrome template ``translate-a64.c`` would have left in the insn
+  start words, both made from the opcode, which is the access's last operand.
+* Left to TCG: system instructions other than those above, exceptions,
+  exclusives and atomics, floating point and SIMD, SVE and SME.
+
+A TB is translated only in AArch64 state with a little-endian guest and
+4 KiB pages, with no single-step, alignment checking, MTE, GCS, nested
+virtualization or pending branch-target check. On a CPU with BTI the
+indirect branches are TCG's, since they set ``PSTATE.BTYPE``.
 
 Testing
 =======

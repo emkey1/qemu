@@ -2,7 +2,8 @@
 # aok-gadgets-sync.sh [--check] [ISH_AOK_CHECKOUT]
 #
 # The AOK gadgets of a front end that iSH-AOK also has are iSH-AOK's sources,
-# kept here as copies (target/riscv/tcg/aok/shared). This brings the copies
+# kept here as copies (target/riscv/tcg/aok/shared, target/arm/tcg/aok/shared).
+# This brings the copies
 # up to date with a checkout of iSH-AOK (default ../ish-AOK), or with
 # --check says whether they are.
 #
@@ -18,13 +19,31 @@ src=${1:-$here/../ish-AOK}/jit/guest-riscv64
 dst=$here/target/riscv/tcg/aok/shared
 [ -f "$src/alu.S" ] || { echo "no iSH-AOK checkout at ${1:-$here/../ish-AOK}" >&2; exit 2; }
 
+# The A64 front end's (target/arm/tcg/aok/shared): the bodies and the
+# specialised integer gadgets. No pair table yet.
+src64=${src%/guest-riscv64}/guest-arm64
+dst64=$here/target/arm/tcg/aok/shared
+a64="alu_spec.S frag.h"
+
 if [ -n "$check" ]; then
     for f in alu.S frag.h pairs.h; do
         cmp -s "$src/$f" "$dst/$f" || { echo "shared/$f differs from iSH-AOK's: run $0" >&2; exit 1; }
     done
+    for f in $a64; do
+        cmp -s "$src64/$f" "$dst64/$f" || { echo "arm shared/$f differs from iSH-AOK's: run $0" >&2; exit 1; }
+    done
     echo "shared gadget sources match $(git -C "$src" rev-parse --short HEAD)"
     exit 0
 fi
+
+mkdir -p "$dst64"
+for f in $a64; do cp "$src64/$f" "$dst64/"; done
+{
+    echo "iSH-AOK jit/guest-arm64 ($a64)"
+    echo "commit $(git -C "$src64" rev-parse HEAD)"
+    git -C "$src64" diff --quiet HEAD -- $a64 || echo "with uncommitted changes"
+    echo "licence: as target/riscv/tcg/aok/shared/SOURCE says of guest-riscv64's"
+} > "$dst64/SOURCE"
 
 mkdir -p "$dst"
 cp "$src/alu.S" "$src/frag.h" "$src/pairs.h" "$dst/"

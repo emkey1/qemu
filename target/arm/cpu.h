@@ -248,6 +248,16 @@ typedef struct CPUArchState {
     /* Regs for A64 mode.  */
     uint64_t xregs[32];
     uint64_t pc;
+#ifdef CONFIG_AOK_GADGETS
+    /*
+     * For AOK gadgets, whose operands are offsets of registers in this
+     * structure: the offset to give for XZR as a source, eight bytes that
+     * nothing ever writes, and the one to give for XZR as a destination.
+     * (Next to xregs: a pair's two offsets share a word, 16 bits each.)
+     */
+    uint64_t aok_zero;
+    uint64_t aok_sink;
+#endif
     /* PSTATE isn't an architectural register for ARMv8. However, it is
      * convenient for us to assemble the underlying state into a 64 bit format
      * identical to the architectural format used for the SPSR. (This is also

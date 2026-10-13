@@ -1,13 +1,13 @@
 /*
  * AOK gadgets for AArch64 guests: the translator.
  *
- * Turns A64 integer, load/store and branch instructions into a gadget
- * stream (include/accel/tcg/aok.h). It translates what it is sure of and
- * stops in front of anything else -- system instructions, floating point and
- * SIMD, exclusives and atomics, an encoding it does not know, a feature it
- * does not model -- so that the next TB starts there and TCG translates it,
- * raising whatever exception is due. A TB whose first insn is one of those
- * is declined outright.
+ * Turns A64 integer, load/store, branch and system instructions into a
+ * gadget stream (include/accel/tcg/aok.h). It translates what it is sure of
+ * and stops in front of anything else -- floating point and SIMD, the LSE
+ * atomics, an encoding it does not know, a feature it does not model -- so
+ * that the next TB starts there and TCG translates it, raising whatever
+ * exception is due. A TB whose first insn is one of those is declined
+ * outright.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -18,7 +18,12 @@
 #include "cpu.h"
 #include "internals.h"
 #include "cpu-features.h"
+#include "cpregs.h"
 #include "syndrome.h"
+#include "helper.h"
+#include "helper-a64.h"
+#include "qemu/atomic.h"
+#include "qemu/atomic128.h"
 #include "exec/target_page.h"
 #include "exec/translation-block.h"
 #include "accel/tcg/aok.h"
@@ -70,6 +75,9 @@ LOADS(DECL, _fast) STORES(DECL, _fast)
 LOADS(DECL, _rx0) STORES(DECL, _rx0) LOADS(DECL, _rx1) STORES(DECL, _rx1)
 LOADS(DECL, _rx2) STORES(DECL, _rx2)
 LOADS(DECL, _wb0) STORES(DECL, _wb0) LOADS(DECL, _wb1) STORES(DECL, _wb1)
+LOADS(DECL, _user) STORES(DECL, _user)
+DECL(load16_ord) DECL(load32_ord) DECL(load64_ord)
+DECL(store16_ord) DECL(store32_ord) DECL(store64_ord)
 DECL(load32_lit) DECL(load64_lit) DECL(loads32_64_lit)
 #define PAIRS(X, n) X(n##64_fast) X(n##32_fast) X(n##64_post) X(n##32_post) \
     X(n##64_pre) X(n##32_pre)
@@ -92,6 +100,7 @@ ALUS(adds) ALUS(subs) ALUS(ands) ALUS(bics)
 ALUXS(adds) ALUXS(subs)
 DECL(b) DECL(bl) D2(cbz) D2(cbnz) DECL(tbz) DECL(tbnz)
 DECL(br) DECL(blr) DECL(br_exit) DECL(blr_exit) DECL(lookup) DECL(barrier)
+DECL(call) DECL(call_exit) DECL(mrs_sp_el0)
 
 /* The gadgets there are one of for each condition, and their tables. */
 #define CONDS(X, p, s) X(p##eq##s) X(p##ne##s) X(p##cs##s) X(p##cc##s) \
@@ -130,6 +139,8 @@ QEMU_BUILD_BUG_ON(offsetof(CPUARMState, VF) != AOK_A64_ENV_VF);
 QEMU_BUILD_BUG_ON(offsetof(CPUARMState, NF) != AOK_A64_ENV_NF);
 QEMU_BUILD_BUG_ON(offsetof(CPUARMState, ZF) != AOK_A64_ENV_ZF);
 QEMU_BUILD_BUG_ON(offsetof(CPUARMState, xregs[30]) != AOK_A64_ENV_X30);
+QEMU_BUILD_BUG_ON(offsetof(CPUARMState, pstate) != AOK_A64_ENV_PSTATE);
+QEMU_BUILD_BUG_ON(PSTATE_SP != 1);
 /* A pair's two register offsets share a word, sixteen bits each. */
 QEMU_BUILD_BUG_ON(offsetof(CPUARMState, aok_sink) >= 0x10000);
 
@@ -147,7 +158,11 @@ typedef struct Ctx {
      */
     bool nf;
     int tbi;                /* an indirect branch's operand (gadgets.S) */
+    ARMCPU *cpu;
+    int el, fp_excp_el;
     bool bti, pauth_active, pauth, fgt, no_goto_ptr;
+    bool unpriv, trap_eret, fgt_svc, lse2, ras, gcs;
+    bool no_sys, no_exc, no_atomic;     /* QEMU_AOK_NO_*, for bisecting */
 } Ctx;
 
 /* ---- Operands --------------------------------------------------------- */
@@ -244,6 +259,7 @@ static uint64_t a64_clean_addr(CPUARMState *env, uint64_t addr)
 typedef struct A64Access {
     bool pair, pair64;
     bool iss_valid, sign, sf;
+    bool ordered, unpriv;
     unsigned size, rt, rt2;
 } A64Access;
 
@@ -251,7 +267,13 @@ static A64Access a64_access(uint32_t insn)
 {
     A64Access a = { .rt = insn & 31 };
 
-    if ((insn & 0x3a000000) == 0x28000000) {
+    if ((insn & 0x3f000000) == 0x08000000) {
+        /* ldar, stlr: the syndrome says which (AR), and they must be aligned */
+        a.size = insn >> 30;
+        a.sf = a.size == 3;
+        a.iss_valid = true;
+        a.ordered = true;
+    } else if ((insn & 0x3a000000) == 0x28000000) {
         a.pair = true;
         a.pair64 = insn >> 31;
         a.rt2 = (insn >> 10) & 31;
@@ -274,8 +296,42 @@ static A64Access a64_access(uint32_t insn)
         a.sf = a.sign ? !ext : a.size == 3;
         /* Write-back makes the syndrome's register fields meaningless. */
         a.iss_valid = imm12 || regoff || !(insn & (1 << 10));
+        a.unpriv = !imm12 && !regoff && ((insn >> 10) & 3) == 2;
     }
     return a;
+}
+
+/* As translate-a64.c's core_a64_user_mem_index(). */
+static int a64_mmu_idx(CPUARMState *env, bool unpriv)
+{
+    int idx = EX_TBFLAG_ANY(env->hflags, MMUIDX);
+
+    if (unpriv && EX_TBFLAG_A64(env->hflags, UNPRIV)) {
+        switch (core_to_aa64_mmu_idx(idx)) {
+        case ARMMMUIdx_E10_1:
+        case ARMMMUIdx_E10_1_PAN:
+            return arm_to_core_mmu_idx(ARMMMUIdx_E10_0);
+        case ARMMMUIdx_E20_2:
+        case ARMMMUIdx_E20_2_PAN:
+            return arm_to_core_mmu_idx(ARMMMUIdx_E20_0);
+        default:
+            g_assert_not_reached();
+        }
+    }
+    return idx;
+}
+
+/*
+ * What every function a stream calls does first: nothing is unwound from
+ * here, so the pc an exception would report is stored now, with the
+ * syndrome template arm_restore_state_to_opc would have left.
+ */
+static void a64_sync_pc(CPUARMState *env, uint64_t pc, uint32_t syn)
+{
+    aok_fold_fpsr(env_cpu(env));
+    aok_no_retaddr();
+    env->pc = pc;
+    env->exception.syndrome = syn;
 }
 
 static MemOpIdx a64_sync(CPUARMState *env, uint64_t pc, const A64Access *a,
@@ -283,18 +339,18 @@ static MemOpIdx a64_sync(CPUARMState *env, uint64_t pc, const A64Access *a,
 {
     uint32_t syn = 0;
 
-    aok_fold_fpsr(env_cpu(env));
-    aok_no_retaddr();
-    env->pc = pc;
     if (a->iss_valid) {
         /* As do_gpr_ld/do_gpr_st and disas_set_insn_syndrome leave it. */
         syn = syn_data_abort_with_iss(0, a->size, a->sign, a->rt, a->sf,
-                                      false, 0, 0, 0, 0, 0, false);
+                                      a->ordered, 0, 0, 0, 0, 0, false);
         syn &= ARM_INSN_START_WORD2_MASK;
         syn = (syn >> ARM_INSN_START_WORD2_SHIFT) << ARM_INSN_START_WORD2_SHIFT;
     }
-    env->exception.syndrome = syn;
-    return make_memop_idx(mop, EX_TBFLAG_ANY(env->hflags, MMUIDX));
+    a64_sync_pc(env, pc, syn);
+    if (a->ordered && a->size) {
+        mop |= MO_ALIGN;    /* check_ordered_align(), without LSE2 */
+    }
+    return make_memop_idx(mop, a64_mmu_idx(env, a->unpriv));
 }
 
 void aok_a64_helper_ld(CPUARMState *env, uint64_t addr, uint64_t pc,
@@ -372,6 +428,256 @@ void aok_a64_helper_st(CPUARMState *env, uint64_t addr, uint64_t pc,
             break;
         }
     }
+}
+
+/* ---- One call to C --------------------------------------------------------
+ *
+ * Instructions done whole in C: fn(env, pc, insn, arg), from the call and
+ * call_exit gadgets. Each does what translate-a64.c generates for the insn,
+ * with the same helpers in the same order.
+ */
+
+static uint64_t a64_reg(CPUARMState *env, unsigned r)
+{
+    return r == 31 ? 0 : env->xregs[r];
+}
+
+static void a64_set_reg(CPUARMState *env, unsigned r, uint64_t v)
+{
+    if (r != 31) {
+        env->xregs[r] = v;
+    }
+}
+
+/*
+ * handle_sys(): mrs, msr and sys with a register. The translator has made
+ * the checks that need only the TB's flags. The register is looked up here,
+ * as TCG's code does: a TB is every CPU's, and each CPU has its own
+ * ARMCPRegInfo, alike but for what its functions are given to work on. A
+ * write that may change what the next TB is ends this one in the main loop,
+ * so the pc is left at the next insn.
+ */
+void aok_a64_helper_sysreg(CPUARMState *env, uint64_t pc, uint64_t insn,
+                           void *unused);
+void aok_a64_helper_sysreg(CPUARMState *env, uint64_t pc, uint64_t insn,
+                           void *unused)
+{
+    bool isread = insn & (1 << 21);
+    unsigned op0 = extract32(insn, 19, 2), op1 = extract32(insn, 16, 3);
+    unsigned crn = extract32(insn, 12, 4), crm = extract32(insn, 8, 4);
+    unsigned op2 = extract32(insn, 5, 3), rt = insn & 31;
+    uint32_t key = ENCODE_AA64_CP_REG(op0, op1, crn, crm, op2);
+    const ARMCPRegInfo *ri = get_arm_cp_reginfo(env_archcpu(env)->cp_regs, key);
+    int el = arm_current_el(env);
+    uint64_t v;
+
+    a64_sync_pc(env, pc, 0);
+    if (ri->accessfn || (ri->fgt && EX_TBFLAG_ANY(env->hflags, FGT_ACTIVE))) {
+        helper_access_check_cp_reg(env, key,
+                                   syn_aa64_sysregtrap(op0, op1, op2, crn, crm,
+                                                       rt, isread),
+                                   isread);
+    }
+    env->pc = pc + 4;
+
+    switch (ri->type & ARM_CP_SPECIAL_MASK) {
+    case 0:
+        break;
+    case ARM_CP_NOP:
+        return;
+    case ARM_CP_NZCV:
+        if (isread) {
+            a64_set_reg(env, rt, (env->NF & 0x80000000u) |
+                        (env->ZF == 0) << 30 | env->CF << 29 |
+                        (env->VF >> 31) << 28);
+        } else {
+            uint32_t nzcv = a64_reg(env, rt);
+
+            env->NF = nzcv & 0x80000000u;
+            env->ZF = !(nzcv & (1 << 30));
+            env->CF = (nzcv >> 29) & 1;
+            env->VF = (nzcv & (1 << 28)) << 3;
+        }
+        return;
+    case ARM_CP_CURRENTEL:
+        a64_set_reg(env, rt, el << 2);
+        return;
+    case ARM_CP_DC_ZVA:
+        env->pc = pc;
+        helper_dc_zva(env, a64_clean_addr(env, a64_reg(env, rt)));
+        env->pc = pc + 4;
+        return;
+    default:
+        g_assert_not_reached();
+    }
+
+    if (isread) {
+        if (ri->type & ARM_CP_CONST) {
+            v = ri->resetvalue;
+        } else if (ri->readfn) {
+            env->pc = pc;
+            v = helper_get_cp_reg64(env, ri);
+            env->pc = pc + 4;
+        } else {
+            v = *(uint64_t *)((char *)env + ri->fieldoffset);
+        }
+        a64_set_reg(env, rt, v);
+        return;
+    }
+    if (ri->type & ARM_CP_CONST) {
+        return;
+    }
+    v = a64_reg(env, rt);
+    if (ri->writefn) {
+        env->pc = pc;
+        helper_set_cp_reg64(env, ri, v);
+        env->pc = pc + 4;
+    } else {
+        *(uint64_t *)((char *)env + ri->fieldoffset) = v;
+    }
+    if (!(ri->type & ARM_CP_SUPPRESS_TB_END)) {
+        helper_rebuild_hflags_a64(env, el);
+    }
+}
+
+/* msr daifset, #imm and msr daifclr, #imm */
+void aok_a64_helper_msr_daif(CPUARMState *env, uint64_t pc, uint64_t insn,
+                             void *unused);
+void aok_a64_helper_msr_daif(CPUARMState *env, uint64_t pc, uint64_t insn,
+                             void *unused)
+{
+    uint32_t imm = extract32(insn, 8, 4);
+
+    a64_sync_pc(env, pc, 0);
+    if (insn & (1 << 5)) {
+        helper_msr_i_daifclear(env, imm);
+    } else {
+        helper_msr_i_daifset(env, imm);
+    }
+    env->pc = pc + 4;
+}
+
+/* svc: the exception is taken from the next insn. */
+void aok_a64_helper_svc(CPUARMState *env, uint64_t pc, uint64_t insn,
+                        void *unused);
+void aok_a64_helper_svc(CPUARMState *env, uint64_t pc, uint64_t insn,
+                        void *unused)
+{
+    a64_sync_pc(env, pc + 4, 0);
+    helper_exception_with_syndrome(env, EXCP_SWI,
+                                   syn_aa64_svc(extract32(insn, 5, 16)));
+}
+
+/* eret: the helper sets the pc and everything else. */
+void aok_a64_helper_eret(CPUARMState *env, uint64_t pc, uint64_t insn,
+                         void *unused);
+void aok_a64_helper_eret(CPUARMState *env, uint64_t pc, uint64_t insn,
+                         void *unused)
+{
+    a64_sync_pc(env, pc, 0);
+    helper_exception_return(env, env->elr_el[arm_current_el(env)]);
+}
+
+/*
+ * The exclusives, as gen_load_exclusive() and gen_store_exclusive(): a load
+ * remembers the address and what was there, and a store is a compare and
+ * swap against that. cputlb's atomic helpers are atomic whether or not the
+ * TB is CF_PARALLEL. Without LSE2 (the translator has checked) every access
+ * wider than a byte must be aligned.
+ */
+static MemOpIdx a64_excl_oi(CPUARMState *env, MemOp mop)
+{
+    if ((mop & MO_SIZE) == MO_128) {
+        mop |= MO_ALIGN | MO_ATOM_IFALIGN_PAIR;
+    } else if (mop & MO_SIZE) {
+        mop |= MO_ALIGN;
+    }
+    return make_memop_idx(mop | MO_LE, EX_TBFLAG_ANY(env->hflags, MMUIDX));
+}
+
+void aok_a64_helper_ldx(CPUARMState *env, uint64_t pc, uint64_t insn,
+                        void *unused);
+void aok_a64_helper_ldx(CPUARMState *env, uint64_t pc, uint64_t insn,
+                        void *unused)
+{
+    unsigned rt = insn & 31, rn = (insn >> 5) & 31, rt2 = (insn >> 10) & 31;
+    bool pair = insn & (1 << 21);
+    unsigned size = pair ? 2 | ((insn >> 30) & 1) : insn >> 30;
+    uint64_t addr = a64_clean_addr(env, env->xregs[rn]);
+    MemOpIdx oi = a64_excl_oi(env, size + pair);
+
+    a64_sync_pc(env, pc, 0);
+    if (pair && size == 3) {
+        Int128 v = cpu_ld16_mmu(env, addr, oi, 0);
+
+        env->exclusive_val = int128_getlo(v);
+        env->exclusive_high = int128_gethi(v);
+        a64_set_reg(env, rt, env->exclusive_val);
+        a64_set_reg(env, rt2, env->exclusive_high);
+    } else if (pair) {
+        env->exclusive_val = cpu_ldq_mmu(env, addr, oi, 0);
+        a64_set_reg(env, rt, (uint32_t)env->exclusive_val);
+        a64_set_reg(env, rt2, env->exclusive_val >> 32);
+    } else {
+        env->exclusive_val = size == 0 ? cpu_ldb_mmu(env, addr, oi, 0)
+                           : size == 1 ? cpu_ldw_mmu(env, addr, oi, 0)
+                           : size == 2 ? cpu_ldl_mmu(env, addr, oi, 0)
+                           : cpu_ldq_mmu(env, addr, oi, 0);
+        a64_set_reg(env, rt, env->exclusive_val);
+    }
+    env->exclusive_addr = addr;
+    if (insn & (1 << 15)) {
+        smp_mb();           /* ldaxr */
+    }
+}
+
+void aok_a64_helper_stx(CPUARMState *env, uint64_t pc, uint64_t insn,
+                        void *unused);
+void aok_a64_helper_stx(CPUARMState *env, uint64_t pc, uint64_t insn,
+                        void *unused)
+{
+    unsigned rt = insn & 31, rn = (insn >> 5) & 31, rt2 = (insn >> 10) & 31;
+    unsigned rs = (insn >> 16) & 31;
+    bool pair = insn & (1 << 21);
+    unsigned size = pair ? 2 | ((insn >> 30) & 1) : insn >> 30;
+    uint64_t addr = a64_clean_addr(env, env->xregs[rn]);
+    uint64_t v = a64_reg(env, rt), v2 = a64_reg(env, rt2);
+    uint64_t cmp = env->exclusive_val, old;
+    MemOpIdx oi = a64_excl_oi(env, size + pair);
+    bool fail = true;
+
+    a64_sync_pc(env, pc, 0);
+    if (insn & (1 << 15)) {
+        smp_mb();           /* stlxr */
+    }
+    if (addr == env->exclusive_addr) {
+        if (pair && size == 3) {
+#if HAVE_CMPXCHG128
+            Int128 o = cpu_atomic_cmpxchgo_le_mmu(
+                env, addr, int128_make128(cmp, env->exclusive_high),
+                int128_make128(v, v2), oi, 0);
+
+            fail = (int128_getlo(o) ^ cmp) |
+                   (int128_gethi(o) ^ env->exclusive_high);
+#else
+            g_assert_not_reached();
+#endif
+        } else if (pair) {
+            old = cpu_atomic_cmpxchgq_le_mmu(env, addr, cmp,
+                                             (uint32_t)v | v2 << 32, oi, 0);
+            fail = old != cmp;
+        } else {
+            old = size == 0 ? cpu_atomic_cmpxchgb_mmu(env, addr, cmp, v, oi, 0)
+                : size == 1 ? cpu_atomic_cmpxchgw_le_mmu(env, addr, cmp, v,
+                                                         oi, 0)
+                : size == 2 ? cpu_atomic_cmpxchgl_le_mmu(env, addr, cmp, v,
+                                                         oi, 0)
+                : cpu_atomic_cmpxchgq_le_mmu(env, addr, cmp, v, oi, 0);
+            fail = old != cmp;
+        }
+    }
+    a64_set_reg(env, rs, fail);
+    env->exclusive_addr = -1;
 }
 
 /* No gadget computes on the host's FP unit yet. */
@@ -781,7 +1087,97 @@ static int dp_reg(Ctx *c, uint32_t insn)
     }
 }
 
-/* ---- Branches, and the few system instructions ------------------------------ */
+/* ---- System instructions ------------------------------------------------------ */
+
+/* An insn that is one call to C (gadgets.S): fn(env, pc, insn, arg). */
+static int call(Ctx *c, Gadget gadget, void *fn, const void *arg)
+{
+    emit(c, gadget, 4, (uint64_t)(uintptr_t)fn, (uint64_t)c->off,
+         (uint64_t)c->insn, (uint64_t)(uintptr_t)arg);
+    c->nf = false;
+    return gadget == G(call) ? NEXT : END;
+}
+
+/*
+ * mrs, msr and sys with a register: handle_sys(), for a register whose
+ * access needs nothing a TB's flags do not say. Whatever is odd about one --
+ * no such register, not at this EL, redirected, a special kind not listed --
+ * is TCG's.
+ */
+static int sysreg(Ctx *c, uint32_t insn)
+{
+    bool isread = insn & (1 << 21);
+    unsigned op0 = extract32(insn, 19, 2), op1 = extract32(insn, 16, 3);
+    unsigned crn = extract32(insn, 12, 4), crm = extract32(insn, 8, 4);
+    unsigned op2 = extract32(insn, 5, 3), rt = insn & 31;
+    uint32_t key = ENCODE_AA64_CP_REG(op0, op1, crn, crm, op2);
+    const ARMCPRegInfo *ri = get_arm_cp_reginfo(c->cpu->cp_regs, key);
+    bool check, ends;
+
+    if (!ri || crn == 11 || crn == 15 || !cp_access_ok(c->el, ri, isread) ||
+        (c->el >= 2 && (ri->vhe_redir_to_el2 || ri->vhe_redir_to_el01)) ||
+        (ri->type & (ARM_CP_FPMR | ARM_CP_SVE | ARM_CP_SME)) ||
+        ((ri->type & ARM_CP_FPU) && c->fp_excp_el)) {
+        return UNKNOWN;
+    }
+    check = ri->accessfn || (ri->fgt && c->fgt);
+
+    switch (ri->type & ARM_CP_SPECIAL_MASK) {
+    case 0:
+        break;
+    case ARM_CP_NOP:
+        if (!check) {
+            return NEXT;
+        }
+        /* fall through */
+    case ARM_CP_NZCV:
+    case ARM_CP_DC_ZVA:
+        return call(c, G(call), aok_a64_helper_sysreg, NULL);
+    case ARM_CP_CURRENTEL:
+        if (!check) {
+            E2(G(mov_const), wz(rt), c->el << 2);
+            return NEXT;
+        }
+        return call(c, G(call), aok_a64_helper_sysreg, NULL);
+    default:
+        return UNKNOWN;
+    }
+
+    if (ri->type & ARM_CP_CONST) {
+        if (ri->type & ARM_CP_IO) {
+            return UNKNOWN;
+        }
+        if (!check) {
+            if (isread) {
+                E2(G(mov_const), wz(rt), ri->resetvalue);
+            }
+            return NEXT;
+        }
+        return call(c, G(call), aok_a64_helper_sysreg, NULL);
+    }
+    /* An access to a device, and a write, end the TB in the main loop. */
+    ends = (ri->type & ARM_CP_IO) ||
+           (!isread && !(ri->type & ARM_CP_SUPPRESS_TB_END));
+    if (isread && !ends && !ri->readfn) {
+        if (!check) {
+            E2(G(umov64), wz(rt), ri->fieldoffset);
+            return NEXT;
+        }
+        if (key == ENCODE_AA64_CP_REG(3, 0, 4, 1, 0) && !(ri->fgt && c->fgt)) {
+            /* sp_el0, whose access function tests PSTATE.SP: the gadget does */
+            E2(G(mrs_sp_el0), wz(rt), ri->fieldoffset);
+            aok_emit(&c->g, (uintptr_t)aok_a64_helper_sysreg);
+            aok_emit(&c->g, c->off);
+            aok_emit(&c->g, c->insn);
+            aok_emit(&c->g, 0);
+            c->nf = false;
+            return NEXT;
+        }
+    }
+    return call(c, ends ? G(call_exit) : G(call), aok_a64_helper_sysreg, NULL);
+}
+
+/* ---- Branches, hints and exceptions ------------------------------------------- */
 
 static int branch_sys(Ctx *c, uint32_t insn)
 {
@@ -849,35 +1245,67 @@ static int branch_sys(Ctx *c, uint32_t insn)
         unsigned crm = (insn >> 8) & 15, op2 = (insn >> 5) & 7;
 
         switch (crm << 3 | op2) {
-        case 0:             /* nop */
-        case 4:             /* sev */
-        case 5:             /* sevl */
-        case 6:             /* dgh */
-            return NEXT;
-        case 7:             /* xpaclri */
+        case 1: case 2: case 3:                 /* yield, wfe, wfi */
+        case 4: case 5:
+            /*
+             * sev, sevl: they set the event register a wfe waits for. A
+             * kernel's "sevl; wfe" would sleep on a sevl that did nothing.
+             */
+            return UNKNOWN;
+        case 7:                                 /* xpaclri */
             return c->pauth ? UNKNOWN : NEXT;
         case 8: case 10: case 12: case 14:      /* pacia1716 ... autib1716 */
         case 24 ... 31:                         /* paciaz ... autibsp */
             return c->pauth_active ? UNKNOWN : NEXT;
-        case 16: case 18: case 20: case 22:
+        case 16:                                /* esb */
+            return c->ras ? UNKNOWN : NEXT;
+        case 19:                                /* gcsb */
+            return c->gcs ? UNKNOWN : NEXT;
+        default:
             /*
-             * bti: with PSTATE.BTYPE zero, as it is inside a TB (a TB that
-             * starts with it nonzero is TCG's), nothing.
+             * The rest of the space is a NOP. That includes bti: PSTATE.BTYPE
+             * is zero inside a TB, and a TB that starts with it nonzero is
+             * TCG's. And chkfeat: so is one with a guarded control stack.
              */
             return NEXT;
-        default:            /* yield, wfe, wfi, esb, ... */
-            return UNKNOWN;
         }
+    }
+    if ((insn & 0xfffff0ff) == 0xd503305f) {            /* clrex */
+        E2(G(mov_const), offsetof(CPUARMState, exclusive_addr), -1);
+        return NEXT;
+    }
+    if ((insn & 0xfffff0ff) == 0xd50330df) {
+        /* isb: the TB ends, for an interrupt or new code to be seen */
+        E0(G(b));
+        way(c, 0, c->off + 4);
+        return END;
+    }
+    if ((insn & 0xfffff0df) == 0xd50340df && !c->no_exc) {
+        /*
+         * msr daifset and daifclr. Masking more needs no look at what is
+         * pending; unmasking does.
+         */
+        if (insn & (1 << 5)) {
+            return call(c, G(call_exit), aok_a64_helper_msr_daif, NULL);
+        }
+        call(c, G(call), aok_a64_helper_msr_daif, NULL);
+        E0(G(b));
+        way(c, 0, c->off + 4);
+        return END;
+    }
+    if ((insn & 0xffc00000) == 0xd5000000 && extract32(insn, 19, 2) &&
+        !c->no_sys) {
+        return sysreg(c, insn);
+    }
+    if ((insn & 0xffe0001f) == 0xd4000001 && !c->fgt_svc && !c->no_exc) {
+        call(c, G(call), aok_a64_helper_svc, NULL);     /* (does not return) */
+        return END;
+    }
+    if (insn == 0xd69f03e0 && c->el && !c->trap_eret && !c->no_exc) {
+        return call(c, G(call_exit), aok_a64_helper_eret, NULL);
     }
     if ((insn & 0xfffff09f) == 0xd503309f && ((insn >> 5) & 7) < 6) {
         E0(G(barrier));                                 /* dsb, dmb */
-        return NEXT;
-    }
-    if ((insn & 0xffffffc0) == 0xd53bd040 && !c->fgt) {
-        /* mrs xt, tpidr_el0 and tpidrro_el0: fields of the state, no more */
-        E2(G(umov64), wz(rt), insn & 0x20
-           ? offsetof(CPUARMState, cp15.tpidrro_el[0])
-           : offsetof(CPUARMState, cp15.tpidr_el[0]));
         return NEXT;
     }
     return UNKNOWN;
@@ -910,6 +1338,7 @@ static int ldst(Ctx *c, uint32_t insn)
     static const Gadget imm_tab[13] = TAB13(_fast);
     static const Gadget rx_tab[3][13] = { TAB13(_rx0), TAB13(_rx1), TAB13(_rx2) };
     static const Gadget wb_tab[2][13] = { TAB13(_wb0), TAB13(_wb1) };
+    static const Gadget user_tab[13] = TAB13(_user);
     unsigned rt = insn & 31, rn = (insn >> 5) & 31, size = insn >> 30;
     /* The host's word: where the insn is, and what it is. */
     uint64_t word = (uint64_t)c->off << 32 | insn;
@@ -957,9 +1386,42 @@ static int ldst(Ctx *c, uint32_t insn)
            rsp(rn), imm, word);
         return NEXT;
     }
+    case 1: {   /* exclusives, and the ordered loads and stores */
+        bool o2 = insn & (1 << 23), load = insn & (1 << 22);
+        bool o1 = insn & (1 << 21);
+        static const Gadget ord[2][4] = {
+            { G(store8_fast), G(store16_ord), G(store32_ord), G(store64_ord) },
+            { G(load8_fast), G(load16_ord), G(load32_ord), G(load64_ord) },
+        };
+
+        /* (with LSE2 what must be aligned is another rule: TCG's) */
+        if ((insn & (1 << 24)) || c->lse2 || c->no_atomic) {
+            return UNKNOWN;
+        }
+        if (!o2) {
+            if (o1 && (!(insn >> 31) || (!HAVE_CMPXCHG128 && (insn >> 30) == 3))) {
+                return UNKNOWN;     /* casp; a pair of doublewords */
+            }
+            return call(c, G(call),
+                        load ? aok_a64_helper_ldx : aok_a64_helper_stx, NULL);
+        }
+        /* ldar, stlr; the LORegion twins need a feature, cas is LSE's */
+        if (o1 || !(insn & (1 << 15)) || ((insn >> 16) & 31) != 31 ||
+            ((insn >> 10) & 31) != 31) {
+            return UNKNOWN;
+        }
+        if (!load) {
+            E0(G(barrier));
+        }
+        E4(ord[load][size], load ? wz(rt) : rz(rt), rsp(rn), 0, word);
+        if (load) {
+            E0(G(barrier));
+        }
+        return NEXT;
+    }
     case 7:
         break;
-    default:    /* exclusives and the rest */
+    default:
         return UNKNOWN;
     }
 
@@ -995,8 +1457,18 @@ static int ldst(Ctx *c, uint32_t insn)
                sextract64(insn, 12, 9), word);
         }
         return NEXT;
-    case 2:                                             /* unprivileged */
-        return UNKNOWN;
+    case 2:
+        /*
+         * Unprivileged: where that means another translation regime, cputlb
+         * makes the access; elsewhere it is the unscaled access.
+         */
+        if (kind == K_PRFM) {
+            return UNKNOWN;
+        }
+        E4(c->unpriv ? user_tab[kind] : imm_tab[kind],
+           kind >= K_S8 ? rz(rt) : wz(rt), rsp(rn), sextract64(insn, 12, 9),
+           word);
+        return NEXT;
     default:                                            /* post- and pre-index */
         if (kind == K_PRFM || (rn == rt && rn != 31)) {
             return UNKNOWN;
@@ -1045,6 +1517,17 @@ int arm_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     }
 
     c.page_off = pc & ~TARGET_PAGE_MASK;
+    c.cpu = cpu;
+    c.no_sys = getenv("QEMU_AOK_NO_SYS");
+    c.no_exc = getenv("QEMU_AOK_NO_EXC");
+    c.no_atomic = getenv("QEMU_AOK_NO_ATOMIC");
+    c.fp_excp_el = EX_TBFLAG_ANY(f, FPEXC_EL);
+    c.unpriv = EX_TBFLAG_A64(f, UNPRIV);
+    c.trap_eret = EX_TBFLAG_A64(f, TRAP_ERET);
+    c.fgt_svc = EX_TBFLAG_ANY(f, FGT_SVC);
+    c.lse2 = cpu_isar_feature(aa64_lse2, cpu);
+    c.ras = cpu_isar_feature(aa64_ras, cpu);
+    c.gcs = cpu_isar_feature(aa64_gcs, cpu);
     c.bti = cpu_isar_feature(aa64_bti, cpu);
     c.pauth = cpu_isar_feature(aa64_pauth, cpu);
     c.pauth_active = EX_TBFLAG_A64(f, PAUTH_ACTIVE);
@@ -1052,6 +1535,7 @@ int arm_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     c.no_goto_ptr = cflags & CF_NO_GOTO_PTR;
     /* gadgets.S's a64_tbi: translate-a64.c's gen_top_byte_ignore(tbii). */
     mmu_idx = core_to_aa64_mmu_idx(EX_TBFLAG_ANY(f, MMUIDX));
+    c.el = arm_mmu_idx_to_el(mmu_idx);
     c.tbi = EX_TBFLAG_A64(f, TBII);
     if (c.tbi && !regime_has_2_ranges(mmu_idx)) {
         c.tbi = 4;

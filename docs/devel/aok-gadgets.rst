@@ -236,10 +236,16 @@ Run-time switches
   At exit, print how many TBs each translator made, how often the main loop
   entered each kind, what lookups done in C found, and the first opcodes of
   the TBs left to TCG.
+  With the value 2, also which of TCG's TBs the main loop entered most,
+  by pc and first instruction: every one is a stream that could not go on.
 
 ``QEMU_AOK_NO_CSR``, ``QEMU_AOK_NO_ATOMIC``, ``QEMU_AOK_NO_FP``, ``QEMU_AOK_NO_FPNATIVE``
   Leave that instruction class to TCG (or, for the last, to softfloat), for
   bisecting.
+
+``QEMU_AOK_NO_SYS``, ``QEMU_AOK_NO_EXC``, ``QEMU_AOK_NO_ATOMIC``
+  The same for AArch64: system register accesses; ``svc``, ``eret`` and the
+  DAIF immediates; exclusives and ordered accesses.
 
 ``QEMU_AOK_NO_PAIRS``, ``QEMU_AOK_NO_FWD``
   Fuse no pairs; fuse them, but forward no register.
@@ -275,9 +281,10 @@ back.
 Translated: data processing with immediates and registers (all of it but the
 tagged, pointer-authentication, CRC and CSSC instructions), conditional
 selects and compares, loads and stores of X and W registers in every
-addressing mode, pairs, literals, direct, conditional and indirect branches,
-the hint space, ``dsb``/``dmb``, and ``mrs`` of the two thread-pointer
-registers.
+addressing mode, pairs, literals, the unprivileged and the ordered ones,
+exclusives, direct, conditional and indirect branches, the hint space,
+barriers, system register accesses, ``msr daifset``/``daifclr``, ``svc`` and
+``eret``.
 
 * **Shared with iSH-AOK:** ``shared/alu_spec.S`` and ``shared/frag.h`` are its
   ``jit/guest-arm64`` files, unchanged: the operand-specialised integer
@@ -295,8 +302,20 @@ registers.
 * **A fault** in a load or store is raised from C with the instruction's pc
   and the syndrome template ``translate-a64.c`` would have left in the insn
   start words, both made from the opcode, which is the access's last operand.
-* Left to TCG: system instructions other than those above, exceptions,
-  exclusives and atomics, floating point and SIMD, SVE and SME.
+* **System registers, exclusives, ``svc``, ``eret``** are one call to C each
+  (``call``, ``call_exit``), which does what ``handle_sys()`` and the
+  ``trans_*`` functions generate, with the same helpers. The translator makes
+  the decisions a TB's flags allow; a read of a plain field with no access
+  function is a move, and so is ``mrs xt, sp_el0`` once its gadget has seen
+  PSTATE.SP. A write ends the TB in the main loop, as with TCG. The register
+  is looked up at run time: a TB is every CPU's, an ``ARMCPRegInfo`` is one
+  CPU's.
+* **Hints** are NOPs only where QEMU's are. ``sev`` and ``sevl`` set the
+  event register a ``wfe`` waits for, and are TCG's with ``wfe``, ``wfi`` and
+  ``yield``.
+* Left to TCG: the other exceptions, the LSE atomics, floating point and
+  SIMD, SVE and SME; and with LSE2, whose alignment rule is another, the
+  exclusives and ordered accesses.
 
 A TB is translated only in AArch64 state with a little-endian guest and
 4 KiB pages, with no single-step, alignment checking, MTE, GCS, nested

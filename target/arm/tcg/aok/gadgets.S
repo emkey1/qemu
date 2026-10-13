@@ -496,3 +496,46 @@ SYM(aok_a64_lookup_pc):
 .gadget barrier
     dmb ish
     gret
+
+/* ---- Instructions that are a call to C ---------------------------------------
+ *
+ * [fn][the insn's distance from the TB's first][insn][arg]:
+ * fn(env, pc, insn, arg), which stores the pc before anything that may raise
+ * (translate-a64.c, "One call to C"). The host's flags are not the guest's
+ * afterwards.
+ */
+.gadget call
+    aok_fp_end
+    ldp x9, x1, [_ip]
+    ldp x2, x3, [_ip, #16]
+    mov x0, _cpu
+    add x1, _pc, x1
+    blr x9
+    gret 4
+
+/* The same, for an insn that ends its TB in the main loop: fn has set env->pc. */
+.gadget call_exit
+    aok_fp_end
+    ldp x9, x1, [_ip]
+    ldp x2, x3, [_ip, #16]
+    mov x0, _cpu
+    add x1, _pc, x1
+    blr x9
+    mov x0, #0
+    b SYM(aok_exit)
+
+/*
+ * mrs xt, sp_el0, a kernel's "current": [rt offset][sp_el[0]'s offset], and
+ * then a call's operands. The register's one access check is that PSTATE.SP
+ * is set. With it clear the access is undefined: the call finds that out
+ * again, and raises it.
+ */
+.gadget mrs_sp_el0
+    ldr w9, [_cpu, #AOK_A64_ENV_PSTATE]
+    ldp x10, x11, [_ip]
+    tbz w9, #0, 1f
+    ldr x12, [_cpu, x11]
+    str x12, [_cpu, x10]
+    gret 6
+1:  add _ip, _ip, #16
+    b SYM(aok_gadget_a64_call)

@@ -114,7 +114,19 @@ _fval2  .req x1
 #define TLBE_WRITE      8
 #define TLBE_ADDEND     24
 
+/*
+ * Two switches for the gadgets instantiated while they are set.
+ * A64_SLOW_ONLY: no fast path at all, for an unprivileged access, which is
+ * another mmu index's table. A64_ALIGNED: no second chance for an unaligned
+ * address, for an ordered access, which must fault on one; cputlb is told.
+ */
+.set A64_SLOW_ONLY, 0
+.set A64_ALIGNED, 0
+
 .macro a64_tlb_probe size, id, tag
+    .if A64_SLOW_ONLY
+    b handle_miss_\id
+    .else
     ldp x9, x10, [_tlb]         /* mask, table */
     eor x11, _addr, _addr, lsr #TLB_FOLD
     and x9, x9, x11, lsr #TLB_SHIFT
@@ -134,6 +146,7 @@ _fval2  .req x1
     cmp x11, x9
     b.ne handle_miss_\id
     add _addr, _addr, x10
+    .endif
 back_\id:
 .endm
 
@@ -148,7 +161,7 @@ back_\id:
 
 /* Unaligned, but inside its page and the page plain RAM: the entry's addend. */
 .macro a64_unaligned size, id
-    .if \size > 8 && \size <= 64
+    .if \size > 8 && \size <= 64 && (A64_SLOW_ONLY + A64_ALIGNED) == 0
     and x9, _addr, #0xfff
     cmp x9, #(0x1000 - \size / 8)
     b.hi 1f
@@ -330,3 +343,30 @@ wb_store store64_wb\pre,  64, str,  x17, \pre
 lit_load load32_lit, 32, ldr, w17
 lit_load load64_lit, 64, ldr, x17
 lit_load loads32_64_lit, 32, ldrsw, x17
+
+/* Unprivileged (ldtr, sttr), where that is another translation regime's. */
+.set A64_SLOW_ONLY, 1
+f_gadget load8_user,      f_load,  8, ldrb,  w17, _, _
+f_gadget load16_user,     f_load, 16, ldrh,  w17, _, _
+f_gadget load32_user,     f_load, 32, ldr,   w17, _, _
+f_gadget load64_user,     f_load, 64, ldr,   x17, _, _
+f_gadget loads8_32_user,  f_load,  8, ldrsb, w17, _, _
+f_gadget loads8_64_user,  f_load,  8, ldrsb, x17, _, _
+f_gadget loads16_32_user, f_load, 16, ldrsh, w17, _, _
+f_gadget loads16_64_user, f_load, 16, ldrsh, x17, _, _
+f_gadget loads32_64_user, f_load, 32, ldrsw, x17, _, _
+f_gadget store8_user,     f_store,  8, strb, w17, _, _
+f_gadget store16_user,    f_store, 16, strh, w17, _, _
+f_gadget store32_user,    f_store, 32, str,  w17, _, _
+f_gadget store64_user,    f_store, 64, str,  x17, _, _
+.set A64_SLOW_ONLY, 0
+
+/* Ordered (ldar, stlr): the byte ones are the plain gadgets. */
+.set A64_ALIGNED, 1
+f_gadget load16_ord,  f_load, 16, ldrh, w17, _, _
+f_gadget load32_ord,  f_load, 32, ldr,  w17, _, _
+f_gadget load64_ord,  f_load, 64, ldr,  x17, _, _
+f_gadget store16_ord, f_store, 16, strh, w17, _, _
+f_gadget store32_ord, f_store, 32, str,  w17, _, _
+f_gadget store64_ord, f_store, 64, str,  x17, _, _
+.set A64_ALIGNED, 0

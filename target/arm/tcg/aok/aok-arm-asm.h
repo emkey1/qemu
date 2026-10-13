@@ -17,4 +17,7 @@
 /* x30, the link register. */
 #define AOK_A64_ENV_X30     0x130
 
+/* PSTATE's bits other than the flags and DAIF; bit 0 is SP. */
+#define AOK_A64_ENV_PSTATE  0x158
+
 #endif

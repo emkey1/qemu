@@ -17,6 +17,9 @@
 #define AOK_X86_ENV_EFLAGS  0x108
 #define AOK_X86_IF          0x200
 
+/* df: 1, or -1 with the direction flag set. */
+#define AOK_X86_ENV_DF      0x12c
+
 /* The lazy flags: cc_dst, cc_src and cc_src2 (eight bytes each), then cc_op. */
 #define AOK_X86_ENV_CC_DST  0x110
 #define AOK_X86_ENV_CC_SRC  (AOK_X86_ENV_CC_DST + 8)

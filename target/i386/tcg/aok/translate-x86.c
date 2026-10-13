@@ -4,9 +4,11 @@
  * Turns 64-bit code into a gadget stream (include/accel/tcg/aok.h). It
  * decodes what it is sure of and stops in front of anything else, so that
  * the next TB starts there and TCG translates it; a TB whose first insn is
- * one of those is declined outright. Only long mode's 64-bit code segment is
- * translated at all: the rest of the architecture's modes are firmware's and
- * a boot loader's, and TCG's.
+ * one of those is declined outright. Two kinds of code are translated: long
+ * mode's 64-bit code, and 32-bit protected-mode code with a 32-bit stack and
+ * flat segments, which is what a 32-bit operating system and its programs
+ * run in (and a 64-bit one's 32-bit programs). The rest of the architecture's
+ * modes are firmware's and a boot loader's, and TCG's.
  *
  * Conditions. The flags are QEMU's lazy ones and every gadget that sets them
  * stores them (gadgets.S), so they are exact wherever anything looks. What
@@ -43,12 +45,19 @@
 
 typedef void (*Gadget)(void);
 
-/* A gadget with a memory operand: [the ea form][with barriers] */
-typedef Gadget MemTab[2][2];
-#define MEMD(n) DECL(n##_bd) DECL(n##_bd_mp) DECL(n##_ea) DECL(n##_ea_mp)
-#define MEMT(n) { { G(n##_bd), G(n##_bd_mp) }, { G(n##_ea), G(n##_ea_mp) } },
+/*
+ * A gadget with a memory operand: [form][with barriers]. The forms are a
+ * base and a displacement, what an ea gadget left, and a base and a
+ * displacement in 32-bit code.
+ */
+enum { F_BD, F_EA, F_B3 };
+typedef Gadget MemTab[3][2];
+#define MEMD(n) DECL(n##_bd) DECL(n##_bd_mp) DECL(n##_ea) DECL(n##_ea_mp) \
+    DECL(n##_b3) DECL(n##_b3_mp)
+#define MEMT(n) { { G(n##_bd), G(n##_bd_mp) }, { G(n##_ea), G(n##_ea_mp) }, \
+                  { G(n##_b3), G(n##_b3_mp) } },
 
-DECL(ea) DECL(ea_seg) DECL(ea_pc) DECL(ea_pc_seg)
+DECL(ea) DECL(ea_seg) DECL(ea_pc) DECL(ea_pc_seg) DECL(ea32) DECL(ea32_seg)
 SIZES(DECL, mov)
 DECL(movzx8) DECL(movzx16) DECL(movsx8_32) DECL(movsx8_64)
 DECL(movsx16_32) DECL(movsx16_64) DECL(movsx32_64)
@@ -157,7 +166,8 @@ BTD(bt) BTD(bts) BTD(btr) BTD(btc)
 static const Gadget bt_tab[4][2][2] = { BTT(bt), BTT(bts), BTT(btr), BTT(btc) };
 DECL(bsf32) DECL(bsf64) DECL(bsr32) DECL(bsr64)
 DECL(tzcnt32) DECL(tzcnt64) DECL(lzcnt32) DECL(lzcnt64)
-DECL(cli) DECL(sti) DECL(mb_ld) DECL(mb_st) DECL(mb)
+DECL(cli) DECL(sti) DECL(cld) DECL(std) DECL(mb_ld) DECL(mb_st) DECL(mb)
+DECL(loop) DECL(loop32) DECL(jcxz) DECL(jcxz32)
 
 SIZES(DECL, hf_sub) SIZES(DECL, hf_add) SIZES(DECL, hf_logic)
 static const Gadget hf_sub_tab[4] = { SIZES(ENTRY, hf_sub) };
@@ -172,21 +182,27 @@ enum { A_EQ, A_NE, A_CS, A_CC, A_MI, A_PL, A_VS, A_VC, A_HI, A_LS, A_GE, A_LT,
 #define CONDS(X, p) X(p##eq) X(p##ne) X(p##cs) X(p##cc) X(p##mi) X(p##pl) \
     X(p##vs) X(p##vc) X(p##hi) X(p##ls) X(p##ge) X(p##lt) X(p##gt) X(p##le)
 CONDS(DECL, set_) CONDS(DECL, cmov32_) CONDS(DECL, cmov64_) CONDS(DECL, jcc_)
+CONDS(DECL, jcc32_)
 static const Gadget set_tab[A_N] = { CONDS(ENTRY, set_) };
 static const Gadget cmov_tab[2][A_N] = {
     { CONDS(ENTRY, cmov32_) }, { CONDS(ENTRY, cmov64_) },
 };
-static const Gadget jcc_tab[A_N] = { CONDS(ENTRY, jcc_) };
+/* [64-bit code] */
+static const Gadget jcc_tab[2][A_N] = {
+    { CONDS(ENTRY, jcc32_) }, { CONDS(ENTRY, jcc_) },
+};
 
-DECL(jmp) DECL(jmpi) DECL(lookup) DECL(call_c) DECL(call_c_exit)
+DECL(jmp) DECL(jmp32) DECL(jmpi) DECL(jmpi32) DECL(lookup)
+DECL(call_c) DECL(call_c_exit)
 DECL(call_c_ea) DECL(call_c_stop) DECL(exit) DECL(irq_check)
-#define MPD(n) DECL(n) DECL(n##_mp)
-#define MPT(n) { G(n), G(n##_mp) }
+/* The stack: [64-bit code][with barriers] */
+#define MPD(n) DECL(n) DECL(n##_mp) DECL(n##32) DECL(n##32_mp)
+#define MPT(n) { { G(n##32), G(n##32_mp) }, { G(n), G(n##_mp) } }
 MPD(push) MPD(pushi) MPD(pop) MPD(leave) MPD(call) MPD(calli) MPD(ret)
-static const Gadget push_tab[2] = MPT(push), pushi_tab[2] = MPT(pushi);
-static const Gadget pop_tab[2] = MPT(pop), leave_tab[2] = MPT(leave);
-static const Gadget call_tab[2] = MPT(call), calli_tab[2] = MPT(calli);
-static const Gadget ret_tab[2] = MPT(ret);
+static const Gadget push_tab[2][2] = MPT(push), pushi_tab[2][2] = MPT(pushi);
+static const Gadget pop_tab[2][2] = MPT(pop), leave_tab[2][2] = MPT(leave);
+static const Gadget call_tab[2][2] = MPT(call), calli_tab[2][2] = MPT(calli);
+static const Gadget ret_tab[2][2] = MPT(ret);
 
 /* What the assembly sources know of CPUX86State (aok-i386-asm.h). */
 QEMU_BUILD_BUG_ON(offsetof(CPUX86State, regs) != AOK_X86_ENV_REGS);
@@ -213,6 +229,7 @@ QEMU_BUILD_BUG_ON(CC_OP_SARB != AOK_CC_OP_SAR);
 QEMU_BUILD_BUG_ON(CC_OP_BMILGB != AOK_CC_OP_BMILG);
 QEMU_BUILD_BUG_ON(offsetof(CPUX86State, eflags) != AOK_X86_ENV_EFLAGS);
 QEMU_BUILD_BUG_ON(IF_MASK != AOK_X86_IF);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, df) != AOK_X86_ENV_DF);
 
 enum { NEXT, END, UNKNOWN };
 
@@ -229,9 +246,12 @@ typedef struct Ctx {
     unsigned off;           /* of this insn from the TB's first */
     unsigned len;           /* of this insn */
     unsigned op;            /* its opcode, for the statistics */
+    bool c64;               /* 64-bit code; else 32-bit, flat */
     bool mp;                /* other CPUs run: memory gadgets with barriers */
     bool no_goto_ptr;
-    bool iopl_ok;           /* cli and sti are allowed here */
+    bool iopl_ok;           /* cli and sti are allowed here, and I/O */
+    int cpl;
+    bool io_ok;             /* a port may be read and written with no check */
     bool abm, bmi1;         /* f3 before bsf and bsr makes tzcnt and lzcnt */
     bool sse;               /* SSE insns raise nothing here */
     bool fp;                /* doubles on the host's FP unit */
@@ -252,6 +272,7 @@ typedef struct Ctx {
 #define T0      offsetof(CPUX86State, aok_tmp[0])
 #define T1      offsetof(CPUX86State, aok_tmp[1])
 #define SEGBASE(s) offsetof(CPUX86State, segs[s].base)
+#define SEGSEL(s)  offsetof(CPUX86State, segs[s].selector)
 /* An XMM register, and where a memory operand of an SSE operation goes. */
 #define X(r)    offsetof(CPUX86State, xmm_regs[r])
 #define XT0     offsetof(CPUX86State, xmm_t0)
@@ -266,6 +287,7 @@ typedef struct Mem {
 
 typedef struct Insn {
     const uint8_t *p, *end;
+    bool c64;
     bool bad;               /* ran into the end of the page */
     bool o16, rep, repne, lock;
     bool a32;               /* 67: fine where there is no address */
@@ -348,7 +370,8 @@ static void modrm(Insn *d)
             d->m.base = (sib & 7) | d->rb;
         }
     } else if (d->rm == 5 && d->mod == 0) {
-        d->m.riprel = true;
+        /* rip-relative, which in 32-bit code is an address by itself */
+        d->m.riprel = d->c64;
         d->m.disp = fimm(d, 4);
     } else {
         d->m.base = d->rm | d->rb;
@@ -397,6 +420,9 @@ static void emit(Ctx *c, Gadget gadget, int n, ...)
 #define E5(g, a, b, d, e, f) emit(c, g, 5, (uint64_t)(a), (uint64_t)(b), \
                                (uint64_t)(d), (uint64_t)(e), (uint64_t)(f))
 
+/* The size of a slot of the stack, and of a code address. */
+#define SW(c)   ((c)->c64 ? 3 : 2)
+
 /* A memory gadget's last operand (gadgets.S, "Guest memory"). */
 static uint64_t word(Ctx *c, int sz)
 {
@@ -423,10 +449,11 @@ static void emit_ea(Ctx *c, const Insn *d)
             E1(G(ea_pc), delta);
         }
     } else if (m->seg >= 0) {
-        E5(G(ea_seg), ro(m->base), ro(m->index), m->scale, m->disp,
-           SEGBASE(m->seg));
+        E5(c->c64 ? G(ea_seg) : G(ea32_seg), ro(m->base), ro(m->index),
+           m->scale, m->disp, SEGBASE(m->seg));
     } else {
-        E4(G(ea), ro(m->base), ro(m->index), m->scale, m->disp);
+        E4(c->c64 ? G(ea) : G(ea32), ro(m->base), ro(m->index), m->scale,
+           m->disp);
     }
 }
 
@@ -439,7 +466,7 @@ static void mem2(Ctx *c, const Insn *d, const MemTab tab, uint64_t own, int sz,
     if (ea && !again) {
         emit_ea(c, d);
     }
-    aok_emit_gadget(&c->g, tab[ea][c->mp]);
+    aok_emit_gadget(&c->g, tab[ea ? F_EA : c->c64 ? F_BD : F_B3][c->mp]);
     aok_emit(&c->g, own);
     if (!ea) {
         aok_emit(&c->g, ro(m->base));
@@ -575,6 +602,8 @@ static unsigned x86_nohf;
 static bool x86_nolive;
 /* QEMU_AOK_X86_NOFP: every floating-point insn is softfloat's. */
 static bool x86_nofp;
+/* QEMU_AOK_X86_NO32, QEMU_AOK_X86_NO64: that kind of code is TCG's. */
+static bool x86_no32, x86_no64;
 
 /* Emit what makes x86 condition @cc one of the host's, and return that. */
 static int cond_arm(Ctx *c, unsigned cc)
@@ -1113,6 +1142,65 @@ void x86_aok_fold_fpsr(CPUState *cs, uint32_t fpsr)
     }
 }
 
+/*
+ * popf, the value popped to the first temporary: @pc is the next insn's,
+ * where the main loop continues, since the flags a TB is made for may have
+ * changed and an interrupt may now be due. @mask: what this CPL may write.
+ */
+void aok_x86_helper_popf(CPUX86State *env, uint64_t pc, uint64_t mask,
+                         uint64_t b);
+void aok_x86_helper_popf(CPUX86State *env, uint64_t pc, uint64_t mask,
+                         uint64_t b)
+{
+    helper_write_eflags(env, env->aok_tmp[0], mask);
+    env->eip = pc;
+}
+
+/* A segment register loaded: @sel is where the selector is, 16 bits. */
+void aok_x86_helper_load_seg(CPUX86State *env, uint64_t pc, uint64_t seg,
+                             uint64_t sel);
+void aok_x86_helper_load_seg(CPUX86State *env, uint64_t pc, uint64_t seg,
+                             uint64_t sel)
+{
+    x86_sync(env, pc);
+    helper_load_seg(env, seg, lduw_he_p((void *)env + sel));
+}
+
+/*
+ * in and out, where the CPL may use any port. @port: the number, or with
+ * bit 16 dx's; @arg: the size, and 4 for out.
+ */
+void aok_x86_helper_io(CPUX86State *env, uint64_t pc, uint64_t port,
+                       uint64_t arg);
+void aok_x86_helper_io(CPUX86State *env, uint64_t pc, uint64_t port,
+                       uint64_t arg)
+{
+    uint32_t p = port & 0x10000 ? (uint16_t)env->regs[R_EDX] : port;
+    uint32_t v = env->regs[R_EAX];
+
+    x86_sync(env, pc);
+    switch (arg) {
+    case 0:
+        x86_wr(env, R(R_EAX), 0, helper_inb(env, p));
+        break;
+    case 1:
+        x86_wr(env, R(R_EAX), 1, helper_inw(env, p));
+        break;
+    case 2:
+        x86_wr(env, R(R_EAX), 2, helper_inl(env, p));
+        break;
+    case 4:
+        helper_outb(env, p, v & 0xff);
+        break;
+    case 5:
+        helper_outw(env, p, v & 0xffff);
+        break;
+    default:
+        helper_outl(env, p, v);
+        break;
+    }
+}
+
 /* pause: @pc is the next insn's, where the CPU is when it has yielded. */
 void aok_x86_helper_pause(CPUX86State *env, uint64_t pc, uint64_t a,
                           uint64_t b);
@@ -1189,7 +1277,7 @@ static uint64_t x86_cmpxchg(CPUX86State *env, uint64_t addr, uint64_t cmp,
 
 /* The operations beyond the ALU_ ones, which are themselves here. */
 enum { AT_INC = 16, AT_DEC, AT_NOT, AT_NEG, AT_XCHG, AT_XADD, AT_CMPXCHG,
-       AT_BTS, AT_BTR, AT_BTC };
+       AT_CMPXCHG8B, AT_BTS, AT_BTR, AT_BTC };
 #define AT_IMM  0x1000
 #define AT_PAR  0x2000
 
@@ -1284,6 +1372,23 @@ void aok_x86_helper_atomic(CPUX86State *env, uint64_t pc, uint64_t a,
         env->cc_op = CC_OP_SUBB + sz;
         break;
     }
+    case AT_CMPXCHG8B: {
+        /* edx:eax against eight bytes, ecx:ebx to them: gen_CMPXCHG8B() */
+        uint64_t cmp = deposit64(env->regs[R_EAX], 32, 32, env->regs[R_EDX]);
+        uint64_t new = deposit64(env->regs[R_EBX], 32, 32, env->regs[R_ECX]);
+
+        f = cpu_cc_compute_all(env) & ~CC_Z;
+        old = x86_cmpxchg(env, addr, cmp, new, 3, par);
+        if (old == cmp) {
+            f |= CC_Z;
+        } else {
+            env->regs[R_EAX] = (uint32_t)old;
+            env->regs[R_EDX] = old >> 32;
+        }
+        env->cc_src = f;
+        env->cc_op = CC_OP_EFLAGS;
+        break;
+    }
     default: {
         /* bts, btr, btc with the bit's number: the carry is the old bit. */
         unsigned bit = v & ((8 << sz) - 1);
@@ -1303,6 +1408,7 @@ void aok_x86_helper_atomic(CPUX86State *env, uint64_t pc, uint64_t a,
 /* ---- The string instructions -------------------------------------------- */
 
 enum { S_MOVS, S_CMPS, S_STOS, S_LODS, S_SCAS };
+#define S_A32   0x1000      /* 32-bit code: the registers are 32 bits */
 
 /*
  * @a: which, the size from bit 4, and from bit 8 whether repeated (1, or 2
@@ -1320,16 +1426,17 @@ uint64_t aok_x86_helper_string(CPUX86State *env, uint64_t pc, uint64_t a,
 {
     unsigned op = a & 15, sz = (a >> 4) & 3, rep = (a >> 8) & 3;
     uint64_t size = 1 << sz, m = x86_mask(sz);
+    uint64_t am = a & S_A32 ? UINT32_MAX : UINT64_MAX;
     uint64_t seg = b ? ldq_he_p((void *)env + b) : 0;
     int mmu_idx = cpu_mmu_index(env_cpu(env), false);
     int64_t step = env->df < 0 ? -(int64_t)size : size;
-    uint64_t n = rep ? env->regs[R_ECX] : 1;
+    uint64_t n = rep ? env->regs[R_ECX] & am : 1;
     unsigned budget = 4096;
 
     x86_sync(env, pc);
     while (n) {
-        uint64_t di = env->regs[R_EDI], si = env->regs[R_ESI], sa = si + seg;
-        uint64_t done = 1, v, v2;
+        uint64_t di = env->regs[R_EDI] & am, si = env->regs[R_ESI] & am;
+        uint64_t sa = (si + seg) & am, done = 1, v, v2;
         bool stop = false;
 
         if (!budget--) {
@@ -1408,13 +1515,13 @@ uint64_t aok_x86_helper_string(CPUX86State *env, uint64_t pc, uint64_t a,
             break;
         }
         if (op != S_STOS && op != S_SCAS) {
-            env->regs[R_ESI] = si + step * done;
+            env->regs[R_ESI] = (si + step * done) & am;
         }
         if (op != S_LODS) {
-            env->regs[R_EDI] = di + step * done;
+            env->regs[R_EDI] = (di + step * done) & am;
         }
         if (rep) {
-            env->regs[R_ECX] -= done;
+            env->regs[R_ECX] = (n - done) & am;
         }
         n -= done;
         if (stop) {
@@ -1444,9 +1551,9 @@ uint64_t aok_x86_helper_string(CPUX86State *env, uint64_t pc, uint64_t a,
 enum { P_OTHER, P_PASS, P_WRITE };
 
 /* What the insn at @p does to the flags, and its length. */
-static int peek(const uint8_t *p, const uint8_t *end, unsigned *len)
+static int peek(bool c64, const uint8_t *p, const uint8_t *end, unsigned *len)
 {
-    Insn dd = { .p = p, .end = end, .seg = -1 }, *d = &dd;
+    Insn dd = { .p = p, .end = end, .seg = -1, .c64 = c64 }, *d = &dd;
     unsigned b = f8(d), count;
     int sz, bsz, r = P_OTHER;
 
@@ -1454,7 +1561,7 @@ static int peek(const uint8_t *p, const uint8_t *end, unsigned *len)
         d->o16 = true;
         b = f8(d);
     }
-    if (b >= 0x40 && b <= 0x4f) {
+    if (c64 && b >= 0x40 && b <= 0x4f) {
         d->rex = true;
         d->w = b & 8;
         d->rr = (b & 4) << 1;
@@ -1634,7 +1741,7 @@ static bool flags_dead(Ctx *c)
         return false;
     }
     for (unsigned n = 1; n <= LIVE_HORIZON; n++) {
-        switch (peek(p, c->end, &len)) {
+        switch (peek(c->c64, p, c->end, &len)) {
         case P_WRITE:
             /* All of them will be translated, and into this TB? */
             if (c->g.n_insns + 1 + n >= c->g.max_insns ||
@@ -1703,6 +1810,7 @@ static int atomic(Ctx *c, const Insn *d, int op, int sz, uint64_t a, bool imm,
     case AT_DEC:
         c->cc = CC_OP_DECB + sz;
         break;
+    case AT_CMPXCHG8B:
     case AT_BTS:
     case AT_BTR:
     case AT_BTC:
@@ -2008,21 +2116,21 @@ static int group5(Ctx *c, const Insn *d, int sz, bool ff)
         if (c->no_goto_ptr) {
             return UNKNOWN;
         }
-        e = src_e(c, d, 3);
-        E3(calli_tab[c->mp], e, c->off + c->len, word(c, 3));
+        e = src_e(c, d, SW(c));
+        E3(calli_tab[c->c64][c->mp], e, c->off + c->len, word(c, SW(c)));
         aok_emit_lookup_operands(&c->g);
         return END;
     case 4:
         if (c->no_goto_ptr) {
             return UNKNOWN;
         }
-        e = src_e(c, d, 3);
-        E1(G(jmpi), e);
+        e = src_e(c, d, SW(c));
+        E1(c->c64 ? G(jmpi) : G(jmpi32), e);
         aok_emit_lookup_operands(&c->g);
         return END;
     case 6:
-        e = src_e(c, d, 3);
-        E2(push_tab[c->mp], e, word(c, 3));
+        e = src_e(c, d, SW(c));
+        E2(push_tab[c->c64][c->mp], e, word(c, SW(c)));
         c->hf = HF_NONE;
         return NEXT;
     default:            /* the far ones */
@@ -2030,11 +2138,61 @@ static int group5(Ctx *c, const Insn *d, int sz, bool ff)
     }
 }
 
+/* push of a segment register: its selector, extended with zeros. */
+static int push_seg(Ctx *c, const Insn *d, int seg)
+{
+    if (d->o16) {
+        return UNKNOWN;
+    }
+    E2(G(mov32), T0, SEGSEL(seg));
+    E2(push_tab[c->c64][c->mp], T0, word(c, SW(c)));
+    c->hf = HF_NONE;
+    return NEXT;
+}
+
+/*
+ * A segment register loaded from the 16 bits at @sel, as gen_movl_seg()
+ * does it: in C, where the descriptor is read and what is due is raised.
+ * The flags a TB is made for say whether es, ds and ss are at zero, so after
+ * one of those the main loop looks again; ss has a shadow besides, and is
+ * TCG's.
+ */
+static int load_seg(Ctx *c, int seg, uint64_t sel)
+{
+    E4(G(call_c), aok_x86_helper_load_seg, c->off, seg, sel);
+    c->hf = HF_NONE;
+    if (seg < R_FS) {
+        E1(G(exit), c->off + c->len);
+        return END;
+    }
+    return NEXT;
+}
+
+/* pop to a segment register: the stack pointer moves when it is loaded. */
+static int pop_seg(Ctx *c, Insn *d, int seg)
+{
+    if (d->o16) {
+        return UNKNOWN;
+    }
+    d->mod = 0;
+    d->m = (Mem){ .base = R_ESP, .index = -1, .seg = -1 };
+    mem(c, d, load_tab[SW(c)], T0, SW(c));
+    E4(G(call_c), aok_x86_helper_load_seg, c->off, seg, T0);
+    E5(c->c64 ? G(lea64) : G(lea32), R(R_ESP), R(R_ESP), ZERO, 0,
+       c->c64 ? 8 : 4);
+    c->hf = HF_NONE;
+    if (seg < R_FS) {
+        E1(G(exit), c->off + c->len);
+        return END;
+    }
+    return NEXT;
+}
+
 static int jcc(Ctx *c, unsigned cc, int64_t rel)
 {
     int a = cond_arm(c, cc);
 
-    aok_emit_gadget(&c->g, jcc_tab[a]);
+    aok_emit_gadget(&c->g, jcc_tab[c->c64][a]);
     way(c, 0, (int64_t)c->off + c->len + rel);
     way(c, 1, c->off + c->len);
     return END;
@@ -2052,6 +2210,8 @@ static void __attribute__((constructor)) x86_aok_init(void)
     }
     x86_nolive = getenv("QEMU_AOK_X86_NOLIVE");
     x86_nofp = getenv("QEMU_AOK_X86_NOFP");
+    x86_no32 = getenv("QEMU_AOK_X86_NO32");
+    x86_no64 = getenv("QEMU_AOK_X86_NO64");
     s = getenv("QEMU_AOK_X86_SKIP");
 
     /* "88,89,1af": one-byte opcodes, and 0F ones as 1xx */
@@ -2071,7 +2231,6 @@ static void __attribute__((constructor)) x86_aok_init(void)
 
 #define FIN() do {                      \
         if (d->bad) {                   \
-            c->cut = !d->a32;           \
             return UNKNOWN;             \
         }                               \
         c->len = d->p - code;           \
@@ -2533,7 +2692,8 @@ static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
         return UNKNOWN;
     }
     if ((b >= 0x10 && b <= 0x17) || (b >= 0x28 && b <= 0x2f) ||
-        (b >= 0x50 && b <= 0x7f) || b == 0xc6 || (b >= 0xd0 && b != 0xff)) {
+        (b >= 0x50 && b <= 0x7f && b != 0x77) || b == 0xc6 ||
+        (b >= 0xd0 && b != 0xff)) {
         int pfx = d->repne ? 3 : d->rep ? 2 : d->o16 ? 1 : 0;
 
         /* The SSE opcodes, which the prefixes tell apart. */
@@ -2551,7 +2711,7 @@ static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
         return UNKNOWN;
     }
     if (d->lock && b != 0xb0 && b != 0xb1 && b != 0xc0 && b != 0xc1 &&
-        b != 0xab && b != 0xb3 && b != 0xbb && b != 0xba) {
+        b != 0xab && b != 0xb3 && b != 0xbb && b != 0xba && b != 0xc7) {
         return UNKNOWN;
     }
     switch (b) {
@@ -2601,6 +2761,23 @@ static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
                G(mb_st));
         }
         return NEXT;
+
+    case 0xa0:              /* push and pop of fs and gs */
+    case 0xa8:
+        FIN();
+        return push_seg(c, d, b == 0xa0 ? R_FS : R_GS);
+    case 0xa1:
+    case 0xa9:
+        FIN();
+        return pop_seg(c, d, b == 0xa1 ? R_FS : R_GS);
+
+    case 0xc7:              /* cmpxchg8b */
+        modrm(d);
+        FIN();
+        if ((d->reg & 7) != 1 || d->mod == 3 || d->w || d->o16) {
+            return UNKNOWN;
+        }
+        return atomic(c, d, AT_CMPXCHG8B, 3, 0, true, d->lock && c->mp);
 
     case 0xb0:              /* cmpxchg, xadd: one step on memory */
     case 0xb1:
@@ -2732,13 +2909,12 @@ static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
 }
 
 /*
- * One instruction at @code, which has bytes up to @end. Whatever is not
- * recognised here returns UNKNOWN with nothing emitted that matters: the
- * caller takes the stream back to where the insn began.
+ * One instruction at @code. Whatever is not recognised here returns UNKNOWN
+ * with nothing emitted that matters: the caller takes the stream back to
+ * where the insn began.
  */
-static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
+static int insn1(Ctx *c, Insn *d, const uint8_t *code)
 {
-    Insn dd = { .p = code, .end = end, .seg = -1 }, *d = &dd;
     unsigned b;
     int64_t imm;
     int sz, bsz, r;
@@ -2778,7 +2954,7 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
         }
         break;
     }
-    if (b >= 0x40 && b <= 0x4f) {
+    if (c->c64 && b >= 0x40 && b <= 0x4f) {
         /* REX, which counts only as the last prefix: any other is no opcode */
         d->rex = true;
         d->w = b & 8;
@@ -2789,7 +2965,6 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
     }
     c->op = b;
     if (d->bad || x86_skip[b]) {
-        c->cut = d->bad;
         return UNKNOWN;
     }
     /* A lock prefix is for an insn that writes memory: each checks that. */
@@ -2813,6 +2988,19 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
 
     switch (b) {
     case 0x00 ... 0x3f:     /* add or adc sbb and sub xor cmp */
+        if (!c->c64 && (b & 7) >= 6 && b < 0x20) {
+            /* In 32-bit code: push and pop of es, cs, ss, ds. */
+            static const uint8_t seg[4] = { R_ES, R_CS, R_SS, R_DS };
+
+            FIN();
+            if (!(b & 1)) {
+                return push_seg(c, d, seg[b >> 3]);
+            }
+            if (b == 0x07 || b == 0x1f) {
+                return pop_seg(c, d, seg[b >> 3]);
+            }
+            return UNKNOWN;
+        }
         switch (b & 7) {
         case 0:
         case 1:
@@ -2835,12 +3023,22 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
             return UNKNOWN;
         }
 
+    case 0x40 ... 0x4f:     /* in 32-bit code: inc and dec of a register */
+        FIN();
+        if (c->c64) {
+            return UNKNOWN;
+        }
+        d->mod = 3;
+        d->rm = b & 7;
+        d->reg = (b >> 3) & 1;
+        return group5(c, d, sz, false);
+
     case 0x50 ... 0x57:
         FIN();
         if (d->o16) {
             return UNKNOWN;
         }
-        E2(push_tab[c->mp], R((b & 7) | d->rb), word(c, 3));
+        E2(push_tab[c->c64][c->mp], R((b & 7) | d->rb), word(c, SW(c)));
         c->hf = HF_NONE;
         return NEXT;
 
@@ -2849,7 +3047,7 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
         if (d->o16) {
             return UNKNOWN;
         }
-        E2(pop_tab[c->mp], R((b & 7) | d->rb), word(c, 3));
+        E2(pop_tab[c->c64][c->mp], R((b & 7) | d->rb), word(c, SW(c)));
         c->hf = HF_NONE;
         return NEXT;
 
@@ -2873,7 +3071,7 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
         if (d->o16) {
             return UNKNOWN;
         }
-        E2(pushi_tab[c->mp], imm, word(c, 3));
+        E2(pushi_tab[c->c64][c->mp], imm, word(c, SW(c)));
         c->hf = HF_NONE;
         return NEXT;
 
@@ -2945,6 +3143,28 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
         }
         return NEXT;
 
+    case 0x8c:              /* mov E, a segment register: its selector */
+        modrm(d);
+        FIN();
+        if ((d->reg & 7) > R_GS) {
+            return UNKNOWN;
+        }
+        if (d->mod != 3) {
+            mem(c, d, store_tab[1], SEGSEL(d->reg & 7), 1);
+        } else {
+            E2(sz == 1 ? G(mov16) : G(mov32), R(d->rm), SEGSEL(d->reg & 7));
+        }
+        return NEXT;
+    case 0x8e:              /* mov a segment register, E */
+        modrm(d);
+        FIN();
+        r = d->reg & 7;
+        if (r > R_GS || r == R_CS || r == R_SS) {
+            return UNKNOWN;
+        }
+        e = src_e(c, d, 1);
+        return load_seg(c, r, e);
+
     case 0x8d:              /* lea: no segment's base, whatever the prefix */
         modrm(d);
         FIN();
@@ -3002,15 +3222,46 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
         E0(sz == 3 ? G(cqo) : G(cdq));
         return NEXT;
 
+    case 0x9d: {            /* popf, which ends the TB */
+        uint32_t mask = TF_MASK | AC_MASK | ID_MASK | NT_MASK;
+
+        FIN();
+        if (d->o16) {
+            return UNKNOWN;
+        }
+        if (c->cpl == 0) {
+            mask |= IF_MASK | IOPL_MASK;
+        } else if (c->iopl_ok) {
+            mask |= IF_MASK;
+        }
+        E2(pop_tab[c->c64][c->mp], T0, word(c, SW(c)));
+        E4(G(call_c_exit), aok_x86_helper_popf, c->off + c->len, mask, 0);
+        return END;
+    }
+
     case 0x9c:              /* pushf */
         FIN();
         if (d->o16) {
             return UNKNOWN;
         }
         E4(G(call_c), aok_x86_helper_pushf, c->off, 0, 0);
-        E2(push_tab[c->mp], T0, word(c, 3));
+        E2(push_tab[c->c64][c->mp], T0, word(c, SW(c)));
         set_flags(c, HF_NONE, CC_OP_EFLAGS);
         return NEXT;
+
+    case 0xa0 ... 0xa3: {   /* mov between al or eax and an address */
+        uint64_t addr = c->c64 ? fimm(d, 8) : (uint32_t)fimm(d, 4);
+
+        FIN();
+        if (d->a32) {
+            return UNKNOWN;
+        }
+        d->mod = 0;
+        d->m = (Mem){ .base = -1, .index = -1, .disp = addr, .seg = d->seg };
+        mem(c, d, b < 0xa2 ? load_tab[bsz] : store_tab[bsz],
+            rn(d, R_EAX, bsz), bsz);
+        return NEXT;
+    }
 
     case 0xa4 ... 0xa7:     /* movs, cmps, stos, lods, scas */
     case 0xaa ... 0xaf: {
@@ -3023,7 +3274,8 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
             return UNKNOWN;
         }
         E4(G(call_c_stop), aok_x86_helper_string, c->off,
-           k | bsz << 4 | rp << 8, d->seg >= 0 ? SEGBASE(d->seg) : 0);
+           k | bsz << 4 | rp << 8 | (c->c64 ? 0 : S_A32),
+           d->seg >= 0 ? SEGBASE(d->seg) : 0);
         c->hf = HF_NONE;
         if (k == S_CMPS || k == S_SCAS) {
             c->cc = rp ? -1 : CC_OP_SUBB + bsz;
@@ -3080,7 +3332,7 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
         if (d->o16 || c->no_goto_ptr) {
             return UNKNOWN;
         }
-        E2(ret_tab[c->mp], imm, word(c, 3));
+        E2(ret_tab[c->c64][c->mp], imm, word(c, SW(c)));
         aok_emit_lookup_operands(&c->g);
         return END;
 
@@ -3108,7 +3360,7 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
         if (d->o16) {
             return UNKNOWN;
         }
-        E1(leave_tab[c->mp], word(c, 3));
+        E1(leave_tab[c->c64][c->mp], word(c, SW(c)));
         c->hf = HF_NONE;
         return NEXT;
 
@@ -3118,7 +3370,7 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
         if (d->o16) {
             return UNKNOWN;
         }
-        E2(call_tab[c->mp], c->off + c->len, word(c, 3));
+        E2(call_tab[c->c64][c->mp], c->off + c->len, word(c, SW(c)));
         way(c, 0, (int64_t)c->off + c->len + imm);
         return END;
 
@@ -3129,9 +3381,43 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
         if (d->o16) {
             return UNKNOWN;
         }
-        E0(G(jmp));
+        E0(c->c64 ? G(jmp) : G(jmp32));
         way(c, 0, (int64_t)c->off + c->len + imm);
         return END;
+
+    case 0xe2:              /* loop, jcxz: the count is rcx, or ecx */
+    case 0xe3:
+        imm = fimm(d, 1);
+        FIN();
+        if (d->a32 || d->o16) {
+            return UNKNOWN;
+        }
+        E0(b == 0xe2 ? (c->c64 ? G(loop) : G(loop32))
+                     : (c->c64 ? G(jcxz) : G(jcxz32)));
+        way(c, 0, (int64_t)c->off + c->len + imm);
+        way(c, 1, c->off + c->len);
+        return END;
+
+    case 0xe4 ... 0xe7:     /* in and out: a port by number, and dx's */
+    case 0xec ... 0xef:
+        imm = b < 0xe8 ? (uint8_t)fimm(d, 1) : 0x10000;
+        FIN();
+        if (!c->io_ok) {
+            return UNKNOWN;
+        }
+        E4(G(call_c), aok_x86_helper_io, c->off, imm,
+           MIN(bsz, 2) | (b & 2 ? 4 : 0));
+        c->hf = HF_NONE;
+        return NEXT;
+
+    case 0xfc:              /* cld, std */
+        FIN();
+        E0(G(cld));
+        return NEXT;
+    case 0xfd:
+        FIN();
+        E0(G(std));
+        return NEXT;
 
     case 0xfa:              /* cli and sti, where IOPL allows them */
         FIN();
@@ -3169,6 +3455,17 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
     default:
         return UNKNOWN;
     }
+}
+
+/* The same, of the insn at @code, which has bytes up to @end. */
+static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
+{
+    Insn d = { .p = code, .end = end, .seg = -1, .c64 = c->c64 };
+    int r = insn1(c, &d, code);
+
+    /* Unknown because it ran into the end of the page? */
+    c->cut = r == UNKNOWN && d.bad && !d.a32;
+    return r;
 }
 
 /*
@@ -3299,25 +3596,42 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     int r;
 
     /*
-     * The state this translator knows: 64-bit code that is not being
-     * stepped, is not in the shadow of a mov to ss, in system management
-     * mode or a guest of SVM, and has no bound registers to reset at each
-     * branch. And an ordinary TB: one in RAM that may check for interrupts
-     * and need not stop after a set number of insns.
+     * The state this translator knows: code that is not being stepped, is
+     * not in the shadow of a mov to ss, in system management mode or a
+     * guest of SVM, and has no bound registers to reset at each branch. And
+     * an ordinary TB: one in RAM that may check for interrupts and need not
+     * stop after a set number of insns.
      */
     if (!host_pc || !(cflags & CF_PCREL) || TARGET_PAGE_BITS != 12 ||
         (cflags & (CF_COUNT_MASK | CF_SINGLE_STEP | CF_MEMI_ONLY |
                    CF_USE_ICOUNT | CF_NOIRQ | CF_BP_PAGE | CF_STEP_ATOMIC)) ||
-        !(flags & HF_CS64_MASK) ||
         (flags & (HF_INHIBIT_IRQ_MASK | HF_TF_MASK | HF_RF_MASK | HF_VM_MASK |
                   HF_SMM_MASK | HF_GUEST_MASK | HF_MPX_EN_MASK))) {
+        return 0;
+    }
+    /*
+     * And either 64-bit code, or 32-bit code in protected mode with a
+     * 32-bit stack and every segment but fs and gs at zero: then an address
+     * is an offset, eip is the pc, and what the two differ in is sizes.
+     */
+    c->c64 = flags & HF_CS64_MASK;
+    if (!c->c64 &&
+        ((flags & (HF_PE_MASK | HF_CS32_MASK | HF_SS32_MASK | HF_ADDSEG_MASK))
+         != (HF_PE_MASK | HF_CS32_MASK | HF_SS32_MASK) || tb->cs_base ||
+         x86_no32)) {
+        return 0;
+    }
+    if (c->c64 && x86_no64) {
         return 0;
     }
 
     c->page_off = pc & ~TARGET_PAGE_MASK;
     c->mp = cflags & CF_PARALLEL;
     c->no_goto_ptr = cflags & CF_NO_GOTO_PTR;
-    c->iopl_ok = (flags & HF_CPL_MASK) <= ((flags >> IOPL_SHIFT) & 3);
+    c->cpl = flags & HF_CPL_MASK;
+    c->iopl_ok = c->cpl <= ((flags >> IOPL_SHIFT) & 3);
+    /* (An I/O breakpoint is looked for after the access: TCG's.) */
+    c->io_ok = c->iopl_ok && !(flags & HF_IOBPT_MASK);
     c->abm = env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_ABM;
     c->bmi1 = env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_BMI1;
     c->sse = !(flags & (HF_EM_MASK | HF_TS_MASK)) && (flags & HF_OSFXSR_MASK);
@@ -3333,7 +3647,7 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
         return 0;
     }
     if (r != END) {
-        E0(G(jmp));
+        E0(c->c64 ? G(jmp) : G(jmp32));
         way(c, 0, c->off);
     }
     return aok_gen_finish(&c->g, c->off);

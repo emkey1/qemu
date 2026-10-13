@@ -16,6 +16,12 @@
  * flags is the translator's to track (translate-x86.c, "Conditions"): a jcc,
  * setcc or cmov right after a cmp tests the host's flags and reads nothing.
  *
+ * 32-bit code has the same gadgets, since a register's upper half is not
+ * read by the 32-bit forms and their results are stored zero-extended, as
+ * TCG's are. What it has of its own is addresses that wrap at 32 bits (the
+ * "b3" form of a memory operand, ea32), a stack of 4-byte slots, and an eip
+ * that wraps (the gadgets named 32).
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -237,6 +243,7 @@ miss_\id:
  * Where a memory gadget's address comes from. \n operands of the gadget's
  * own come first, which it has read by now.
  *   bd: [...][base offset][displacement][word]
+ *   b3: the same in 32-bit code, where the sum wraps
  *   ea: [...][word], the address what the ea gadget before it left
  */
 .macro mem_begin form, n
@@ -245,7 +252,14 @@ miss_\id:
     add _ip, _ip, #(8 * (\n + 4))
     ldr x9, [_cpu, x9]
     add _addr, x9, x10
-    .else
+    .endif
+    .ifc \form, b3
+    ldp x9, x10, [_ip, #(8 * \n)]
+    add _ip, _ip, #(8 * (\n + 4))
+    ldr w9, [_cpu, x9]
+    add w7, w9, w10
+    .endif
+    .ifc \form, ea
     add _ip, _ip, #(8 * (\n + 2))
     mov _addr, _ea
     .endif
@@ -280,6 +294,28 @@ miss_\id:
     add _ea, _pc, x9
     gret 1
 
+/* In 32-bit code: the same sums, which wrap. */
+.gadget ea32
+    ldp x9, x10, [_ip]
+    ldp x11, x12, [_ip, #16]
+    ldr w9, [_cpu, x9]
+    ldr w10, [_cpu, x10]
+    lsl w10, w10, w11
+    add w9, w9, w12
+    add w6, w9, w10
+    gret 4
+.gadget ea32_seg
+    ldp x9, x10, [_ip]
+    ldp x11, x12, [_ip, #16]
+    ldr x13, [_ip, #32]
+    ldr w9, [_cpu, x9]
+    ldr w10, [_cpu, x10]
+    ldr x13, [_cpu, x13]
+    lsl w10, w10, w11
+    add w9, w9, w12
+    add w9, w9, w13
+    add w6, w9, w10
+    gret 5
 /* rip-relative and a segment's base: [distance][offset of the base] */
 .gadget ea_pc_seg
     ldp x9, x10, [_ip]
@@ -490,6 +526,7 @@ g_storei storei64_\form\sfx, 64, \form
 .endm
 .macro loads_stores sfx
 loads_stores1 bd, \sfx
+loads_stores1 b3, \sfx
 loads_stores1 ea, \sfx
 .endm
 
@@ -680,6 +717,10 @@ alu_mem_forms1 \op, \store, \name, bd, 8, \sfx
 alu_mem_forms1 \op, \store, \name, bd, 16, \sfx
 alu_mem_forms1 \op, \store, \name, bd, 32, \sfx
 alu_mem_forms1 \op, \store, \name, bd, 64, \sfx
+alu_mem_forms1 \op, \store, \name, b3, 8, \sfx
+alu_mem_forms1 \op, \store, \name, b3, 16, \sfx
+alu_mem_forms1 \op, \store, \name, b3, 32, \sfx
+alu_mem_forms1 \op, \store, \name, b3, 64, \sfx
 alu_mem_forms1 \op, \store, \name, ea, 8, \sfx
 alu_mem_forms1 \op, \store, \name, ea, 16, \sfx
 alu_mem_forms1 \op, \store, \name, ea, 32, \sfx
@@ -752,6 +793,7 @@ g_vloadz vload64z_\form\sfx, 64, \form, ldr x17
 .macro all_mem sfx
 loads_stores \sfx
 vloads_stores1 bd, \sfx
+vloads_stores1 b3, \sfx
 vloads_stores1 ea, \sfx
 alu_mem_forms add, 1, add, \sfx
 alu_mem_forms or, 1, or, \sfx
@@ -1161,6 +1203,14 @@ g_bitscan lzcnt64, lzcnt, x, (AOK_CC_OP_BMILG + 3)
     orr x9, x9, #AOK_X86_IF
     str x9, [_cpu, #AOK_X86_ENV_EFLAGS]
     gret
+.gadget cld
+    mov w9, #1
+    str w9, [_cpu, #AOK_X86_ENV_DF]
+    gret
+.gadget std
+    mov w9, #-1
+    str w9, [_cpu, #AOK_X86_ENV_DF]
+    gret
 .gadget mb_ld
     dmb ishld
     gret
@@ -1423,10 +1473,14 @@ g_cmov \cc
  * A way out is aok_gadget_goto's two operands, [pc delta][slot], each its own
  * copy of aok_goto_tail so that each ends in an indirect branch of its own.
  */
-.macro x86_leave off
+.macro x86_leave off, r=x
     ldp x9, x10, [_ip, #\off]
     ldr w11, [_exitreq]
+    .ifc \r, w
+    add w19, w19, w9                /* eip, which wraps */
+    .else
     add _pc, _pc, x9
+    .endif
     ldr _ip, [x10]
     str _pc, [_pcp]
     tbnz w11, #31, 7f
@@ -1437,6 +1491,8 @@ g_cmov \cc
 /* [pc delta][slot] (jmp, and whatever ends a TB without a branch) */
 .gadget jmp
     x86_leave 0
+.gadget jmp32
+    x86_leave 0, w
 
 /* jcc on the host's flags: [taken: pc delta][slot][not: pc delta][slot] */
 .macro g_jcc cc
@@ -1444,146 +1500,200 @@ g_cmov \cc
     b.\cc 1f
     x86_leave 16
 1:  x86_leave 0
+.gadget jcc32_\cc
+    b.\cc 1f
+    x86_leave 16, w
+1:  x86_leave 0, w
 .endm
 .irp cc, CONDS
 g_jcc \cc
 .endr
 
+/*
+ * loop and jcxz: [taken: pc delta][slot][not: pc delta][slot]. loop counts
+ * rcx down, with no flags; in 32-bit code both mean ecx.
+ */
+.macro g_loop name, r, dec
+.gadget \name
+    ldr \r\()9, [_cpu, #(AOK_X86_ENV_REGS + 8)]
+    .if \dec
+    sub \r\()9, \r\()9, #1
+    str x9, [_cpu, #(AOK_X86_ENV_REGS + 8)]
+    cbnz \r\()9, 1f
+    .else
+    cbz \r\()9, 1f
+    .endif
+    x86_leave 16, \r
+1:  x86_leave 0, \r
+.endm
+g_loop loop, x, 1
+g_loop loop32, w, 1
+g_loop jcxz, x, 0
+g_loop jcxz32, w, 0
+
 /* ---- The stack -------------------------------------------------------------
+ *
+ * Each of these twice: for 64-bit code, and (named 32) for 32-bit code with
+ * a 32-bit stack, where a slot is four bytes and esp wraps. \r is the
+ * host's register size for that, x or w.
  *
  * push: [source's offset][word]; pushi: [value][word]. The store is made
  * before rsp moves, so a fault leaves it where it was.
  */
-.macro g_push name, imm, sfx
-.gadget \name\sfx
+.macro g_push name, imm, r, bytes, bits
+.gadget \name
     ldr x8, [_ip]
     add _ip, _ip, #24
     .if \imm
     mov x17, x8
     .else
-    ldr x17, [_cpu, x8]
+    ldr \r\()17, [_cpu, x8]
     .endif
-    ldr x5, [_cpu, #AOK_X86_ENV_RSP]
-    sub x5, x5, #8
+    ldr \r\()5, [_cpu, #AOK_X86_ENV_RSP]
+    sub \r\()5, \r\()5, #\bytes
     mov _addr, x5
-    x86_probe 64, \name\sfx, TLBE_WRITE
+    x86_probe \bits, \name, TLBE_WRITE
     st_barrier
-    str x17, [_addr]
+    str \r\()17, [_addr]
     str x5, [_cpu, #AOK_X86_ENV_RSP]
     gret_ahead
-    x86_slow_st 64, \name\sfx
+    x86_slow_st \bits, \name
 .endm
 /* pop: [destination's offset][word]. rsp first: "pop rsp" keeps what it got. */
-.macro g_pop sfx
-.gadget pop\sfx
+.macro g_pop name, r, bytes, bits
+.gadget \name
     ldr x8, [_ip]
     add _ip, _ip, #24
-    ldr x5, [_cpu, #AOK_X86_ENV_RSP]
+    ldr \r\()5, [_cpu, #AOK_X86_ENV_RSP]
     mov _addr, x5
-    x86_probe 64, pop\sfx, TLBE_READ
-    ldr x17, [_addr]
+    x86_probe \bits, \name, TLBE_READ
+    ldr \r\()17, [_addr]
     ld_barrier
-    add x5, x5, #8
+    add \r\()5, \r\()5, #\bytes
     str x5, [_cpu, #AOK_X86_ENV_RSP]
     str x17, [_cpu, x8]
     gret_ahead
-    x86_slow_ld 64, pop\sfx
+    x86_slow_ld \bits, \name
 .endm
 /* leave: [word]. rsp = rbp, then pop rbp. */
-.macro g_leave sfx
-.gadget leave\sfx
+.macro g_leave name, r, bytes, bits
+.gadget \name
     add _ip, _ip, #16
-    ldr x5, [_cpu, #AOK_X86_ENV_RBP]
+    ldr \r\()5, [_cpu, #AOK_X86_ENV_RBP]
     mov _addr, x5
-    x86_probe 64, leave\sfx, TLBE_READ
-    ldr x17, [_addr]
+    x86_probe \bits, \name, TLBE_READ
+    ldr \r\()17, [_addr]
     ld_barrier
-    add x5, x5, #8
+    add \r\()5, \r\()5, #\bytes
     str x5, [_cpu, #AOK_X86_ENV_RSP]
     str x17, [_cpu, #AOK_X86_ENV_RBP]
     gret_ahead
-    x86_slow_ld 64, leave\sfx
+    x86_slow_ld \bits, \name
 .endm
 
 /*
  * call: [return address's distance from the TB's first insn][word], then a
  * way out: the return address is pushed, then it is a jmp.
  */
-.macro g_call sfx
-.gadget call\sfx
+.macro g_call name, r, bytes, bits
+.gadget \name
     ldr x8, [_ip]
     add _ip, _ip, #24
-    add x17, _pc, x8
-    ldr x5, [_cpu, #AOK_X86_ENV_RSP]
-    sub x5, x5, #8
+    add \r\()17, \r\()19, \r\()8
+    ldr \r\()5, [_cpu, #AOK_X86_ENV_RSP]
+    sub \r\()5, \r\()5, #\bytes
     mov _addr, x5
-    x86_probe 64, call\sfx, TLBE_WRITE
+    x86_probe \bits, \name, TLBE_WRITE
     st_barrier
-    str x17, [_addr]
+    str \r\()17, [_addr]
     str x5, [_cpu, #AOK_X86_ENV_RSP]
     sub _ip, _ip, #8
-    x86_leave 0
-    x86_slow_st 64, call\sfx
+    x86_leave 0, \r
+    x86_slow_st \bits, \name
 .endm
 /*
  * An indirect call: [target's offset][return address's distance][word], then
  * a lookup's operands. The target is read first: it may be rsp-relative.
  */
-.macro g_calli sfx
-.gadget calli\sfx
+.macro g_calli name, r, bytes, bits
+.gadget \name
     ldp x8, x9, [_ip]
     add _ip, _ip, #32
-    ldr x4, [_cpu, x8]
-    add x17, _pc, x9
-    ldr x5, [_cpu, #AOK_X86_ENV_RSP]
-    sub x5, x5, #8
+    ldr \r\()4, [_cpu, x8]
+    add \r\()17, \r\()19, \r\()9
+    ldr \r\()5, [_cpu, #AOK_X86_ENV_RSP]
+    sub \r\()5, \r\()5, #\bytes
     mov _addr, x5
-    x86_probe 64, calli\sfx, TLBE_WRITE
+    x86_probe \bits, \name, TLBE_WRITE
     st_barrier
-    str x17, [_addr]
+    str \r\()17, [_addr]
     str x5, [_cpu, #AOK_X86_ENV_RSP]
     mov x10, x4
     str x10, [_pcp]
     sub _ip, _ip, #8
     b SYM(aok_x86_lookup_pc)
-    x86_slow_st 64, calli\sfx
+    x86_slow_st \bits, \name
 .endm
 /* ret: [bytes to drop besides][word], then a lookup's operands */
-.macro g_ret sfx
-.gadget ret\sfx
+.macro g_ret name, r, bytes, bits
+.gadget \name
     ldr x8, [_ip]
     add _ip, _ip, #24
-    ldr x5, [_cpu, #AOK_X86_ENV_RSP]
+    ldr \r\()5, [_cpu, #AOK_X86_ENV_RSP]
     mov _addr, x5
-    x86_probe 64, ret\sfx, TLBE_READ
-    ldr x10, [_addr]
+    x86_probe \bits, \name, TLBE_READ
+    ldr \r\()10, [_addr]
     ld_barrier
-    add x5, x5, #8
-    add x5, x5, x8
+    add \r\()5, \r\()5, #\bytes
+    add \r\()5, \r\()5, \r\()8
     str x5, [_cpu, #AOK_X86_ENV_RSP]
     str x10, [_pcp]
     sub _ip, _ip, #8
     b SYM(aok_x86_lookup_pc)
-    x86_slow_ld 64, ret\sfx
+    x86_slow_ld \bits, \name
 .endm
-.macro all_stack sfx
-g_push push, 0, \sfx
-g_push pushi, 1, \sfx
-g_pop \sfx
-g_leave \sfx
-g_call \sfx
-g_calli \sfx
-g_ret \sfx
-.endm
-all_stack
+.set X86_MP, 0
+g_push push, 0, x, 8, 64
+g_push pushi, 1, x, 8, 64
+g_pop pop, x, 8, 64
+g_leave leave, x, 8, 64
+g_call call, x, 8, 64
+g_calli calli, x, 8, 64
+g_ret ret, x, 8, 64
+g_push push32, 0, w, 4, 32
+g_push pushi32, 1, w, 4, 32
+g_pop pop32, w, 4, 32
+g_leave leave32, w, 4, 32
+g_call call32, w, 4, 32
+g_calli calli32, w, 4, 32
+g_ret ret32, w, 4, 32
 .set X86_MP, 1
-all_stack _mp
+g_push push_mp, 0, x, 8, 64
+g_push pushi_mp, 1, x, 8, 64
+g_pop pop_mp, x, 8, 64
+g_leave leave_mp, x, 8, 64
+g_call call_mp, x, 8, 64
+g_calli calli_mp, x, 8, 64
+g_ret ret_mp, x, 8, 64
+g_push push32_mp, 0, w, 4, 32
+g_push pushi32_mp, 1, w, 4, 32
+g_pop pop32_mp, w, 4, 32
+g_leave leave32_mp, w, 4, 32
+g_call call32_mp, w, 4, 32
+g_calli calli32_mp, w, 4, 32
+g_ret ret32_mp, w, 4, 32
 .set X86_MP, 0
 
 /* An indirect jmp: [target's offset], then a lookup's operands */
 .gadget jmpi
     ldr x8, [_ip]
     ldr x10, [_cpu, x8]
+    str x10, [_pcp]
+    add _ip, _ip, #8
+    b SYM(aok_x86_lookup_pc)
+.gadget jmpi32
+    ldr x8, [_ip]
+    ldr w10, [_cpu, x8]
     str x10, [_pcp]
     add _ip, _ip, #8
     b SYM(aok_x86_lookup_pc)

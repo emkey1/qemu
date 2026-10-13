@@ -12,7 +12,7 @@ gadgets come from iSH-AOK's user-mode engine.
 
 It is built with ``--enable-aok-gadgets``, needs an AArch64 host, and applies
 to system emulation. There are front ends for RISC-V (RV64), AArch64 and
-x86-64.
+x86, both 64-bit and 32-bit code.
 
 Why
 ===
@@ -281,6 +281,9 @@ Run-time switches
 ``QEMU_AOK_X86_SKIP=88,89,1af``
   For x86: leave these opcodes to TCG (hexadecimal; ``1xx`` is ``0f xx``).
 
+``QEMU_AOK_X86_NO32``, ``QEMU_AOK_X86_NO64``
+  For x86: leave 32-bit code, or 64-bit code, to TCG.
+
 ``QEMU_AOK_X86_NOLIVE``, ``QEMU_AOK_X86_NOFP``, ``QEMU_AOK_X86_NOHF=mask``
   For x86: compute every flag; leave floating point to softfloat; compute in
   C the conditions of the classes in the mask (bits as ``HF_`` in
@@ -385,13 +388,22 @@ A TB is translated only in AArch64 state with a little-endian guest and
 virtualization or pending branch-target check. On a CPU with BTI the
 indirect branches are TCG's, since they set ``PSTATE.BTYPE``.
 
-x86-64
-======
+x86
+===
 
-``target/i386/tcg/aok``. Long mode's 64-bit code, kernel and user; every
-other mode the architecture has is TCG's. Nothing here is iSH-AOK's: its x86
-gadgets are built around its own register cache and flags, and these are
-written against ``CPUX86State``.
+``target/i386/tcg/aok``, in the x86-64 target. Two kinds of code are
+translated: long mode's 64-bit code, and 32-bit protected-mode code with a
+32-bit stack and flat segments (every one but ``fs`` and ``gs`` at zero),
+which is what a 32-bit operating system and its programs run in, and a
+64-bit system's 32-bit programs. Real mode, 16-bit segments and virtual-8086
+mode are TCG's: they are a firmware's and a boot loader's. Nothing here is
+iSH-AOK's: its x86 gadgets are built around its own register cache and
+flags, and these are written against ``CPUX86State``.
+
+The i386 target has no front end: its ``CPUX86State`` has registers of four
+bytes, and the gadgets' operands are offsets into the other. A 32-bit guest
+is run by ``qemu-system-x86_64``, where it finds a CPU that could do more
+than it asks of it.
 
 On the same guest programs, in host CPU cycles on an Apple M5 (``-M q35``,
 one CPU, the stock Alpine 6.18 kernel and userland; the cycles between a
@@ -416,6 +428,14 @@ with the gadgets.
   stored as eight bytes. An absent base or index is ``aok_zero``, eight
   bytes that nothing writes; ``aok_tmp`` is where the memory operand of a
   rarer form is loaded first, so that the register form's gadget serves it.
+* **32-bit code** has the same gadgets: a 32-bit form does not read a
+  register's upper half and stores its result zero-extended, as TCG's code
+  does. What it has of its own is addresses that wrap at 32 bits (a third
+  form of every memory gadget, and ``ea32``), a stack of four-byte slots and
+  an ``eip`` that wraps (the gadgets named ``32``), and the opcodes that mean
+  something else there. A segment register is loaded in C by the helper TCG
+  calls; after ``es`` or ``ds`` the TB ends in the main loop, since a TB's
+  flags say whether those are at zero.
 * **A memory operand** is a base and a displacement in the gadget's own
   operands, or whatever an ``ea`` gadget before it computed (an index, a
   segment's base, ``rip``). Guest memory is reached through the softmmu
@@ -446,8 +466,9 @@ with the gadgets.
 * **In C**, one call each: ``mul`` and ``div`` with one operand, the double
   shifts, rotates whose flags are wanted, the string instructions (a ``rep``
   goes page by page on the host's memory where the pages are RAM, and comes
-  back to the main loop if it is long), ``cmpxchg``, ``xadd`` and ``xchg``
-  with memory, ``pushf``, ``rdtsc`` and ``pause``.
+  back to the main loop if it is long), ``cmpxchg``, ``cmpxchg8b``, ``xadd``
+  and ``xchg`` with memory, ``pushf`` and ``popf``, ``rdtsc``, ``pause``,
+  and ``in`` and ``out`` where the CPL may use any port.
 * **Other CPUs.** Under multi-threaded TCG a guest's stores must stay in
   order and its loads before what follows them. Every memory gadget exists
   a second time with the barriers that give that, used in a ``CF_PARALLEL``
@@ -472,16 +493,17 @@ with the gadgets.
   numbers and zeros under a plain MXCSR, raising at most inexact.
 * **A TB stays in its page.** One whose first instruction runs into the next
   page is that one instruction, as TCG makes it.
-* Left to TCG: everything outside 64-bit code, x87 and MMX, single-precision
-  arithmetic on the host (it is softfloat's, called from the stream),
-  ``syscall`` and the returns from it, the control, debug and segment
-  registers, I/O, ``cmpxchg16b``, the rotates through carry, 16-bit
-  ``adc``/``sbb`` and stack operations, a bit string addressed by a register,
-  and anything with VEX or EVEX.
+* Left to TCG: everything outside those two kinds of code, x87 and MMX,
+  single-precision arithmetic on the host (it is softfloat's, called from
+  the stream), the system calls, interrupts and the returns from them, the
+  control and debug registers, loads of ``ss`` and ``cs``, string I/O,
+  ``cmpxchg16b``, the rotates through carry, 16-bit ``adc``/``sbb`` and stack
+  operations, 16-bit addressing, a bit string addressed by a register, and
+  anything with VEX or EVEX.
 
-A TB is translated only in 64-bit code with no single-step or resume flag
-pending, outside the shadow of a ``mov`` to ``ss``, system management mode
-and SVM guests, with MPX off. Self-modifying code is found as TCG finds it,
+A TB is translated only with no single-step or resume flag pending, outside
+the shadow of a ``mov`` to ``ss``, system management mode and SVM guests,
+with MPX off. Self-modifying code is found as TCG finds it,
 with one difference: a store into the page of the TB that is running does
 not stop that TB at the store, so an instruction that rewrites one further
 on in its own TB still runs the old one once.
@@ -509,6 +531,15 @@ All three are identical with one guest CPU and with four, with pairs, without
 them, and with forwarding off. For x86-64 they are also identical with four
 CPUs under multi-threaded TCG, and so is the FP test printing every result
 (370,000 lines).
+
+For x86 there is a fourth, ``x86test``: the integer instructions on awkward
+and random operands with the flags hashed in, among them what Linux's
+compilers seldom emit and other systems' code is full of: ``rep`` with the
+direction flag set, ``repne scas`` and ``repe cmps``, ``loop``,
+``cmpxchg8b``, rotates whose flags are read, segment registers pushed and
+loaded, and every condition after every kind of instruction that sets flags,
+with a load or a store in between. The first three and this one are
+identical for a 64-bit guest and for a 32-bit one.
 
 An x86 guest needs a source of entropy to be measured at all: without one a
 Linux guest spends a quarter of a minute in its scheduler making some before

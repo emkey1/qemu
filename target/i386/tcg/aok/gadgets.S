@@ -169,15 +169,18 @@ back_\id:
     .endif
 .endm
 
-/* fn(env, address, pc, the word's lower half, \arg) */
-.macro x86_call_slow fn, arg
+/*
+ * fn(env, address, pc, the word's lower half, \arg). \woff: where the word is
+ * from _ip (a gadget that has not moved _ip yet has it at 0).
+ */
+.macro x86_call_slow fn, arg, woff=-16
     stp x1, x2, [sp, #-64]!
     stp x3, x4, [sp, #16]
     stp x5, x6, [sp, #32]
     stp x8, x17, [sp, #48]
     mov x4, \arg
     aok_fp_end                  /* (x14-x17 are its scratch) */
-    ldr x3, [_ip, #-16]
+    ldr x3, [_ip, #\woff]
     mov x0, _cpu
     mov x1, _addr
     add x2, _pc, x3, lsr #32
@@ -196,18 +199,18 @@ back_\id:
  * and a read-modify-write, which cputlb has checked may be written, works on
  * the copy and x86_rmw_done writes it back.
  */
-.macro x86_slow_ld size, id
+.macro x86_slow_ld size, id, woff=-16
 miss_\id:
     x86_unaligned \size, \id
     add x9, x29, #AOK_FRAME_SCRATCH
-    x86_call_slow aok_x86_helper_ld, x9
+    x86_call_slow aok_x86_helper_ld, x9, \woff
     add _addr, x29, #AOK_FRAME_SCRATCH
     b back_\id
 .endm
-.macro x86_slow_st size, id
+.macro x86_slow_st size, id, woff=-16
 miss_\id:
     x86_unaligned \size, \id
-    x86_call_slow aok_x86_helper_st, x17
+    x86_call_slow aok_x86_helper_st, x17, \woff
     add _addr, x29, #AOK_FRAME_SCRATCH
     b back_\id
 .endm
@@ -2094,3 +2097,5 @@ x86_fp_cvtt fp_cvttsd2sq, x, 0x43e, call_hret64
     blr x9
     mov x0, #0
     b SYM(aok_exit)
+
+#include "x87-host.S"

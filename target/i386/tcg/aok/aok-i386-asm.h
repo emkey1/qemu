@@ -29,6 +29,22 @@
 /* aok_zero, then aok_tmp[0] and aok_tmp[1] (cpu.h). */
 #define AOK_X86_ENV_AOK_ZERO 0x138
 
+#define AOK_X86_ENV_AOK_TMP  (AOK_X86_ENV_AOK_ZERO + 8)
+
+/*
+ * The x87: TOP (fpstt, four bytes), the status word without it (fpus), the
+ * control word (fpuc), a tag byte a register (fptags, 1 for empty) and the
+ * eight registers, 16 bytes each.
+ */
+#define AOK_X86_ENV_FPSTT   0x2f8
+#define AOK_X86_ENV_FPUS    0x2fc
+#define AOK_X86_ENV_FPUC    0x2fe
+#define AOK_X86_ENV_FPTAGS  0x300
+#define AOK_X86_ENV_FPREGS  0x310
+
+/* The lazy flags are the flags themselves, in cc_src. */
+#define AOK_CC_OP_EFLAGS    0
+
 /* CC_OP_xxxB: the byte form of each lazy operation; + log2 of the bytes. */
 #define AOK_CC_OP_MUL       4
 #define AOK_CC_OP_ADD       8

@@ -4,7 +4,8 @@
 # The AOK gadgets of a front end that iSH-AOK also has are not written here:
 # they are the sources of the aok-gadgets repository (emkey1/aok-gadgets),
 # which both engines build, kept here as copies (target/riscv/tcg/aok/shared,
-# target/arm/tcg/aok/shared). This brings the copies up to date with a
+# target/arm/tcg/aok/shared, target/i386/tcg/aok/shared). This brings the
+# copies up to date with a
 # checkout of that repository (default ../aok-gadgets), or with --check says
 # whether they are.
 #
@@ -26,7 +27,14 @@ src64=${src%/riscv64}/arm64
 dst64=$here/target/arm/tcg/aok/shared
 a64="alu_spec.S frag.h"
 
+# The x86 front end's x87 (target/i386/tcg/aok/shared): all of x87/.
+srcx87=${src%/riscv64}/x87
+dstx87=$here/target/i386/tcg/aok/shared
+
 if [ -n "$check" ]; then
+    for f in "$srcx87"/*.S; do
+        cmp -s "$f" "$dstx87/$(basename "$f")" || { echo "i386 shared/$(basename "$f") differs from aok-gadgets': run $0" >&2; exit 1; }
+    done
     for f in alu.S frag.h pairs.h; do
         cmp -s "$src/$f" "$dst/$f" || { echo "shared/$f differs from aok-gadgets': run $0" >&2; exit 1; }
     done
@@ -36,6 +44,15 @@ if [ -n "$check" ]; then
     echo "shared gadget sources match $(git -C "$src" rev-parse --short HEAD)"
     exit 0
 fi
+
+mkdir -p "$dstx87"
+cp "$srcx87"/*.S "$dstx87/"
+{
+    echo "aok-gadgets x87 ($(cd "$srcx87" && echo *.S))"
+    echo "commit $(git -C "$srcx87" rev-parse HEAD)"
+    git -C "$srcx87" diff --quiet HEAD -- . || echo "with uncommitted changes"
+    echo "licence: as target/riscv/tcg/aok/shared/SOURCE says of riscv64's"
+} > "$dstx87/SOURCE"
 
 mkdir -p "$dst64"
 for f in $a64; do cp "$src64/$f" "$dst64/"; done

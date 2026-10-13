@@ -2003,6 +2003,16 @@ typedef struct CPUArchState {
     uint32_t hflags; /* TB flags, see HF_xxx constants. These flags
                         are known at translation time. */
     uint32_t hflags2; /* various other flags, see HF2_xxx constants. */
+#ifdef CONFIG_AOK_GADGETS
+    /*
+     * For AOK gadgets, whose operands are offsets of registers in this
+     * structure: eight bytes that are always zero (an absent base or index),
+     * and two temporaries a memory operand can be loaded to, so that a
+     * register form of an instruction also serves its memory form.
+     */
+    uint64_t aok_zero;
+    uint64_t aok_tmp[2];
+#endif
 
     /* segments */
     SegmentCache segs[6]; /* selector values */

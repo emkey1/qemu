@@ -428,38 +428,7 @@ tbz_one tbnz, ne
     /* (entered here with env->pc in x10 and _ip at the two operands) */
     .globl SYM(aok_a64_lookup_pc)
 SYM(aok_a64_lookup_pc):
-    ldr x11, [_bps]
-    eor x12, x10, x10, lsr #5
-    cbnz x11, 3f
-    lsr x13, x12, #5
-    and x12, x12, #0x7f
-    and x13, x13, #0x3f80
-    orr x12, x12, x13               /* the hash */
-    add x13, _jc, x12, lsl #4
-    ldp x14, x15, [x13, #16]        /* tb, pc */
-    cmp x15, x10
-    b.ne 2f
-1:  cbz x14, 3f
-    ldp x15, x16, [x14, #8]         /* cs_base, flags | cflags << 32 */
-    ldp x11, x12, [_ip]
-    ldrb w17, [x14, #28]            /* aok */
-    cmp x16, x11
-    ccmp x15, x12, #0, eq
-    b.ne 3f
-    cbz w17, 3f
-    /* A jump between streams, as aok_goto_tail makes it. */
-    ldr w11, [_exitreq]
-    ldr _ip, [x14, #32]             /* tc.ptr */
-    mov _pc, x10
-    tbnz w11, #31, 4f
-    gret AOK_ENTER_WORDS
-2:  eor x12, x12, #1                /* the other way */
-    add x13, _jc, x12, lsl #4
-    ldp x14, x15, [x13, #16]
-    cmp x15, x10
-    b.eq 1b
-3:  b SYM(aok_lookup_slow)
-4:  b SYM(aok_exit_requested)
+    aok_lookup_jc
 
 /* dmb, dsb: a full barrier, as TCG's tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC) */
 .gadget barrier

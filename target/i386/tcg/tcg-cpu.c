@@ -27,6 +27,11 @@
 #include "accel/tcg/cpu-ops.h"
 #include "tcg-cpu.h"
 #include "tb-cpu-state.h"
+#if defined(CONFIG_AOK_GADGETS) && defined(TARGET_X86_64) && \
+    !defined(CONFIG_USER_ONLY)
+#include "aok/aok-i386.h"
+#define X86_AOK
+#endif
 
 /* Frob eflags into and out of the CPU temporary format.  */
 
@@ -153,6 +158,11 @@ const TCGCPUOps x86_tcg_ops = {
     .guest_default_memory_order = TCG_MO_ALL & ~TCG_MO_ST_LD,
     .initialize = tcg_x86_init,
     .translate_code = x86_translate_code,
+#ifdef X86_AOK
+    .aok_translate_code = x86_aok_translate_code,
+    .aok_pc_offset = offsetof(CPUX86State, eip),
+    .aok_fold_fpsr = x86_aok_fold_fpsr,
+#endif
     .get_tb_cpu_state = x86_get_tb_cpu_state,
     .synchronize_from_tb = x86_cpu_synchronize_from_tb,
     .restore_state_to_opc = x86_restore_state_to_opc,

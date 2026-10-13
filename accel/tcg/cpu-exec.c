@@ -484,6 +484,16 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
         }
         ret = aok_tb_exec(env, tb_ptr, &aok);
         aok_fold_fpsr(cpu);
+        if (unlikely(aok_stats_enabled)) {
+            /* With a TB to link from, or with none (and what asked). */
+            if (ret & ~(uintptr_t)TB_EXIT_MASK) {
+                aok_stats.ret_slot++;
+            } else if ((int32_t)qatomic_read(&cpu->neg.icount_decr.u32) < 0) {
+                aok_stats.ret_request++;
+            } else {
+                aok_stats.ret_none++;
+            }
+        }
     } else
 #endif
     {
@@ -682,6 +692,26 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
 
 #ifdef CONFIG_AOK_GADGETS
 /*
+ * A stream's direct jump to a TB that may not be linked to (one of two
+ * pages, whose second may be mapped elsewhere tomorrow): rather than come
+ * back here each time, the jump goes to the stream's own stub that looks
+ * the TB up, which aok_gen_finish() put after the stubs of its slots.
+ */
+static void aok_slot_to_lookup(TranslationBlock *tb, int n)
+{
+    uint16_t r0 = tb->jmp_reset_offset[0], r1 = tb->jmp_reset_offset[1];
+    uint16_t last = r0 == TB_JMP_OFFSET_INVALID ? r1 :
+                    r1 == TB_JMP_OFFSET_INVALID ? r0 : MAX(r0, r1);
+
+    if (n > 1 || tb->jmp_reset_offset[n] == TB_JMP_OFFSET_INVALID ||
+        qatomic_read(&tb->jmp_dest[n])) {
+        return;
+    }
+    tb_set_jmp_target(tb, n, (uintptr_t)tb->tc.ptr + last +
+                             2 * sizeof(uint64_t));
+}
+
+/*
  * A front end's lookup gadget does tb_lookup()'s first step itself: it
  * hashes the pc as tb_jmp_cache_hash_func does, reads both ways of
  * cpu->tb_jmp_cache, and compares the TB's cs_base, flags and cflags with
@@ -718,6 +748,29 @@ const void *aok_lookup_tb_ptr(CPUArchState *env)
         cpu_loop_exit(cpu);
     }
 
+    if (unlikely(aok_stats_enabled)) {
+        /* Why did the lookup gadget not find it: was it there to find? */
+        uint32_t h = tb_jmp_cache_hash_func(s.pc);
+
+        for (int way = 0; way < 2; way++) {
+            TranslationBlock *t = cpu->tb_jmp_cache->array[h ^ way].tb;
+
+            if (t && cpu->tb_jmp_cache->array[h ^ way].pc == s.pc) {
+                aok_stats.lookup_cached++;
+                if (t->flags != s.flags || t->cs_base != s.cs_base) {
+                    aok_stats.lookup_cached_flags++;
+                    for (int b = 0; b < 32; b++) {
+                        if ((t->flags ^ s.flags) >> b & 1) {
+                            aok_stats.lookup_flag_bit[b]++;
+                        }
+                    }
+                } else if (tb_cflags(t) != s.cflags) {
+                    aok_stats.lookup_cached_cflags++;
+                }
+                break;
+            }
+        }
+    }
     tb = tb_lookup(cpu, s);
     if (unlikely(aok_stats_enabled)) {
         *(tb == NULL ? &aok_stats.lookup_none :
@@ -1103,6 +1156,12 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * for the second page can change.
              */
             if (tb_page_addr1(tb) != -1) {
+#ifdef CONFIG_AOK_GADGETS
+                if (last_tb && last_tb->aok && tb->aok) {
+                    aok_slot_to_lookup(last_tb, tb_exit);
+                    aok_stats.two_page++;
+                }
+#endif
                 last_tb = NULL;
             }
 #endif

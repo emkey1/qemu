@@ -208,7 +208,6 @@ aluxs \op\()_sxth32, \op, w, sxth x13, w13
  * NAME_nf_cc is for when the gadget before it left the host's flags the guest's
  * (a flag-setting gadget; store_flags changes none).
  */
-#define CONDS eq, ne, cs, cc, mi, pl, vs, vc, hi, ls, ge, lt, gt, le
 
 /* [rd offset][rn offset][rm offset]: csel, csinc, csinv, csneg */
 .macro csel_one name, op, r, cc, reload
@@ -281,119 +280,11 @@ ccmp_one ccmni32_nf_\cc, adds, w, \cc, 1, 0
 
 /* ---- Leaving a TB ------------------------------------------------------------
  *
- * A way out is aok_gadget_goto's two operands, [pc delta][slot]. Each is its
- * own copy of aok_goto_tail rather than a jump to it, so that each ends in an
- * indirect branch of its own (the RISC-V front end's gadgets-shared.S has
- * why).
+ * The ways out (a64_leave) and the top byte of an indirect branch's target
+ * (a64_tbi) are aok-arm-asm.h's; b, bl, b.cond, cbz, cbnz, tbz, tbnz and the
+ * indirect branches br_cached, blr_cached and ret_cached are gadgets-shared.S's,
+ * built from iSH-AOK's bodies so that its pairs can end in them.
  */
-.macro a64_leave off
-    ldp x9, x10, [_ip, #\off]
-    ldr w11, [_exitreq]
-    add _pc, _pc, x9
-    ldr _ip, [x10]
-    str _pc, [_pcp]
-    tbnz w11, #31, 7f
-    gret AOK_ENTER_WORDS
-7:  b SYM(aok_exit_requested)
-.endm
-
-/* [pc delta][slot] (b, and whatever ends a TB without a branch) */
-.gadget b
-    a64_leave 0
-
-/* [link delta][pc delta][slot]: x30 = entry pc + link delta, then b */
-.gadget bl
-    ldr x12, [_ip]
-    add x12, _pc, x12
-    str x12, [_cpu, #AOK_A64_ENV_X30]
-    a64_leave 8
-
-/* [taken: pc delta][slot][not taken: pc delta][slot] */
-.macro bcond_one name, cc, reload
-.gadget \name
-    .if \reload
-    load_flags
-    .endif
-    b.\cc 1f
-    a64_leave 16
-1:  a64_leave 0
-.endm
-.irp cc, CONDS
-bcond_one b_\cc, \cc, 1
-bcond_one b_nf_\cc, \cc, 0
-.endr
-
-/* [rt offset][taken way][other way] */
-.macro cbz_one name, insn, r
-.gadget \name
-    ldr x9, [_ip]
-    ldr x12, [_cpu, x9]
-    \insn \r\()12, 1f
-    a64_leave 24
-1:  a64_leave 8
-.endm
-cbz_one cbz64, cbz, x
-cbz_one cbz32, cbz, w
-cbz_one cbnz64, cbnz, x
-cbz_one cbnz32, cbnz, w
-
-/* [rt offset][bit mask][taken way][other way] */
-.macro tbz_one name, cc
-.gadget \name
-    ldp x9, x10, [_ip]
-    ldr x12, [_cpu, x9]
-    tst x12, x10
-    b.\cc 1f
-    a64_leave 32
-1:  a64_leave 16
-.endm
-tbz_one tbz, eq
-tbz_one tbnz, ne
-
-/* ---- Indirect branches -----------------------------------------------------
- *
- * br, blr, ret: [rn offset][tbi][link delta][flags | cflags << 32][cs_base].
- * The target is read before the link is written, since blr's register may be
- * x30, and has its top byte seen to as TCG's gen_top_byte_ignore does it:
- * tbi 0, as it is; 1, 2, 3, sign-extended from bit 55 where the address is in
- * the half that has TBI (the low one, the high one, both); 4, for a regime
- * with one range, its top byte cleared. Then the lookup below.
- */
-.macro a64_tbi
-    cbz x11, 4f
-    sbfx x12, x10, #0, #56
-    cmp x11, #2
-    b.hi 3f
-    b.eq 2f
-    and x10, x12, x10           /* 1: only where bit 55 is clear */
-    b 4f
-2:  orr x10, x12, x10           /* 2: only where bit 55 is set */
-    b 4f
-3:  cmp x11, #4
-    csel x10, x12, x10, ne      /* 3: both halves */
-    b.ne 4f
-    and x10, x10, #0x00ffffffffffffff
-4:
-.endm
-
-.gadget br
-    ldp x9, x11, [_ip]
-    ldr x10, [_cpu, x9]
-    a64_tbi
-    str x10, [_pcp]
-    add _ip, _ip, #24
-    b SYM(aok_a64_lookup_pc)
-
-.gadget blr
-    ldp x9, x11, [_ip]
-    ldr x13, [_ip, #16]
-    ldr x10, [_cpu, x9]
-    add x13, _pc, x13
-    a64_tbi
-    str x13, [_cpu, #AOK_A64_ENV_X30]
-    str x10, [_pcp]
-    add _ip, _ip, #24
-    b SYM(aok_a64_lookup_pc)
 
 /* The same two for a TB that may not look its successor up: the stream exits. */
 .gadget br_exit

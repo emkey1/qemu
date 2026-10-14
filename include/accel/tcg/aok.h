@@ -130,16 +130,22 @@ typedef struct AokGen {
  * Fused pairs. Two gadgets that follow one another can be one gadget that
  * does both and dispatches once: iSH-AOK's scheme (its jit/gen.c,
  * jit_pair_fuse, and jit/guest-arm64/frag.h for the reasoning), and for the
- * gadgets a front end shares with iSH-AOK also its list of pairs. The fused
+ * gadgets a front end took from iSH-AOK also its list of pairs. The fused
  * gadget takes the first gadget's place in the stream and the second's word
  * goes: [fused][first's operands][second's operands].
  *
  * Where the second takes as an operand the register the first has just
  * written, a variant of the pair hands the value over in a host register
  * (fused_fw[k], for the second's k-th forwardable operand): op[k] says which
- * of the second's operand words names that register.
+ * of the second's operand words names that register: as its offset in the
+ * CPU state (SLOT), or as its number, in the word's low five bits (REG, and
+ * REG_NOT31 where 31 is not a register) or the five from bit 8 (REG8), the
+ * set's reg_base being register 0's offset.
  */
-enum { AOK_PAIR_OP_NONE, AOK_PAIR_OP_SLOT };
+enum {
+    AOK_PAIR_OP_NONE, AOK_PAIR_OP_SLOT, AOK_PAIR_OP_REG, AOK_PAIR_OP_REG8,
+    AOK_PAIR_OP_REG_NOT31
+};
 typedef struct AokPair {
     void (*a)(void), (*b)(void), (*fused)(void);
     void (*fused_fw[2])(void);
@@ -151,6 +157,7 @@ typedef struct AokPairSet {
     const AokPair *pairs;
     unsigned n;
     bool forward;
+    uintptr_t reg_base;
     uint16_t hash[AOK_PAIR_HASH];   /* index + 1; 0 is empty */
 } AokPairSet;
 

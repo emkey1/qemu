@@ -17,6 +17,7 @@ i386_ss.add(when: 'CONFIG_TCG', if_true: files(
 if get_option('aok_gadgets')
   i386_system_ss.add(when: 'TARGET_X86_64', if_true: files(
     'aok/gadgets.S',
+    'aok/gadgets-vec.S',
     'aok/translate-x86.c',
   ))
 endif

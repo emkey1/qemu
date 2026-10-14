@@ -1779,6 +1779,9 @@ typedef struct {
  */
 #define UNASSIGNED_APIC_ID 0xFFFFFFFF
 
+/* The bits of MXCSR, DAZ among them (FXSAVE's MXCSR_MASK); the rest are reserved. */
+#define MXCSR_MASK 0x0000ffff
+
 typedef struct X86LegacyXSaveArea {
     uint16_t fcw;
     uint16_t fsw;

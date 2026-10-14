@@ -13,7 +13,8 @@
 # q0 (the integer bodies) or q2 (the float ones).
 #
 # Word: [s1 (0-3) | s2 (4-7) | dst (8-11) | s2 staged (12) | L (13) |
-#        imm8 (16-23)], gret 1.
+#        result to VEX_STAGE (14) | a legacy SSE encoding: the destination's
+#        bits 511:128 kept, L 0 (15) | imm8 (16-23)], gret 1.
 # ===========================================================================
 
 /* (VEX_STAGE, VEX_MASK and the loads and stores are the host's: gadgets-vec.S) */
@@ -56,10 +57,12 @@
 
 # The end of every VEX register write: zmm_hi[dst] zeroed. Clobbers x9, x15.
 .macro vex_zero_zmm
+    tbnz x8, 15, .Lvzz\@                    /* (legacy SSE: kept) */
     ubfx x15, x8, 8, 4
     vex_addr x9, x15, CPU_zmm_hi, 5
     stp  xzr, xzr, [x9]
     stp  xzr, xzr, [x9, 16]
+.Lvzz\@:
 .endm
 
 # dst = s1 OP s2, half by half. vex_l3i: the high half's imm8 is the word's
@@ -95,6 +98,7 @@
     str  \res, [x13]
     b    .Ll3_end\@
 .Ll3_128\@:
+    tbnz x8, 15, .Ll3_end\@                 /* (legacy SSE: kept) */
     stp  xzr, xzr, [x13]
 .Ll3_end\@:
     vex_zero_zmm
@@ -120,6 +124,7 @@
     str  q0, [x13]
     b    .Lsx_end\@
 .Lsx_128\@:
+    tbnz x8, 15, .Lsx_end\@                 /* (legacy SSE: kept) */
     stp  xzr, xzr, [x13]
 .Lsx_end\@:
     vex_zero_zmm
@@ -144,6 +149,7 @@
     str  q0, [x13]
     b    .Lsi_end\@
 .Lsi_128\@:
+    tbnz x8, 15, .Lsi_end\@                 /* (legacy SSE: kept) */
     stp  xzr, xzr, [x13]
 .Lsi_end\@:
     vex_zero_zmm
@@ -183,6 +189,7 @@
     str  q0, [x13]
     b    .Ldq_end\@
 .Ldq_128\@:
+    tbnz x8, 15, .Ldq_end\@                 /* (legacy SSE: kept) */
     stp  xzr, xzr, [x13]
 .Ldq_end\@:
     vex_zero_zmm
@@ -444,6 +451,7 @@ vex_l3 xf_cmpsd, q2, xf_body_cmp32, d, 2d, 0
     str  q0, [x13]
     b    .Ltb_end\@
 .Ltb_128\@:
+    tbnz x8, 15, .Ltb_end\@                 /* (legacy SSE: kept) */
     stp  xzr, xzr, [x13]
 .Ltb_end\@:
     vex_zero_zmm
@@ -798,6 +806,7 @@ vex_l3 shv_\k, q0, vshv_body, \k
     str  \res, [x13]
     b    .Lwd_end\@
 .Lwd_128\@:
+    tbnz x8, 15, .Lwd_end\@                 /* (legacy SSE: kept) */
     stp  xzr, xzr, [x13]
 .Lwd_end\@:
     vex_zero_zmm
@@ -823,7 +832,9 @@ vex_l3 shv_\k, q0, vshv_body, \k
     vex_ptrs 0
     str  q24, [x13]
     vex_ptrs 1
+    tbnz x8, 15, .Lnk\@                     /* (legacy SSE: kept) */
     stp  xzr, xzr, [x13]
+.Lnk\@:
     vex_zero_zmm
     gret 1
 .endm
@@ -931,7 +942,7 @@ vex_widen xf_cvtph2ps, 8, q2, xfb_cvtph2ps
     vex_ptrs 0
     str  q24, [x13]
     vex_ptrs 1
-    stp  xzr, xzr, [x13]
+    stp  xzr, xzr, [x13]                 /* (VEX only: no legacy form) */
     vex_zero_zmm
     gret 1
 
@@ -1330,6 +1341,7 @@ vex_l3 insertps, q0, vinsps_body
     str  q0, [x13]
     b    .Lbv_end\@
 .Lbv_128\@:
+    tbnz x8, 15, .Lbv_end\@                 /* (legacy SSE: kept) */
     stp  xzr, xzr, [x13]
 .Lbv_end\@:
     vex_zero_zmm
@@ -1795,6 +1807,7 @@ vex_blendv pblendvb, 16b
     str  q2, [x13]
     b    .Lfm_end\@
 .Lfm_128\@:
+    tbnz x8, 15, .Lfm_end\@                 /* (legacy SSE: kept) */
     stp  xzr, xzr, [x13]
 .Lfm_end\@:
     vex_zero_zmm

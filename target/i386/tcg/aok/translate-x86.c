@@ -634,6 +634,8 @@ static bool x86_nox87;
 static bool x86_no32, x86_no64;
 /* QEMU_AOK_X86_NOONE: a stepped AVX-512 insn TCG's too (which raises #UD). */
 static bool x86_noone;
+/* QEMU_AOK_X86_SSEHELPERS: legacy SSE's float ops QEMU's helpers, not VEX's frames. */
+static bool x86_sse_helpers;
 
 /* Emit what makes x86 condition @cc one of the host's, and return that. */
 static int cond_arm(Ctx *c, unsigned cc)
@@ -1246,14 +1248,25 @@ uint64_t aok_x86_fp_begin(CPUX86State *env)
            !(fpcr & 0x07f89f00);
 }
 
-/* TCGCPUOps.aok_fold_fpsr: inexact is all a gadget leaves to the host. */
+/*
+ * TCGCPUOps.aok_fold_fpsr: what the host's FP unit raised for the guest, as
+ * MXCSR's flags. The double gadgets leave only inexact there; the vector
+ * frames (gadgets-vec.S) anything: IOC is IE, DZC ZE, OFC OE, UFC UE, IXC
+ * PE and IDC DE.
+ */
 void x86_aok_fold_fpsr(CPUState *cs, uint32_t fpsr)
 {
     CPUX86State *env = cpu_env(cs);
+    int f = (fpsr & 0x01 ? float_flag_invalid : 0) |
+            (fpsr & 0x02 ? float_flag_divbyzero : 0) |
+            (fpsr & 0x04 ? float_flag_overflow : 0) |
+            (fpsr & 0x08 ? float_flag_underflow : 0) |
+            (fpsr & 0x10 ? float_flag_inexact : 0) |
+            (fpsr & 0x80 ? float_flag_input_denormal_used : 0);
 
-    if (fpsr & 0x10) {
-        set_float_exception_flags(get_float_exception_flags(&env->sse_status)
-                                  | float_flag_inexact, &env->sse_status);
+    if (f) {
+        set_float_exception_flags(get_float_exception_flags(&env->sse_status) | f,
+                                  &env->sse_status);
     }
 }
 
@@ -2374,6 +2387,7 @@ static void __attribute__((constructor)) x86_aok_init(void)
     x86_no32 = getenv("QEMU_AOK_X86_NO32");
     x86_no64 = getenv("QEMU_AOK_X86_NO64");
     x86_noone = getenv("QEMU_AOK_X86_NOONE");
+    x86_sse_helpers = getenv("QEMU_AOK_X86_SSEHELPERS");
     s = getenv("QEMU_AOK_X86_SKIP");
 
     /* "88,89,1af": one-byte opcodes, and 0F ones as 1xx */
@@ -2638,6 +2652,10 @@ static int sse(Ctx *c, const Insn *d, unsigned b, int pfx, int64_t imm)
     if (!c->sse) {
         return UNKNOWN;
     }
+    /* floating point, and its conversions: VEX's frames (sse_vex) */
+    if (sse_vex(c, d, 1, b, pfx, imm) == NEXT) {
+        return NEXT;
+    }
     switch (b) {
     case 0x10:              /* movups, movupd, movss, movsd: G from E */
         if (pfx < 2) {
@@ -2862,10 +2880,10 @@ static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
         return UNKNOWN;
     }
     if (b == 0x38 || b == 0x3a) {
-        return sse_evex(c, d, code, b);
+        return sse_3byte(c, d, code, b);
     }
     if ((b >= 0x10 && b <= 0x17) || (b >= 0x28 && b <= 0x2f) ||
-        (b >= 0x50 && b <= 0x7f && b != 0x77) || b == 0xc6 ||
+        (b >= 0x50 && b <= 0x7f && b != 0x77) || b == 0xc2 || b == 0xc6 ||
         (b >= 0xd0 && b != 0xff)) {
         int pfx = d->repne ? 3 : d->rep ? 2 : d->o16 ? 1 : 0;
 
@@ -2875,7 +2893,7 @@ static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
             return UNKNOWN;
         }
         modrm(d);
-        imm = (b >= 0x70 && b <= 0x73) || b == 0xc6 ? fimm(d, 1) : 0;
+        imm = (b >= 0x70 && b <= 0x73) || b == 0xc2 || b == 0xc6 ? fimm(d, 1) : 0;
         FIN();
         return sse(c, d, b, pfx, imm);
     }
@@ -3151,7 +3169,10 @@ void aok_x86_helper_ldmxcsr(CPUX86State *env, uint64_t pc, uint64_t a,
                             uint64_t b)
 {
     x86_sync(env, pc);
-    helper_ldmxcsr(env, env->aok_tmp[0]);
+    if (env->aok_tmp[0] & ~(uint64_t)MXCSR_MASK) {
+        raise_exception_err_ra(env, EXCP0D_GPF, 0, 0);
+    }
+    cpu_set_mxcsr(env, env->aok_tmp[0]);
 }
 
 void aok_x86_helper_stmxcsr(CPUX86State *env, uint64_t pc, uint64_t a,

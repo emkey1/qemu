@@ -1974,6 +1974,102 @@ x86_fp_pd fp_mulpd, fmul, mul
 x86_fp_pd fp_divpd, fdiv, div
 
 /*
+ * The same in front of VEX's frames (translate-vec.c.inc's sse_vex):
+ * [d][s][frame][its word], s VEX_STAGE for an operand in memory, which a
+ * load has put there. What the host does not give exactly here (MXCSR not
+ * plain, an operand or result that is not a normal number or a zero) is the
+ * frame's, which is x86's in every case: it runs next, as if dispatched.
+ * FPSR accumulates the stream's flags (gadgets-vec.S), so the host must not
+ * raise a flag x86 would not: a product or quotient that may be tiny goes
+ * to the frame before it is computed (x86_fpx_tiny), since AArch64's
+ * underflow is tiny before rounding and x86's after. Every other bail-out
+ * (an infinity, a NaN) raises what x86 raises too.
+ */
+.macro x86_fpx_slow
+    add _ip, _ip, #16
+    ldr x9, [_ip], #8
+    br x9
+.endm
+/*
+ * To \slow where \a * \b or \a / \b, normal numbers or zeros, may come out
+ * below the smallest normal or at it: a product's biased exponent is ea + eb
+ * - 1023 (+ 1), a quotient's ea - eb + 1023 (- 1), each bounded here with a
+ * step to spare. A zero dividend or factor makes an exact zero.
+ */
+.macro x86_fpx_tiny zero, a, b, slow
+    .ifc \zero, mul
+    lsl x13, \a, #1
+    cbz x13, 1f
+    lsl x13, \b, #1
+    cbz x13, 1f
+    ubfx x13, \a, #52, #11
+    ubfx x14, \b, #52, #11
+    add x13, x13, x14
+    cmp x13, #1025
+    b.ls \slow
+    .endif
+    .ifc \zero, div
+    lsl x13, \a, #1
+    cbz x13, 1f
+    ubfx x13, \a, #52, #11
+    ubfx x14, \b, #52, #11
+    sub x13, x13, x14
+    cmn x13, #1020
+    b.le \slow
+    .endif
+1:
+.endm
+.macro x86_fpx_sd name, insn, zero
+.gadget \name
+0:  cbz _fpact, 8f
+    cbz _fpok, 7f
+    ldp x8, x9, [_ip]
+    ldr x10, [_cpu, x8]
+    ldr x11, [_cpu, x9]
+    .ifnc \zero, sqrt
+    x86_fp_operand x10, 7f
+    .endif
+    x86_fp_operand x11, 7f
+    x86_fpx_tiny \zero, x10, x11, 7f
+    x86_fp_compute \insn, \zero, x10, x11, x12, 7f
+    str x12, [_cpu, x8]
+    gret 4
+7:  x86_fpx_slow
+8:  x86_fp_begin 0b
+.endm
+x86_fpx_sd fpx_addsd, fadd, exact
+x86_fpx_sd fpx_subsd, fsub, exact
+x86_fpx_sd fpx_mulsd, fmul, mul
+x86_fpx_sd fpx_divsd, fdiv, div
+x86_fpx_sd fpx_sqrtsd, fsqrt, sqrt
+.macro x86_fpx_pd name, insn, zero
+.gadget \name
+0:  cbz _fpact, 8f
+    cbz _fpok, 7f
+    ldp x8, x9, [_ip]
+    add x8, _cpu, x8
+    add x9, _cpu, x9
+    ldp x10, x15, [x8]
+    ldp x11, x16, [x9]
+    x86_fp_operand x10, 7f
+    x86_fp_operand x11, 7f
+    x86_fp_operand x15, 7f
+    x86_fp_operand x16, 7f
+    x86_fpx_tiny \zero, x10, x11, 7f
+    x86_fpx_tiny \zero, x15, x16, 7f
+    x86_fp_compute \insn, \zero, x10, x11, x12, 7f
+    x86_fp_compute \insn, \zero, x15, x16, x17, 7f
+    stp x12, x17, [x8]
+    gret 4
+7:  x86_fpx_slow
+8:  x86_fp_begin 0b
+.endm
+x86_fpx_pd fpx_addpd, fadd, exact
+x86_fpx_pd fpx_subpd, fsub, exact
+x86_fpx_pd fpx_mulpd, fmul, mul
+x86_fpx_pd fpx_divpd, fdiv, div
+
+/*
  * ucomisd and comisd: [fn][a][b][-]. Without a NaN they are one compare,
  * and with one (or a denormal) fn's; either way cc_src holds ZF, PF and CF
  * as CC_OP_EFLAGS, and the host's flags are left as fcmp leaves them for an

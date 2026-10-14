@@ -4510,20 +4510,6 @@ static void gen_VMOVHPx_st(DisasContext *s, X86DecodedInsn *decode)
     gen_stq_env_A0(s, decode->op[2].offset + offsetof(XMMReg, XMM_Q(1)));
 }
 
-static void gen_VMOVHPx(DisasContext *s, X86DecodedInsn *decode)
-{
-    TCGv_i64 t = tcg_temp_new_i64();
-
-    if (decode->op[0].offset != decode->op[2].offset) {
-        tcg_gen_ld_i64(t, tcg_env, decode->op[2].offset + offsetof(XMMReg, XMM_Q(1)));
-        tcg_gen_st_i64(t, tcg_env, decode->op[0].offset + offsetof(XMMReg, XMM_Q(1)));
-    }
-    if (decode->op[0].offset != decode->op[1].offset) {
-        tcg_gen_ld_i64(t, tcg_env, decode->op[1].offset + offsetof(XMMReg, XMM_Q(0)));
-        tcg_gen_st_i64(t, tcg_env, decode->op[0].offset + offsetof(XMMReg, XMM_Q(0)));
-    }
-}
-
 static void gen_VMOVHLPS(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i64 t = tcg_temp_new_i64();

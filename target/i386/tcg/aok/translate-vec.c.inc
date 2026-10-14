@@ -2023,7 +2023,24 @@ static const MemTab vwp_tab[7] = { VSZ(MEMT, vwp) };
 static const MemTab vlda_tab[7] = { [4] = MEMT(vld16a) [5] = MEMT(vld32a) [6] = MEMT(vld64a) };
 static const MemTab vsta_tab[7] = { [4] = MEMT(vst16a) [5] = MEMT(vst32a) [6] = MEMT(vst64a) };
 #define VSTAGE  offsetof(CPUX86State, aok_vstage)
-DECL(vex_gst_amd64) DECL(vex_to_gpr_amd64) DECL(vex_bmi)
+
+/* gadgets-vec.S's EVEX memory gadgets. */
+MEMD(vldb4) MEMD(vldb8) MEMD(vldbm4) MEMD(vldbm8) MEMD(vldm) MEMD(vstm)
+MEMD(vgather) MEMD(vscatter) MEMD(vwpm)
+static const MemTab vldb_tab[2][2] = {
+    { MEMT(vldb4) MEMT(vldb8) }, { MEMT(vldbm4) MEMT(vldbm8) },
+};
+static const MemTab evex_mem_tab[5] = {
+    MEMT(vldm) MEMT(vstm) MEMT(vwpm) MEMT(vgather) MEMT(vscatter)
+};
+#define vldm_tab        evex_mem_tab[0]
+#define vstm_tab        evex_mem_tab[1]
+#define vwpm_tab        evex_mem_tab[2]
+#define vgather_tab     evex_mem_tab[3]
+#define vscatter_tab    evex_mem_tab[4]
+DECL(vex_gst_amd64) DECL(vex_to_gpr_amd64) DECL(vex_bmi) DECL(vmskk) DECL(vmskld)
+DECL(fpx_addsd) DECL(fpx_subsd) DECL(fpx_mulsd) DECL(fpx_divsd) DECL(fpx_sqrtsd)
+DECL(fpx_addpd) DECL(fpx_subpd) DECL(fpx_mulpd) DECL(fpx_divpd)
 
 static unsigned vlog2(unsigned bytes)
 {
@@ -2033,10 +2050,10 @@ static unsigned vlog2(unsigned bytes)
 /*
  * A vector memory operand: the gadget of @tab for its form, [@own] if it has
  * one, the address and the host's word: the log2 of the bytes, | 16 for an
- * operand that must be aligned to its size.
+ * operand that must be aligned to its size (vmem_w: those bits as given).
  */
-static void vmem(Ctx *c, const Insn *d, const MemTab tab, bool has_own,
-                 uint64_t own, unsigned bytes, bool aligned)
+static void vmem_w(Ctx *c, const Insn *d, const MemTab tab, bool has_own,
+                   uint64_t own, uint32_t wbits)
 {
     const Mem *m = &d->m;
     bool ea = m->riprel || m->seg >= 0 || m->index >= 0;
@@ -2052,8 +2069,14 @@ static void vmem(Ctx *c, const Insn *d, const MemTab tab, bool has_own,
         aok_emit(&c->g, ro(m->base));
         aok_emit(&c->g, m->disp);
     }
-    aok_emit(&c->g, word(c, vlog2(bytes) | (aligned ? 16 : 0)));
+    aok_emit(&c->g, word(c, wbits));
     c->hf = HF_NONE;
+}
+
+static void vmem(Ctx *c, const Insn *d, const MemTab tab, bool has_own,
+                 uint64_t own, unsigned bytes, bool aligned)
+{
+    vmem_w(c, d, tab, has_own, own, vlog2(bytes) | (aligned ? 16 : 0));
 }
 
 /* #UD, raised where the insn is. */
@@ -2073,6 +2096,43 @@ static int vex_ud(Ctx *c, Insn *d, const uint8_t *code)
 
 static int evex_at(Ctx *c, Insn *d, const uint8_t *code, unsigned p0,
                    unsigned p1, unsigned p2, unsigned op, int from);
+
+/*
+ * A VP_FRAME plan's gadgets: its memory operand or general register
+ * staged, a write probe for a result that goes to memory (its fault before
+ * the frame changes anything, MXCSR), the frame and its words, the store.
+ * @legacy: a legacy SSE encoding of the op (sse_vex): word bit 15, and a
+ * 16-byte operand in memory aligned.
+ */
+static void vex_frame(Ctx *c, const Insn *d, const struct vex_entry *e,
+                      const struct vex_plan *p, bool legacy)
+{
+    bool aligned = p->align || (legacy && p->stage_bytes == 16);
+
+    if (p->gpr_stage >= 0) {
+        E1(G(vex_gst_amd64), (p->gpr_stage & 15) | (p->gpr_w ? 16 : 0));
+    } else if (p->stage_bytes) {
+        vmem(c, d, aligned ? vlda_tab[vlog2(p->stage_bytes)]
+                           : vld_tab[vlog2(p->stage_bytes)],
+             false, 0, p->stage_bytes, aligned);
+    }
+    if (p->st_after) {
+        vmem(c, d, vwp_tab[vlog2(p->st_after)], false, 0, p->st_after, false);
+    }
+    aok_emit_gadget(&c->g, p->gadget);
+    aok_emit(&c->g, p->word | (legacy ? 1ull << 15 : 0));
+    for (unsigned i = 0; i < p->nextra; i++) {
+        aok_emit(&c->g, p->extra[i]);
+    }
+    if (p->st_after) {
+        vmem(c, d, vst_tab[vlog2(p->st_after)], true, VSTAGE, p->st_after, false);
+    }
+    c->hf = HF_NONE;
+    if (e->kind == VXK_FLAGS || e->kind == VXK_TEST ||
+        (e->kind == VXK_KOP && ((e->aux & 31) == 13 || (e->aux & 31) == 14))) {
+        set_flags(c, HF_NONE, CC_OP_EFLAGS);
+    }
+}
 
 /*
  * A VEX insn, @lead (C4 or C5) and the legacy prefixes before it read. In
@@ -2159,7 +2219,7 @@ static int vex(Ctx *c, Insn *d, const uint8_t *code, unsigned lead)
         return vex_ud(c, d, code);
     }
     if ((e->kind == VXK_KOP && !c->avx512) || e->kind == VXK_GATHER ||
-        e->kind == VXK_MASKMOV || e->kind == VXK_SPECIAL) {
+        e->kind == VXK_SPECIAL) {
         return UNKNOWN;         /* (not here yet: QEMU's engine's) */
     }
     if (vex_has_imm8(v.map, v.op)) {
@@ -2197,63 +2257,50 @@ static int vex(Ctx *c, Insn *d, const uint8_t *code, unsigned lead)
         if (v.mem && !p.stage_bytes && p.gpr_stage < 0 && !p.st_after) {
             return vex_ud(c, d, code);
         }
-        if (p.gpr_stage >= 0) {
-            E1(G(vex_gst_amd64), (p.gpr_stage & 15) | (p.gpr_w ? 16 : 0));
-        } else if (p.stage_bytes) {
-            vmem(c, d, p.align ? vlda_tab[vlog2(p.stage_bytes)]
-                               : vld_tab[vlog2(p.stage_bytes)],
-                 false, 0, p.stage_bytes, p.align);
-        }
-        if (p.st_after) {
-            /* the store's fault before the frame changes anything (MXCSR) */
-            vmem(c, d, vwp_tab[vlog2(p.st_after)], false, 0, p.st_after, false);
-        }
-        aok_emit_gadget(&c->g, p.gadget);
-        aok_emit(&c->g, p.word);
-        for (unsigned i = 0; i < p.nextra; i++) {
-            aok_emit(&c->g, p.extra[i]);
-        }
-        if (p.st_after) {
-            vmem(c, d, vst_tab[vlog2(p.st_after)], true, VSTAGE, p.st_after, false);
+        vex_frame(c, d, e, &p, false);
+        return NEXT;
+    case VP_MASKED: {
+        /*
+         * VMASKMOV*, VPMASKMOV*: the mask's signs to VM_KSTAGE, then
+         * gadgets-vec.S's masked load (masked-off elements zeroed by
+         * vmskld) or store, which touch only the enabled elements.
+         */
+        unsigned esz = p.masked_esz == 8 ? 3 : 2;
+        uint64_t w = (v.l ? 1ull << 16 : 0) | (uint64_t)esz << (p.masked_store ? 44 : 22);
+
+        E1(G(vmskk), (v.vvvv & 15) | (esz == 3 ? 16 : 0));
+        if (p.masked_store) {
+            E2(G(vmov128), VSTAGE, X(v.reg));
+            E2(G(vmov128), VSTAGE + 16, X(v.reg) + 16);
+            vmem_w(c, d, vstm_tab, true, w, vlog2(16u << v.l) | 32);
+        } else {
+            vmem_w(c, d, vldm_tab, true, w, vlog2(16u << v.l) | 32);
+            E1(G(vmskld), (v.reg & 15) | (v.vvvv & 15) << 4 |
+               (esz == 3 ? 1 << 8 : 0) | (v.l ? 1 << 9 : 0));
         }
         c->hf = HF_NONE;
-        if (e->kind == VXK_FLAGS || e->kind == VXK_TEST ||
-            (e->kind == VXK_KOP && ((e->aux & 31) == 13 || (e->aux & 31) == 14))) {
-            set_flags(c, HF_NONE, CC_OP_EFLAGS);
-        }
         return NEXT;
-    default:                    /* gathers, masked moves, the specials: TCG's */
+    }
+    default:                    /* gathers, the specials: TCG's */
         return UNKNOWN;
     }
 }
 
 /* ---- EVEX: this front end's emitter -------------------------------------------- */
 
-/* gadgets-vec.S's EVEX memory gadgets. */
-MEMD(vldb4) MEMD(vldb8) MEMD(vldbm4) MEMD(vldbm8) MEMD(vldm) MEMD(vstm)
-MEMD(vgather) MEMD(vscatter) MEMD(vwpm)
-static const MemTab vldb_tab[2][2] = {
-    { MEMT(vldb4) MEMT(vldb8) }, { MEMT(vldbm4) MEMT(vldbm8) },
-};
-static const MemTab evex_mem_tab[5] = {
-    MEMT(vldm) MEMT(vstm) MEMT(vwpm) MEMT(vgather) MEMT(vscatter)
-};
-#define vldm_tab        evex_mem_tab[0]
-#define vstm_tab        evex_mem_tab[1]
-#define vwpm_tab        evex_mem_tab[2]
-#define vgather_tab     evex_mem_tab[3]
-#define vscatter_tab    evex_mem_tab[4]
 
 /*
  * A masked operand's elements (gadgets-vec.S's vm_elems): the EVEX word's
  * opmask, the field at bit @ks (and the log2 of the elements' size 4 bits
  * up), over the operand's elements: 16 << VL bytes, or 1 << bits 59-61 with
- * bit 58 (a narrowing store's).
+ * bit 58 (a narrowing store's). With @sz | 32 (the host's word) the mask
+ * is vmskk's (VEX's VMASKMOV).
  */
-static uint64_t vm_elems(CPUX86State *env, uint64_t w, int ks,
+static uint64_t vm_elems(CPUX86State *env, uint64_t w, uint32_t sz, int ks,
                          unsigned *bytes, unsigned *esz)
 {
-    uint64_t k = env->opmask_regs[(w >> ks) & 7];
+    uint64_t k = sz & 32 ? ldq_le_p(env->aok_vstage + 248)      /* (vmskk's) */
+                         : env->opmask_regs[(w >> ks) & 7];
     unsigned n;
 
     *esz = (w >> (ks + 4)) & 3;
@@ -2301,7 +2348,7 @@ void aok_x86_helper_vldm(CPUX86State *env, uint64_t addr, uint64_t pc,
     uint64_t k;
 
     x86_sync(env, pc);
-    k = vm_elems(env, w, 18, &bytes, &esz);
+    k = vm_elems(env, w, sz, 18, &bytes, &esz);
     if ((sz & 16) && (addr & (bytes - 1))) {
         raise_exception_err_ra(env, EXCP0D_GPF, 0, 0);
     }
@@ -2329,7 +2376,7 @@ static void x86_vstm(CPUX86State *env, uint64_t addr, uint64_t pc, uint32_t sz,
     uint64_t k;
 
     x86_sync(env, pc);
-    k = vm_elems(env, w, 40, &bytes, &esz);
+    k = vm_elems(env, w, sz, 40, &bytes, &esz);
     if ((sz & 16) && (addr & (bytes - 1))) {
         raise_exception_err_ra(env, EXCP0D_GPF, 0, 0);
     }
@@ -2700,4 +2747,163 @@ void aok_x86_helper_tf(CPUX86State *env, uint64_t pc, uint64_t a, uint64_t b)
 {
     x86_sync(env, pc);
     helper_single_step(env);
+}
+
+/*
+ * A legacy SSE op as its VEX form computes it: the frames are exact to x86
+ * (which NaN, DAZ in MINPS and MAXPS, the flags, RCPPS's table), where
+ * QEMU's softfloat helpers are not, and SSSE3 to SSE4.1 are TCG's
+ * otherwise. VEX's dst = s1 OP s2 with s1 the destination, at L 0, the
+ * word's bit 15 keeping bits 511:128 as a legacy write does; a 16-byte
+ * operand in memory must be aligned. The ops: 0F's floating point and its
+ * conversions, and the 66 0F 38 and 66 0F 3A ops of SSSE3 and SSE4.1 that
+ * have a VEX form (legacy BLENDV's implicit xmm0 is the VEX form's mask
+ * register). @map: 1 (0F), 2 (0F 38), 3 (0F 3A); @pfx: none, 66, F3, F2.
+ * UNKNOWN for anything else (the caller's other path).
+ */
+static bool sse_vex_op(unsigned map, unsigned op, int pfx)
+{
+    switch (map) {
+    case 1:
+        return op == 0x51 || op == 0x52 || op == 0x53 || (op >= 0x58 && op <= 0x5f) ||
+               op == 0xc2 || op == 0x2a || op == 0x2c || op == 0x2d || op == 0x2e ||
+               op == 0x2f || op == 0xd0 || op == 0x7c || op == 0x7d || op == 0xe6 ||
+               (op == 0x12 && pfx >= 2) || (op == 0x16 && pfx == 2);
+    case 2:
+        return pfx == 1 && (op <= 0x0b || op == 0x10 || op == 0x14 || op == 0x15 ||
+                            op == 0x17 || (op >= 0x1c && op <= 0x1e) ||
+                            (op >= 0x20 && op <= 0x25) || op == 0x28 || op == 0x29 ||
+                            op == 0x2b || (op >= 0x30 && op <= 0x35) ||
+                            (op >= 0x37 && op <= 0x41));
+    case 3:
+        return pfx == 1 && ((op >= 0x08 && op <= 0x0f) || op == 0x20 || op == 0x21 ||
+                            op == 0x22 || (op >= 0x40 && op <= 0x42));
+    default:
+        return false;
+    }
+}
+
+/*
+ * Whether the CPU offers such an op: SSE3's (ADDSUB, HADD, HSUB, MOVDDUP,
+ * MOVSLDUP, MOVSHDUP), SSSE3's, SSE4.1's, SSE4.2's PCMPGTQ. (Without, TCG
+ * raises the #UD.)
+ */
+static bool sse_vex_cpuid_ok(const CPUX86State *env, unsigned map, unsigned op)
+{
+    uint32_t ecx = env->features[FEAT_1_ECX];
+
+    switch (map) {
+    case 1:
+        if (op == 0xd0 || op == 0x7c || op == 0x7d || op == 0x12 || op == 0x16) {
+            return ecx & CPUID_EXT_SSE3;
+        }
+        return true;
+    case 2:
+        if (op <= 0x0b || (op >= 0x1c && op <= 0x1e)) {
+            return ecx & CPUID_EXT_SSSE3;
+        }
+        return ecx & (op == 0x37 ? CPUID_EXT_SSE42 : CPUID_EXT_SSE41);
+    default:
+        return ecx & (op == 0x0f ? CPUID_EXT_SSSE3 : CPUID_EXT_SSE41);
+    }
+}
+
+static int sse_vex(Ctx *c, const Insn *d, unsigned map, unsigned op, int pfx,
+                   int64_t imm)
+{
+    struct vex_insn v = { 0 };
+    const struct vex_entry *e;
+    struct vex_plan p;
+
+    if (x86_novec || x86_sse_helpers || !sse_vex_op(map, op, pfx) ||
+        !sse_vex_cpuid_ok(c->env, map, op)) {
+        return UNKNOWN;
+    }
+    v.map = map;
+    v.pp = pfx;
+    v.op = op;
+    /* W selects only for these; elsewhere legacy ignores REX.W */
+    v.w = ((map == 1 && (op == 0x2a || op == 0x2c || op == 0x2d)) ||
+           (map == 3 && op == 0x22)) && d->w;
+    v.reg = d->reg & 15;
+    v.rm = d->rm & 15;
+    v.mem = d->mod != 3;
+    v.vsib_index = -1;
+    v.imm = map == 1 && op == 0xc2 ? imm & 7 : imm;   /* (CMPccPS: predicates 0-7) */
+    if (map == 2 && (op == 0x10 || op == 0x14 || op == 0x15)) {
+        /* PBLENDVB, BLENDVPS, BLENDVPD: VEX's 0F 3A 4C, 4A, 4B, the mask xmm0 */
+        v.map = 3;
+        v.op = op == 0x10 ? 0x4c : op == 0x14 ? 0x4a : 0x4b;
+        v.imm = 0;
+    }
+    e = vex_lookup(&v);
+    if (!e || e->gadget == aok_vec_none) {
+        return UNKNOWN;
+    }
+    switch (e->kind) {
+    case VXK_L3: case VXK_SCAL: case VXK_TBL2: case VXK_INTIN: case VXK_INSPS:
+    case VXK_BLENDV:
+        v.vvvv = v.reg;             /* s1: the destination */
+        break;
+    case VXK_L2: case VXK_TBL1: case VXK_FLAGS: case VXK_TEST: case VXK_WIDEN:
+    case VXK_NARROW: case VXK_G2R:
+        break;
+    default:
+        return UNKNOWN;
+    }
+    if (!vex_plan(&v, &p, false) || p.type != VP_FRAME || p.gadget == aok_vec_none ||
+        (v.mem && !p.stage_bytes && p.gpr_stage < 0)) {
+        return UNKNOWN;
+    }
+    if (c->fp && map == 1 && (pfx == 1 || pfx == 3) &&
+        (op == 0x58 || op == 0x59 || op == 0x5c || op == 0x5e || (op == 0x51 && pfx == 3))) {
+        /*
+         * Doubles: the host's FP unit first, where it is exact (gadgets.S's
+         * fpx_*), the frame for the rest.
+         */
+        static const Gadget fpx[2][8] = {
+            { G(fpx_addpd), G(fpx_mulpd), NULL, NULL, G(fpx_subpd), NULL, G(fpx_divpd) },
+            { G(fpx_addsd), G(fpx_mulsd), NULL, NULL, G(fpx_subsd), NULL, G(fpx_divsd) },
+        };
+        Gadget g = op == 0x51 ? G(fpx_sqrtsd) : fpx[pfx == 3][op - 0x58];
+
+        if (v.mem) {
+            vmem(c, d, p.stage_bytes == 16 ? vlda_tab[4] : vld_tab[vlog2(p.stage_bytes)],
+                 false, 0, p.stage_bytes, p.stage_bytes == 16);
+        }
+        E4(g, X(v.reg), v.mem ? VSTAGE : X(v.rm), p.gadget, p.word | 1ull << 15);
+        c->hf = HF_NONE;
+        return NEXT;
+    }
+    vex_frame(c, d, e, &p, true);
+    return NEXT;
+}
+
+/*
+ * 0F 38 and 0F 3A (@esc read): GFNI, AES and PCLMULQDQ as EVEX's ops
+ * (sse_evex), SSSE3 and SSE4.1 as VEX's (sse_vex); the rest TCG's.
+ */
+static int sse_3byte(Ctx *c, Insn *d, const uint8_t *code, unsigned esc)
+{
+    unsigned map = esc == 0x38 ? 2 : 3, op;
+    int pfx = d->repne ? 3 : d->rep ? 2 : d->o16 ? 1 : 0;
+    int64_t imm = 0;
+
+    if (!c->sse || d->p >= d->end) {
+        return UNKNOWN;
+    }
+    op = *d->p;
+    if (sse_via_evex(map, op)) {
+        return sse_evex(c, d, code, esc);
+    }
+    if (d->lock || !sse_vex_op(map, op, pfx)) {
+        return UNKNOWN;
+    }
+    d->p++;
+    modrm(d);
+    if (map == 3) {
+        imm = fimm(d, 1);
+    }
+    FIN();
+    return sse_vex(c, d, map, op, pfx, imm);
 }

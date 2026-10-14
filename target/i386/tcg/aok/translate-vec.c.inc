@@ -1,8 +1,10 @@
 /*
- * The VEX instructions (AVX, AVX2, FMA3, F16C, BMI1/2 and the opmask ones),
- * included by translate-x86.c: iSH-AOK's table of them and its planner,
- * which say which of gadgets-vec.S's frames computes each and with what
- * operand word, and this front end's emitter.
+ * The VEX instructions (AVX, AVX2, FMA3, F16C, BMI1/2 and the opmask ones)
+ * and the EVEX ones (AVX-512 and the extensions that come with it, and the
+ * VEX and legacy forms of GFNI, AES, PCLMULQDQ and AVX-VNNI, which are its
+ * ops), included by translate-x86.c: iSH-AOK's tables of them and its
+ * planners, which say which of gadgets-vec.S's frames computes each and
+ * with what operand word, and this front end's emitter.
  *
  * The table, the planner and x86_shuffle_index are iSH-AOK's jit/gen.c
  * (commit 651f974a2, contributed there by Mike Miller after iSH's 0e3a4144
@@ -977,15 +979,1031 @@ static bool vex_plan(const struct vex_insn *v, struct vex_plan *p, bool i386) {
     return true;
 }
 
-/*
- * The VEX forms of GFNI, AES, VPCLMULQDQ and AVX-VNNI, which iSH-AOK computes
- * with the EVEX table's ops (not here yet: QEMU's engine's).
- */
-static inline bool vex_via_evex(unsigned map, unsigned pp, unsigned op)
-{
+// The VEX forms of GFNI (VGF2P8MULB, VGF2P8AFFINE(INV)QB), AES (VAES*,
+// VAESIMC, VAESKEYGENASSIST), VPCLMULQDQ and AVX-VNNI are the EVEX table's ops
+// at VL 128/256, unmasked: EVEX's P0-P2 from the VEX fields (R X B and vvvv
+// as VEX has them, R' and V' clear, L'L = L). Their legacy SSE forms too
+// (sse_via_evex: which).
+static inline bool vex_via_evex(unsigned map, unsigned pp, unsigned op) {
     return pp == 1 && ((map == 2 && (op == 0xcf || (op >= 0xdb && op <= 0xdf) || (op >= 0x50 && op <= 0x53))) ||
             (map == 3 && (op == 0xce || op == 0xcf || op == 0xdf || op == 0x44)));
 }
+static inline bool sse_via_evex(unsigned map, unsigned op) {           // GFNI, AES, PCLMULQDQ (not AVX-VNNI)
+    return vex_via_evex(map, 1, op) && !(map == 2 && op >= 0x50 && op <= 0x53);
+}
+static inline bool sse_via_evex_unary(unsigned map, unsigned op) {     // AESIMC, AESKEYGENASSIST: no s1
+    return (map == 2 && op == 0xdb) || (map == 3 && op == 0xdf);
+}
+static inline void vex_to_evex(bool r, bool x, bool b, unsigned map, bool w, unsigned vvvv, bool l, unsigned pp,
+        unsigned *p0, unsigned *p1, unsigned *p2) {
+    *p0 = (r ? 0 : 0x80) | (x ? 0 : 0x40) | (b ? 0 : 0x20) | 0x10 | map;
+    *p1 = (w ? 0x80 : 0) | ((~vvvv & 15) << 3) | 4 | pp;
+    *p2 = (l ? 0x20 : 0) | 8;
+}
+enum { EVF_EVEX, EVF_VEX, EVF_SSE };
+
+// Whether an EVEX opcode has an imm8 after its operand (the decoder reads it
+// before the lookup): the 0F3A map, and the 0F map's shift groups, CMPPS/PD
+// and the shuffles.
+static inline bool evex_has_imm8(unsigned map, unsigned op) {
+    return map == 3 || (map == 1 && ((op >= 0x70 && op <= 0x73) || op == 0xc2 || (op >= 0xc4 && op <= 0xc6)));
+}
+
+// ---- EVEX (AVX-512): vec/evex.inc's frames ----
+//
+// An entry gives the opcode's operand roles (kind), the VEX.W it requires,
+// the element size masking works at (esz, log2 bytes), the embedded
+// broadcast's element (bcast, log2 bytes; 0: none, EVEX.b with memory is
+// #UD), the memory operand's tuple for disp8*N, whether a memory operand
+// must be aligned to the vector length, and whether masking is #UD.
+enum evex_kind {
+    EVK_L3,     // dst = reg, s1 = vvvv, s2 = r/m
+    EVK_L2,     // dst = reg, s2 = r/m (as s1 too); vvvv must be 1111b
+    EVK_LOAD,   // dst = reg, s2 = r/m: a move; vvvv 1111b
+    EVK_STORE,  // r/m = reg: a move to memory (masked: only the elements the mask enables) or a register
+    EVK_TOMASK, // k[reg] = s1 OP s2, element by element (the compares, VPTESTM/NM); zeroing only
+    EVK_SHI,    // dst = vvvv, s2 = r/m: the imm8 shifts and rotates (a group in ModRM.reg)
+    EVK_BCAST,  // dst = reg, s2 = r/m, vvvv 1111b: a broadcast (the frame's flags pick the quarter)
+    EVK_BCASTG, // dst = reg, s2 = the r/m GPR (staged), vvvv 1111b: VPBROADCASTB/W/D/Q from a GPR
+    EVK_SCAL,   // a scalar op: as EVK_L3 at VL 128, element 0 masked (the rest s1's), memory 1 << esz bytes
+    EVK_TOMASKS,// a scalar compare into an opmask: as EVK_TOMASK at VL 128, memory 1 << esz bytes
+    EVK_FULL,   // as EVK_L3, on evex_full's whole-vector frame (the lane-crossing ops)
+    EVK_FULL1,  // as EVK_FULL with vvvv 1111b: dst = reg, the source s2 = r/m
+    EVK_FULL8,  // as EVK_FULL, word bit 39 (VINSERT*32x8/64x4)
+    EVK_EXTRACT,  // r/m (an xmm, or a masked store) = a 128-bit lane of reg: VEXTRACT*32x4/64x2
+    EVK_EXTRACT8, // ... a 256-bit half: VEXTRACT*32x8/64x4
+    EVK_V2M,    // k[reg] = each element's sign of the r/m register (VPMOVB2M ...): vvvv 1111b, no mask
+    EVK_M2V,    // dst = reg, from the r/m k register (VPMOVM2B ...): vvvv 1111b, no mask
+    EVK_EXT,    // dst = reg, s2 = r/m of VL >> ld bytes: VPMOVSX/ZX; vvvv 1111b
+    EVK_NARROW, // r/m (a register, or memory of VL >> ld bytes) = reg narrowed: VPMOV(S/US)*; vvvv 1111b
+    EVK_COMPRESS, // r/m (a register, or memory) = reg's enabled elements packed: VPCOMPRESS*
+    EVK_EXPAND, // dst = reg, the r/m's low elements spread to the enabled ones: VPEXPAND*
+    EVK_GATHER, // reg = the VSIB elements the mask enables (opcode bit 0: qword indices; W: qword data)
+    EVK_SCATTER,// the VSIB elements the mask enables = reg's
+    EVK_CVTW,   // a widening conversion: dst = reg, s2 = r/m of VL / 2 (evex_cvtw); vvvv 1111b
+    EVK_CVTN,   // a narrowing one: dst = reg of VL / 2 (VL 128: 64 bits), s2 = r/m (evex_cvtn); vvvv 1111b
+    EVK_CVTNR,  // VCVTPS2PH: as EVK_CVTN with the source reg, the destination r/m (memory: VL / 2 bytes)
+    EVK_CVTSI,  // VCVT(U)SI2SS/SD: as EVK_SCAL, s2 a GPR (staged) or memory of ld bytes
+    EVK_CVT2GPR,// VCVT(T)SS/SD2(U)SI: the GPR reg = s2's low element (evex_cvt2gpr; gen_evex_cvt2gpr_word)
+    EVK_FLAGS,  // (V)(U)COMISS/SD: EFLAGS = s1 (reg) against s2's low element (r/m: ld bytes); vvvv 1111b
+    EVK_INS,    // dst = reg = s1 (vvvv) with an element from a GPR (staged) or memory of ld bytes: VPINSR*, VMOVD/Q in
+    EVK_EXTR,   // r/m (a GPR, or memory of ld bytes) = an element of reg (evex_extr; gen_evex_extr_word)
+    EVK_SSTORE, // VMOVSS/SD 11: memory = reg's element 0 (masked); register: rm = s1 (vvvv) <- reg's, as EVK_SCAL
+};
+// evex_entry.flags bits 4-7
+#define EVF_MEMONLY 0x10
+#define EVF_REGONLY 0x20
+#define EVF_MIN256 0x40
+#define EVF_MIN512 0x80
+#define EVF_LEGACY 0x100
+#define EVF_NOVVVV 0x200        // vvvv must be 1111b (a one-source op into an opmask: VFPCLASS)
+#define EVF_L128 0x400          // EVEX.128 only: L'L must be 0 (the element moves)
+#define EVF_ZEROS1 0x800        // EVK_INS into zeros, not s1 (VMOVD/VMOVQ in): vvvv 1111b; word bit 46
+#define EVF_MEMNOVVVV 0x1000    // the memory form's vvvv must be 1111b (VMOVSS/SD's load)
+#define EVF_EXTR_SWAP 0x2000    // EVK_EXTR with the GPR in ModRM.reg and the source r/m (VPEXTRW 0F C5)        // SSE and VEX.128 only (AESIMC, AESKEYGENASSIST): EVEX, VEX.256 #UD
+enum evex_tuple { EVT_FV, EVT_FVM, EVT_FIX, EVT_DIV, EVT_DUP };  // DUP: VMOVDDUP's, 8 bytes at VL 128  // FIX: disp8 * the fixed size (ld); DIV: VL bytes >> ld
+struct evex_entry {
+    uint8_t map, pp, op;
+    uint8_t kind, wreq, esz, bcast, tuple, align, nomask;
+    void (*gadget)(void);
+    uint8_t grp;                // ModRM.reg + 1 for a group (the imm8 shifts), else 0
+    uint16_t flags;             // the frame's word bits 33-36 (s2's quarter 0, q & 1; merge s1; dst in), EVF_*
+    uint8_t ld;                 // a memory operand of this many bytes whatever VL (0: VL's)
+    uint8_t fp;                 // a float op: 1 with {er} (EVEX.b, register: RC in L'L), 2 {sae} only
+};
+#define EVEX_INT(X) \
+    X(1, 0xfc, 0, 0, 0, paddb) X(1, 0xfd, 0, 1, 0, paddw) X(1, 0xfe, 1, 2, 2, paddd) X(1, 0xd4, 2, 3, 3, paddq) \
+    X(1, 0xf8, 0, 0, 0, psubb) X(1, 0xf9, 0, 1, 0, psubw) X(1, 0xfa, 1, 2, 2, psubd) X(1, 0xfb, 2, 3, 3, psubq) \
+    X(1, 0xec, 0, 0, 0, paddsb) X(1, 0xed, 0, 1, 0, paddsw) X(1, 0xdc, 0, 0, 0, paddusb) X(1, 0xdd, 0, 1, 0, paddusw) \
+    X(1, 0xe8, 0, 0, 0, psubsb) X(1, 0xe9, 0, 1, 0, psubsw) X(1, 0xd8, 0, 0, 0, psubusb) X(1, 0xd9, 0, 1, 0, psubusw) \
+    X(1, 0xdb, 1, 2, 2, pand) X(1, 0xdb, 2, 3, 3, pand) X(1, 0xdf, 1, 2, 2, pandn) X(1, 0xdf, 2, 3, 3, pandn) \
+    X(1, 0xeb, 1, 2, 2, por) X(1, 0xeb, 2, 3, 3, por) X(1, 0xef, 1, 2, 2, pxor) X(1, 0xef, 2, 3, 3, pxor) \
+    X(1, 0xda, 0, 0, 0, pminub) X(1, 0xde, 0, 0, 0, pmaxub) X(1, 0xea, 0, 1, 0, pminsw) X(1, 0xee, 0, 1, 0, pmaxsw) \
+    X(1, 0xe0, 0, 0, 0, pavgb) X(1, 0xe3, 0, 1, 0, pavgw) X(1, 0xd5, 0, 1, 0, pmullw) X(1, 0xe5, 0, 1, 0, pmulhw) \
+    X(1, 0xe4, 0, 1, 0, pmulhuw) X(1, 0xf4, 2, 3, 3, pmuludq) X(1, 0xf5, 0, 2, 0, pmaddwd) \
+    X(1, 0x60, 0, 0, 0, punpcklbw) X(1, 0x61, 0, 1, 0, punpcklwd) X(1, 0x62, 1, 2, 2, punpckldq) \
+    X(1, 0x6c, 2, 3, 3, punpcklqdq) X(1, 0x68, 0, 0, 0, punpckhbw) X(1, 0x69, 0, 1, 0, punpckhwd) \
+    X(1, 0x6a, 1, 2, 2, punpckhdq) X(1, 0x6d, 2, 3, 3, punpckhqdq) X(1, 0x63, 0, 0, 0, packsswb) \
+    X(1, 0x67, 0, 0, 0, packuswb) X(1, 0x6b, 1, 1, 2, packssdw) \
+    X(2, 0x00, 0, 0, 0, pshufb) X(2, 0x04, 0, 1, 0, pmaddubsw) X(2, 0x0b, 0, 1, 0, pmulhrsw) \
+    X(2, 0x28, 2, 3, 3, pmuldq) X(2, 0x2b, 1, 1, 2, packusdw) X(2, 0x38, 0, 0, 0, pminsb) \
+    X(2, 0x39, 1, 2, 2, pminsd) X(2, 0x3a, 0, 1, 0, pminuw) X(2, 0x3b, 1, 2, 2, pminud) X(2, 0x3c, 0, 0, 0, pmaxsb) \
+    X(2, 0x3d, 1, 2, 2, pmaxsd) X(2, 0x3e, 0, 1, 0, pmaxuw) X(2, 0x3f, 1, 2, 2, pmaxud) X(2, 0x40, 1, 2, 2, pmulld)
+#define EVEX_INT_UN(X) X(2, 0x1c, 0, 0, 0, pabsb) X(2, 0x1d, 0, 1, 0, pabsw) X(2, 0x1e, 1, 2, 2, pabsd)
+#define EVEX_DECL(map, op, w, esz, bc, n) void aok_gadget_x86_evex_vi_##n(void);
+EVEX_INT(EVEX_DECL) EVEX_INT_UN(EVEX_DECL)
+void aok_gadget_x86_evex_mov(void), aok_gadget_x86_evex_vi_psadbw(void);
+void aok_gadget_x86_evex_compress0(void), aok_gadget_x86_evex_compress1(void), aok_gadget_x86_evex_compress2(void), aok_gadget_x86_evex_compress3(void), aok_gadget_x86_evex_expand0(void), aok_gadget_x86_evex_expand1(void), aok_gadget_x86_evex_expand2(void), aok_gadget_x86_evex_expand3(void), aok_gadget_x86_evex_pmov0xbd(void), aok_gadget_x86_evex_pmov0xbq(void), aok_gadget_x86_evex_pmov0xbw(void), aok_gadget_x86_evex_pmov0xdq(void), aok_gadget_x86_evex_pmov0xwd(void), aok_gadget_x86_evex_pmov0xwq(void), aok_gadget_x86_evex_pmov1xbd(void), aok_gadget_x86_evex_pmov1xbq(void), aok_gadget_x86_evex_pmov1xbw(void), aok_gadget_x86_evex_pmov1xdq(void), aok_gadget_x86_evex_pmov1xwd(void), aok_gadget_x86_evex_pmov1xwq(void), aok_gadget_x86_evex_pmov_sqxtn_db(void), aok_gadget_x86_evex_pmov_sqxtn_dw(void), aok_gadget_x86_evex_pmov_sqxtn_qb(void), aok_gadget_x86_evex_pmov_sqxtn_qd(void), aok_gadget_x86_evex_pmov_sqxtn_qw(void), aok_gadget_x86_evex_pmov_sqxtn_wb(void), aok_gadget_x86_evex_pmov_uqxtn_db(void), aok_gadget_x86_evex_pmov_uqxtn_dw(void), aok_gadget_x86_evex_pmov_uqxtn_qb(void), aok_gadget_x86_evex_pmov_uqxtn_qd(void), aok_gadget_x86_evex_pmov_uqxtn_qw(void), aok_gadget_x86_evex_pmov_uqxtn_wb(void), aok_gadget_x86_evex_pmov_xtn_db(void), aok_gadget_x86_evex_pmov_xtn_dw(void), aok_gadget_x86_evex_pmov_xtn_qb(void), aok_gadget_x86_evex_pmov_xtn_qd(void), aok_gadget_x86_evex_pmov_xtn_qw(void), aok_gadget_x86_evex_pmov_xtn_wb(void);
+void aok_gadget_x86_evex_fma_maddsub132ps(void), aok_gadget_x86_evex_fma_maddsub132pd(void), aok_gadget_x86_evex_fma_msubadd132ps(void), aok_gadget_x86_evex_fma_msubadd132pd(void), aok_gadget_x86_evex_fma_madd132ps(void), aok_gadget_x86_evex_fma_madd132pd(void), aok_gadget_x86_evex_fma_madd132ss(void), aok_gadget_x86_evex_fma_madd132sd(void), aok_gadget_x86_evex_fma_msub132ps(void), aok_gadget_x86_evex_fma_msub132pd(void), aok_gadget_x86_evex_fma_msub132ss(void), aok_gadget_x86_evex_fma_msub132sd(void), aok_gadget_x86_evex_fma_nmadd132ps(void), aok_gadget_x86_evex_fma_nmadd132pd(void), aok_gadget_x86_evex_fma_nmadd132ss(void), aok_gadget_x86_evex_fma_nmadd132sd(void), aok_gadget_x86_evex_fma_nmsub132ps(void), aok_gadget_x86_evex_fma_nmsub132pd(void), aok_gadget_x86_evex_fma_nmsub132ss(void), aok_gadget_x86_evex_fma_nmsub132sd(void), aok_gadget_x86_evex_fma_maddsub213ps(void), aok_gadget_x86_evex_fma_maddsub213pd(void), aok_gadget_x86_evex_fma_msubadd213ps(void), aok_gadget_x86_evex_fma_msubadd213pd(void), aok_gadget_x86_evex_fma_madd213ps(void), aok_gadget_x86_evex_fma_madd213pd(void), aok_gadget_x86_evex_fma_madd213ss(void), aok_gadget_x86_evex_fma_madd213sd(void), aok_gadget_x86_evex_fma_msub213ps(void), aok_gadget_x86_evex_fma_msub213pd(void), aok_gadget_x86_evex_fma_msub213ss(void), aok_gadget_x86_evex_fma_msub213sd(void), aok_gadget_x86_evex_fma_nmadd213ps(void), aok_gadget_x86_evex_fma_nmadd213pd(void), aok_gadget_x86_evex_fma_nmadd213ss(void), aok_gadget_x86_evex_fma_nmadd213sd(void), aok_gadget_x86_evex_fma_nmsub213ps(void), aok_gadget_x86_evex_fma_nmsub213pd(void), aok_gadget_x86_evex_fma_nmsub213ss(void), aok_gadget_x86_evex_fma_nmsub213sd(void), aok_gadget_x86_evex_fma_maddsub231ps(void), aok_gadget_x86_evex_fma_maddsub231pd(void), aok_gadget_x86_evex_fma_msubadd231ps(void), aok_gadget_x86_evex_fma_msubadd231pd(void), aok_gadget_x86_evex_fma_madd231ps(void), aok_gadget_x86_evex_fma_madd231pd(void), aok_gadget_x86_evex_fma_madd231ss(void), aok_gadget_x86_evex_fma_madd231sd(void), aok_gadget_x86_evex_fma_msub231ps(void), aok_gadget_x86_evex_fma_msub231pd(void), aok_gadget_x86_evex_fma_msub231ss(void), aok_gadget_x86_evex_fma_msub231sd(void), aok_gadget_x86_evex_fma_nmadd231ps(void), aok_gadget_x86_evex_fma_nmadd231pd(void), aok_gadget_x86_evex_fma_nmadd231ss(void), aok_gadget_x86_evex_fma_nmadd231sd(void), aok_gadget_x86_evex_fma_nmsub231ps(void), aok_gadget_x86_evex_fma_nmsub231pd(void), aok_gadget_x86_evex_fma_nmsub231ss(void), aok_gadget_x86_evex_fma_nmsub231sd(void);
+void aok_gadget_x86_evex_rcp14ps(void), aok_gadget_x86_evex_rcp14pd(void), aok_gadget_x86_evex_rcp14ss(void), aok_gadget_x86_evex_rcp14sd(void);
+void aok_gadget_x86_evex_rsqrt14ps(void), aok_gadget_x86_evex_rsqrt14pd(void), aok_gadget_x86_evex_rsqrt14ss(void), aok_gadget_x86_evex_rsqrt14sd(void);
+void aok_gadget_x86_evex_getexpps(void), aok_gadget_x86_evex_getexppd(void), aok_gadget_x86_evex_getexpss(void), aok_gadget_x86_evex_getexpsd(void);
+void aok_gadget_x86_evex_getmantps(void), aok_gadget_x86_evex_getmantpd(void), aok_gadget_x86_evex_getmantss(void), aok_gadget_x86_evex_getmantsd(void);
+void aok_gadget_x86_evex_rndscaleps(void), aok_gadget_x86_evex_rndscalepd(void), aok_gadget_x86_evex_rndscaless(void), aok_gadget_x86_evex_rndscalesd(void);
+void aok_gadget_x86_evex_reduceps(void), aok_gadget_x86_evex_reducepd(void), aok_gadget_x86_evex_reducess(void), aok_gadget_x86_evex_reducesd(void);
+void aok_gadget_x86_evex_scalefps(void), aok_gadget_x86_evex_scalefpd(void), aok_gadget_x86_evex_scalefss(void), aok_gadget_x86_evex_scalefsd(void);
+void aok_gadget_x86_evex_rangeps(void), aok_gadget_x86_evex_rangepd(void), aok_gadget_x86_evex_rangess(void), aok_gadget_x86_evex_rangesd(void);
+void aok_gadget_x86_evex_fpclassps(void), aok_gadget_x86_evex_fpclasspd(void), aok_gadget_x86_evex_fpclassss(void), aok_gadget_x86_evex_fpclasssd(void);
+void aok_gadget_x86_evex_fixupimmps(void), aok_gadget_x86_evex_fixupimmpd(void), aok_gadget_x86_evex_fixupimmss(void), aok_gadget_x86_evex_fixupimmsd(void);
+void aok_gadget_x86_evex_cvtdq2ps(void), aok_gadget_x86_evex_cvtudq2ps(void), aok_gadget_x86_evex_cvtqq2pd(void), aok_gadget_x86_evex_cvtuqq2pd(void), aok_gadget_x86_evex_cvtps2dq(void), aok_gadget_x86_evex_cvttps2dq(void), aok_gadget_x86_evex_cvtps2udq(void), aok_gadget_x86_evex_cvttps2udq(void), aok_gadget_x86_evex_cvtpd2qq(void), aok_gadget_x86_evex_cvttpd2qq(void), aok_gadget_x86_evex_cvtpd2uqq(void), aok_gadget_x86_evex_cvttpd2uqq(void);
+void aok_gadget_x86_evex_cvtps2pd(void), aok_gadget_x86_evex_cvtdq2pd(void), aok_gadget_x86_evex_cvtudq2pd(void), aok_gadget_x86_evex_cvtps2qq(void), aok_gadget_x86_evex_cvttps2qq(void), aok_gadget_x86_evex_cvtps2uqq(void), aok_gadget_x86_evex_cvttps2uqq(void), aok_gadget_x86_evex_cvtpd2ps(void), aok_gadget_x86_evex_cvtqq2ps(void), aok_gadget_x86_evex_cvtuqq2ps(void), aok_gadget_x86_evex_cvtpd2dq(void), aok_gadget_x86_evex_cvttpd2dq(void), aok_gadget_x86_evex_cvtpd2udq(void), aok_gadget_x86_evex_cvttpd2udq(void);
+void aok_gadget_x86_evex_cvtss2si32_0(void), aok_gadget_x86_evex_cvtss2si64_0(void), aok_gadget_x86_evex_cvtss2si32_1(void), aok_gadget_x86_evex_cvtss2si64_1(void), aok_gadget_x86_evex_cvttss2si32_0(void), aok_gadget_x86_evex_cvttss2si64_0(void), aok_gadget_x86_evex_cvttss2si32_1(void), aok_gadget_x86_evex_cvttss2si64_1(void), aok_gadget_x86_evex_cvtsi2ss32(void), aok_gadget_x86_evex_cvtsi2ss64(void), aok_gadget_x86_evex_cvtusi2ss32(void), aok_gadget_x86_evex_cvtusi2ss64(void), aok_gadget_x86_evex_cvtsd2si32_0(void), aok_gadget_x86_evex_cvtsd2si64_0(void), aok_gadget_x86_evex_cvtsd2si32_1(void), aok_gadget_x86_evex_cvtsd2si64_1(void), aok_gadget_x86_evex_cvttsd2si32_0(void), aok_gadget_x86_evex_cvttsd2si64_0(void), aok_gadget_x86_evex_cvttsd2si32_1(void), aok_gadget_x86_evex_cvttsd2si64_1(void), aok_gadget_x86_evex_cvtsi2sd32(void), aok_gadget_x86_evex_cvtsi2sd64(void), aok_gadget_x86_evex_cvtusi2sd32(void), aok_gadget_x86_evex_cvtusi2sd64(void), aok_gadget_x86_evex_cvtss2sd(void), aok_gadget_x86_evex_cvtsd2ss(void);
+void aok_gadget_x86_evex_cvtph2ps(void), aok_gadget_x86_evex_cvtps2ph(void);
+void aok_gadget_x86_evex_movsldup(void), aok_gadget_x86_evex_movshdup(void), aok_gadget_x86_evex_movddup(void), aok_gadget_x86_evex_bcastmb2q(void), aok_gadget_x86_evex_bcastmw2d(void), aok_gadget_x86_evex_comiss(void), aok_gadget_x86_evex_ucomiss(void), aok_gadget_x86_evex_comisd(void), aok_gadget_x86_evex_ucomisd(void);
+void aok_gadget_x86_evex_insb(void), aok_gadget_x86_evex_insw(void), aok_gadget_x86_evex_insd(void), aok_gadget_x86_evex_insq(void), aok_gadget_x86_evex_extrb(void), aok_gadget_x86_evex_extrw(void), aok_gadget_x86_evex_extrd(void), aok_gadget_x86_evex_extrq(void), aok_gadget_x86_evex_insertps(void), aok_gadget_x86_evex_movlo(void), aok_gadget_x86_evex_movhi(void), aok_gadget_x86_evex_hi2lo(void), aok_gadget_x86_evex_movss(void), aok_gadget_x86_evex_movsd(void), aok_gadget_x86_evex_movq0(void);
+void aok_gadget_x86_evex_dbpsadbw(void), aok_gadget_x86_evex_cvtneps2bf16(void), aok_gadget_x86_evex_cvtne2ps2bf16(void), aok_gadget_x86_evex_dpbf16ps(void);
+void aok_gadget_x86_evex_aesenc(void), aok_gadget_x86_evex_aesenclast(void), aok_gadget_x86_evex_aesdec(void), aok_gadget_x86_evex_aesdeclast(void), aok_gadget_x86_evex_aesimc(void), aok_gadget_x86_evex_aeskeygenassist(void), aok_gadget_x86_evex_pclmulqdq(void);
+void aok_gadget_x86_evex_pmultishiftqb(void), aok_gadget_x86_evex_pshldw(void), aok_gadget_x86_evex_pshldd(void), aok_gadget_x86_evex_pshldq(void), aok_gadget_x86_evex_pshrdw(void), aok_gadget_x86_evex_pshrdd(void), aok_gadget_x86_evex_pshrdq(void), aok_gadget_x86_evex_pshldvw(void), aok_gadget_x86_evex_pshldvd(void), aok_gadget_x86_evex_pshldvq(void), aok_gadget_x86_evex_pshrdvw(void), aok_gadget_x86_evex_pshrdvd(void), aok_gadget_x86_evex_pshrdvq(void), aok_gadget_x86_evex_pdpbusd(void), aok_gadget_x86_evex_pdpbusds(void), aok_gadget_x86_evex_pdpwssd(void), aok_gadget_x86_evex_pdpwssds(void), aok_gadget_x86_evex_pmadd52luq(void), aok_gadget_x86_evex_pmadd52huq(void), aok_gadget_x86_evex_popcntb(void), aok_gadget_x86_evex_popcntw(void), aok_gadget_x86_evex_pshufbitqmb(void), aok_gadget_x86_evex_gf2p8mulb(void), aok_gadget_x86_evex_gf2p8affineqb(void), aok_gadget_x86_evex_gf2p8affineinvqb(void);
+void aok_gadget_x86_evex_pconflictd(void), aok_gadget_x86_evex_pconflictq(void), aok_gadget_x86_evex_plzcntd(void), aok_gadget_x86_evex_plzcntq(void), aok_gadget_x86_evex_pmovb2m(void), aok_gadget_x86_evex_pmovd2m(void), aok_gadget_x86_evex_pmovm2b(void), aok_gadget_x86_evex_pmovm2d(void), aok_gadget_x86_evex_pmovm2q(void), aok_gadget_x86_evex_pmovm2w(void), aok_gadget_x86_evex_pmovq2m(void), aok_gadget_x86_evex_pmovw2m(void), aok_gadget_x86_evex_popcntd(void), aok_gadget_x86_evex_popcntq(void);
+void aok_gadget_x86_evex_alignd(void), aok_gadget_x86_evex_alignq(void), aok_gadget_x86_evex_extract(void), aok_gadget_x86_evex_insert(void), aok_gadget_x86_evex_palignr(void), aok_gadget_x86_evex_permb(void), aok_gadget_x86_evex_permd(void), aok_gadget_x86_evex_permi2b(void), aok_gadget_x86_evex_permi2d(void), aok_gadget_x86_evex_permi2q(void), aok_gadget_x86_evex_permi2w(void), aok_gadget_x86_evex_permilpd_i(void), aok_gadget_x86_evex_permilpd_v(void), aok_gadget_x86_evex_permilps_v(void), aok_gadget_x86_evex_permq(void), aok_gadget_x86_evex_permqi(void), aok_gadget_x86_evex_permt2b(void), aok_gadget_x86_evex_permt2d(void), aok_gadget_x86_evex_permt2q(void), aok_gadget_x86_evex_permt2w(void), aok_gadget_x86_evex_permw(void), aok_gadget_x86_evex_pshufd(void), aok_gadget_x86_evex_pshufhw(void), aok_gadget_x86_evex_pshuflw(void), aok_gadget_x86_evex_shuf4(void), aok_gadget_x86_evex_shufpd(void), aok_gadget_x86_evex_shufps(void);
+void aok_gadget_x86_evex_xf_addpd(void), aok_gadget_x86_evex_xf_addps(void), aok_gadget_x86_evex_xf_addsd(void), aok_gadget_x86_evex_xf_addss(void), aok_gadget_x86_evex_xf_cmppd(void), aok_gadget_x86_evex_xf_cmpps(void), aok_gadget_x86_evex_xf_cmpsd(void), aok_gadget_x86_evex_xf_cmpss(void), aok_gadget_x86_evex_xf_divpd(void), aok_gadget_x86_evex_xf_divps(void), aok_gadget_x86_evex_xf_divsd(void), aok_gadget_x86_evex_xf_divss(void), aok_gadget_x86_evex_xf_maxpd(void), aok_gadget_x86_evex_xf_maxps(void), aok_gadget_x86_evex_xf_maxsd(void), aok_gadget_x86_evex_xf_maxss(void), aok_gadget_x86_evex_xf_minpd(void), aok_gadget_x86_evex_xf_minps(void), aok_gadget_x86_evex_xf_minsd(void), aok_gadget_x86_evex_xf_minss(void), aok_gadget_x86_evex_xf_mulpd(void), aok_gadget_x86_evex_xf_mulps(void), aok_gadget_x86_evex_xf_mulsd(void), aok_gadget_x86_evex_xf_mulss(void), aok_gadget_x86_evex_xf_sqrtpd(void), aok_gadget_x86_evex_xf_sqrtps(void), aok_gadget_x86_evex_xf_sqrtsd(void), aok_gadget_x86_evex_xf_sqrtss(void), aok_gadget_x86_evex_xf_subpd(void), aok_gadget_x86_evex_xf_subps(void), aok_gadget_x86_evex_xf_subsd(void), aok_gadget_x86_evex_xf_subss(void);
+void aok_gadget_x86_evex_bcast_b(void), aok_gadget_x86_evex_bcast_d(void), aok_gadget_x86_evex_bcast_q(void), aok_gadget_x86_evex_bcast_w(void), aok_gadget_x86_evex_blendm(void), aok_gadget_x86_evex_pabsq(void), aok_gadget_x86_evex_pmaxsq(void), aok_gadget_x86_evex_pmaxuq(void), aok_gadget_x86_evex_pminsq(void), aok_gadget_x86_evex_pminuq(void), aok_gadget_x86_evex_pmullq(void), aok_gadget_x86_evex_pslldq(void), aok_gadget_x86_evex_psrldq(void), aok_gadget_x86_evex_pternlog(void), aok_gadget_x86_evex_roli_d(void), aok_gadget_x86_evex_roli_q(void), aok_gadget_x86_evex_rolv_d(void), aok_gadget_x86_evex_rolv_q(void), aok_gadget_x86_evex_rori_d(void), aok_gadget_x86_evex_rori_q(void), aok_gadget_x86_evex_rorv_d(void), aok_gadget_x86_evex_rorv_q(void), aok_gadget_x86_evex_shi_slld(void), aok_gadget_x86_evex_shi_sllq(void), aok_gadget_x86_evex_shi_sllw(void), aok_gadget_x86_evex_shi_srad(void), aok_gadget_x86_evex_shi_sraq(void), aok_gadget_x86_evex_shi_sraw(void), aok_gadget_x86_evex_shi_srld(void), aok_gadget_x86_evex_shi_srlq(void), aok_gadget_x86_evex_shi_srlw(void), aok_gadget_x86_evex_shv_slld(void), aok_gadget_x86_evex_shv_sllq(void), aok_gadget_x86_evex_shv_sllw(void), aok_gadget_x86_evex_shv_srad(void), aok_gadget_x86_evex_shv_sraq(void), aok_gadget_x86_evex_shv_sraw(void), aok_gadget_x86_evex_shv_srld(void), aok_gadget_x86_evex_shv_srlq(void), aok_gadget_x86_evex_shv_srlw(void), aok_gadget_x86_evex_shx_slld(void), aok_gadget_x86_evex_shx_sllq(void), aok_gadget_x86_evex_shx_sllw(void), aok_gadget_x86_evex_shx_srad(void), aok_gadget_x86_evex_shx_sraq(void), aok_gadget_x86_evex_shx_sraw(void), aok_gadget_x86_evex_shx_srld(void), aok_gadget_x86_evex_shx_srlq(void), aok_gadget_x86_evex_shx_srlw(void);
+void aok_gadget_x86_evex_pcmpeqb(void), aok_gadget_x86_evex_pcmpeqw(void), aok_gadget_x86_evex_pcmpeqd(void), aok_gadget_x86_evex_pcmpeqq(void), aok_gadget_x86_evex_pcmpgtb(void), aok_gadget_x86_evex_pcmpgtw(void), aok_gadget_x86_evex_pcmpgtd(void), aok_gadget_x86_evex_pcmpgtq(void), aok_gadget_x86_evex_pcmpb(void), aok_gadget_x86_evex_pcmpw(void), aok_gadget_x86_evex_pcmpd(void), aok_gadget_x86_evex_pcmpq(void), aok_gadget_x86_evex_pcmpub(void), aok_gadget_x86_evex_pcmpuw(void), aok_gadget_x86_evex_pcmpud(void), aok_gadget_x86_evex_pcmpuq(void), aok_gadget_x86_evex_ptestmb(void), aok_gadget_x86_evex_ptestmw(void), aok_gadget_x86_evex_ptestmd(void), aok_gadget_x86_evex_ptestmq(void), aok_gadget_x86_evex_ptestnmb(void), aok_gadget_x86_evex_ptestnmw(void), aok_gadget_x86_evex_ptestnmd(void), aok_gadget_x86_evex_ptestnmq(void);
+
+#define EVEX_ROW(map, op, w, esz, bc, n) {map, 1, op, EVK_L3, w, esz, bc, bc ? EVT_FV : EVT_FVM, 0, 0, aok_gadget_x86_evex_vi_##n, 0, 0, 0, 0},
+#define EVEX_ROW_UN(map, op, w, esz, bc, n) {map, 1, op, EVK_L2, w, esz, bc, bc ? EVT_FV : EVT_FVM, 0, 0, aok_gadget_x86_evex_vi_##n, 0, 0, 0, 0},
+static const struct evex_entry evex_table[] = {
+    // the moves: VMOVDQA32/64, VMOVDQU8/16/32/64, VMOVUPS/PD, VMOVAPS/PD
+    {1, 1, 0x6f, EVK_LOAD, 1, 2, 0, EVT_FVM, 1, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0}, {1, 1, 0x6f, EVK_LOAD, 2, 3, 0, EVT_FVM, 1, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0},
+    {1, 2, 0x6f, EVK_LOAD, 1, 2, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0}, {1, 2, 0x6f, EVK_LOAD, 2, 3, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0},
+    {1, 3, 0x6f, EVK_LOAD, 1, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0}, {1, 3, 0x6f, EVK_LOAD, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0},
+    {1, 1, 0x7f, EVK_STORE, 1, 2, 0, EVT_FVM, 1, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0}, {1, 1, 0x7f, EVK_STORE, 2, 3, 0, EVT_FVM, 1, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0},
+    {1, 2, 0x7f, EVK_STORE, 1, 2, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0}, {1, 2, 0x7f, EVK_STORE, 2, 3, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0},
+    {1, 3, 0x7f, EVK_STORE, 1, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0}, {1, 3, 0x7f, EVK_STORE, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0},
+    {1, 0, 0x10, EVK_LOAD, 1, 2, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0}, {1, 1, 0x10, EVK_LOAD, 2, 3, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0},
+    {1, 0, 0x11, EVK_STORE, 1, 2, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0}, {1, 1, 0x11, EVK_STORE, 2, 3, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0},
+    {1, 0, 0x28, EVK_LOAD, 1, 2, 0, EVT_FVM, 1, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0}, {1, 1, 0x28, EVK_LOAD, 2, 3, 0, EVT_FVM, 1, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0},
+    {1, 0, 0x29, EVK_STORE, 1, 2, 0, EVT_FVM, 1, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0}, {1, 1, 0x29, EVK_STORE, 2, 3, 0, EVT_FVM, 1, 0, aok_gadget_x86_evex_mov, 0, 0, 0, 0},
+    // the integer ops (vex.inc's bodies); VPSADBW takes no mask
+    EVEX_INT(EVEX_ROW) EVEX_INT_UN(EVEX_ROW_UN)
+    {1, 1, 0xf6, EVK_L3, 0, 3, 0, EVT_FVM, 0, 1, aok_gadget_x86_evex_vi_psadbw, 0, 0, 0, 0},
+    // the compares and tests into an opmask
+    {1, 1, 0x74, EVK_TOMASK, 0, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pcmpeqb, 0, 0, 0, 0},
+    {1, 1, 0x75, EVK_TOMASK, 0, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pcmpeqw, 0, 0, 0, 0},
+    {1, 1, 0x76, EVK_TOMASK, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_pcmpeqd, 0, 0, 0, 0},
+    {1, 1, 0x64, EVK_TOMASK, 0, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pcmpgtb, 0, 0, 0, 0},
+    {1, 1, 0x65, EVK_TOMASK, 0, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pcmpgtw, 0, 0, 0, 0},
+    {1, 1, 0x66, EVK_TOMASK, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_pcmpgtd, 0, 0, 0, 0},
+    {2, 1, 0x29, EVK_TOMASK, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pcmpeqq, 0, 0, 0, 0},
+    {2, 1, 0x37, EVK_TOMASK, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pcmpgtq, 0, 0, 0, 0},
+    {3, 1, 0x3f, EVK_TOMASK, 1, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pcmpb, 0, 0, 0, 0},
+    {3, 1, 0x3f, EVK_TOMASK, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pcmpw, 0, 0, 0, 0},
+    {3, 1, 0x3e, EVK_TOMASK, 1, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pcmpub, 0, 0, 0, 0},
+    {3, 1, 0x3e, EVK_TOMASK, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pcmpuw, 0, 0, 0, 0},
+    {3, 1, 0x1f, EVK_TOMASK, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_pcmpd, 0, 0, 0, 0},
+    {3, 1, 0x1f, EVK_TOMASK, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pcmpq, 0, 0, 0, 0},
+    {3, 1, 0x1e, EVK_TOMASK, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_pcmpud, 0, 0, 0, 0},
+    {3, 1, 0x1e, EVK_TOMASK, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pcmpuq, 0, 0, 0, 0},
+    {2, 1, 0x26, EVK_TOMASK, 1, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_ptestmb, 0, 0, 0, 0},
+    {2, 1, 0x26, EVK_TOMASK, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_ptestmw, 0, 0, 0, 0},
+    {2, 1, 0x27, EVK_TOMASK, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_ptestmd, 0, 0, 0, 0},
+    {2, 1, 0x27, EVK_TOMASK, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_ptestmq, 0, 0, 0, 0},
+    {2, 2, 0x26, EVK_TOMASK, 1, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_ptestnmb, 0, 0, 0, 0},
+    {2, 2, 0x26, EVK_TOMASK, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_ptestnmw, 0, 0, 0, 0},
+    {2, 2, 0x27, EVK_TOMASK, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_ptestnmd, 0, 0, 0, 0},
+    {2, 2, 0x27, EVK_TOMASK, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_ptestnmq, 0, 0, 0, 0},
+    // the shifts and rotates, the qword ops, VPTERNLOG, VPBLENDM, the broadcasts, the non-temporal moves
+    {1, 1, 0x71, EVK_SHI, 0, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_shi_srlw, 3, 0, 0, 0},
+    {1, 1, 0x71, EVK_SHI, 0, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_shi_sraw, 5, 0, 0, 0},
+    {1, 1, 0x71, EVK_SHI, 0, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_shi_sllw, 7, 0, 0, 0},
+    {1, 1, 0x72, EVK_SHI, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_rori_d, 1, 0, 0, 0},
+    {1, 1, 0x72, EVK_SHI, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_rori_q, 1, 0, 0, 0},
+    {1, 1, 0x72, EVK_SHI, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_roli_d, 2, 0, 0, 0},
+    {1, 1, 0x72, EVK_SHI, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_roli_q, 2, 0, 0, 0},
+    {1, 1, 0x72, EVK_SHI, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_shi_srld, 3, 0, 0, 0},
+    {1, 1, 0x72, EVK_SHI, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_shi_srad, 5, 0, 0, 0},
+    {1, 1, 0x72, EVK_SHI, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_shi_sraq, 5, 0, 0, 0},
+    {1, 1, 0x72, EVK_SHI, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_shi_slld, 7, 0, 0, 0},
+    {1, 1, 0x73, EVK_SHI, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_shi_srlq, 3, 0, 0, 0},
+    {1, 1, 0x73, EVK_SHI, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_shi_sllq, 7, 0, 0, 0},
+    {1, 1, 0x73, EVK_SHI, 0, 3, 0, EVT_FVM, 0, 1, aok_gadget_x86_evex_psrldq, 4, 0, 0, 0},
+    {1, 1, 0x73, EVK_SHI, 0, 3, 0, EVT_FVM, 0, 1, aok_gadget_x86_evex_pslldq, 8, 0, 0, 0},
+    {1, 1, 0xd1, EVK_L3, 0, 1, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_shx_srlw, 0, 1, 16, 0},
+    {1, 1, 0xd2, EVK_L3, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_shx_srld, 0, 1, 16, 0},
+    {1, 1, 0xd3, EVK_L3, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_shx_srlq, 0, 1, 16, 0},
+    {1, 1, 0xe1, EVK_L3, 0, 1, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_shx_sraw, 0, 1, 16, 0},
+    {1, 1, 0xe2, EVK_L3, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_shx_srad, 0, 1, 16, 0},
+    {1, 1, 0xe2, EVK_L3, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_shx_sraq, 0, 1, 16, 0},
+    {1, 1, 0xf1, EVK_L3, 0, 1, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_shx_sllw, 0, 1, 16, 0},
+    {1, 1, 0xf2, EVK_L3, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_shx_slld, 0, 1, 16, 0},
+    {1, 1, 0xf3, EVK_L3, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_shx_sllq, 0, 1, 16, 0},
+    {2, 1, 0x45, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_shv_srld, 0, 0, 0, 0},
+    {2, 1, 0x45, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_shv_srlq, 0, 0, 0, 0},
+    {2, 1, 0x46, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_shv_srad, 0, 0, 0, 0},
+    {2, 1, 0x46, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_shv_sraq, 0, 0, 0, 0},
+    {2, 1, 0x47, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_shv_slld, 0, 0, 0, 0},
+    {2, 1, 0x47, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_shv_sllq, 0, 0, 0, 0},
+    {2, 1, 0x10, EVK_L3, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_shv_srlw, 0, 0, 0, 0},
+    {2, 1, 0x11, EVK_L3, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_shv_sraw, 0, 0, 0, 0},
+    {2, 1, 0x12, EVK_L3, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_shv_sllw, 0, 0, 0, 0},
+    {2, 1, 0x15, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_rolv_d, 0, 0, 0, 0},
+    {2, 1, 0x15, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_rolv_q, 0, 0, 0, 0},
+    {2, 1, 0x14, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_rorv_d, 0, 0, 0, 0},
+    {2, 1, 0x14, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_rorv_q, 0, 0, 0, 0},
+    {2, 1, 0x39, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pminsq, 0, 0, 0, 0},
+    {2, 1, 0x3b, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pminuq, 0, 0, 0, 0},
+    {2, 1, 0x3d, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pmaxsq, 0, 0, 0, 0},
+    {2, 1, 0x3f, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pmaxuq, 0, 0, 0, 0},
+    {2, 1, 0x40, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pmullq, 0, 0, 0, 0},
+    {2, 1, 0x1f, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pabsq, 0, 0, 0, 0},
+    {3, 1, 0x25, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_pternlog, 0, 8, 0, 0},
+    {3, 1, 0x25, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pternlog, 0, 8, 0, 0},
+    {2, 1, 0x64, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_blendm, 0, 4, 0, 0},
+    {2, 1, 0x64, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_blendm, 0, 4, 0, 0},
+    {2, 1, 0x65, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_blendm, 0, 4, 0, 0},
+    {2, 1, 0x65, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_blendm, 0, 4, 0, 0},
+    {2, 1, 0x66, EVK_L3, 1, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_blendm, 0, 4, 0, 0},
+    {2, 1, 0x66, EVK_L3, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_blendm, 0, 4, 0, 0},
+    {2, 1, 0x78, EVK_BCAST, 1, 0, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_bcast_b, 0, 1, 1, 0},
+    {2, 1, 0x79, EVK_BCAST, 1, 1, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_bcast_w, 0, 1, 2, 0},
+    {2, 1, 0x58, EVK_BCAST, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_bcast_d, 0, 1, 4, 0},
+    {2, 1, 0x59, EVK_BCAST, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_bcast_q, 0, 1, 8, 0},
+    {2, 1, 0x59, EVK_BCAST, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_bcast_q, 0, 1, 8, 0},
+    {2, 1, 0x18, EVK_BCAST, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_bcast_d, 0, 1, 4, 0},
+    {2, 1, 0x19, EVK_BCAST, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_bcast_q, 0, 65, 8, 0},
+    {2, 1, 0x19, EVK_BCAST, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_bcast_q, 0, 65, 8, 0},
+    {2, 1, 0x5a, EVK_BCAST, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_mov, 0, 81, 16, 0},
+    {2, 1, 0x5a, EVK_BCAST, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_mov, 0, 81, 16, 0},
+    {2, 1, 0x1a, EVK_BCAST, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_mov, 0, 81, 16, 0},
+    {2, 1, 0x1a, EVK_BCAST, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_mov, 0, 81, 16, 0},
+    {2, 1, 0x5b, EVK_BCAST, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_mov, 0, 146, 32, 0},
+    {2, 1, 0x5b, EVK_BCAST, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_mov, 0, 146, 32, 0},
+    {2, 1, 0x1b, EVK_BCAST, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_mov, 0, 146, 32, 0},
+    {2, 1, 0x1b, EVK_BCAST, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_mov, 0, 146, 32, 0},
+    {2, 1, 0x7a, EVK_BCASTG, 1, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_bcast_b, 0, 33, 0, 0},
+    {2, 1, 0x7b, EVK_BCASTG, 1, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_bcast_w, 0, 33, 0, 0},
+    {2, 1, 0x7c, EVK_BCASTG, 1, 2, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_bcast_d, 0, 33, 0, 0},
+    {2, 1, 0x7c, EVK_BCASTG, 2, 3, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_bcast_q, 0, 33, 0, 0},
+    {1, 1, 0xe7, EVK_STORE, 1, 2, 0, EVT_FVM, 1, 1, aok_gadget_x86_evex_mov, 0, 16, 0, 0},
+    {1, 0, 0x2b, EVK_STORE, 1, 2, 0, EVT_FVM, 1, 1, aok_gadget_x86_evex_mov, 0, 16, 0, 0},
+    {1, 1, 0x2b, EVK_STORE, 2, 3, 0, EVT_FVM, 1, 1, aok_gadget_x86_evex_mov, 0, 16, 0, 0},
+    {2, 1, 0x2a, EVK_LOAD, 1, 2, 0, EVT_FVM, 1, 1, aok_gadget_x86_evex_mov, 0, 16, 0, 0},
+    // floating point
+    {1, 0, 0x58, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_xf_addps, 0, 0, 0, 1},
+    {1, 1, 0x58, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_xf_addpd, 0, 0, 0, 1},
+    {1, 2, 0x58, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_xf_addss, 0, 0, 4, 1},
+    {1, 3, 0x58, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_xf_addsd, 0, 0, 8, 1},
+    {1, 0, 0x59, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_xf_mulps, 0, 0, 0, 1},
+    {1, 1, 0x59, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_xf_mulpd, 0, 0, 0, 1},
+    {1, 2, 0x59, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_xf_mulss, 0, 0, 4, 1},
+    {1, 3, 0x59, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_xf_mulsd, 0, 0, 8, 1},
+    {1, 0, 0x5c, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_xf_subps, 0, 0, 0, 1},
+    {1, 1, 0x5c, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_xf_subpd, 0, 0, 0, 1},
+    {1, 2, 0x5c, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_xf_subss, 0, 0, 4, 1},
+    {1, 3, 0x5c, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_xf_subsd, 0, 0, 8, 1},
+    {1, 0, 0x5e, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_xf_divps, 0, 0, 0, 1},
+    {1, 1, 0x5e, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_xf_divpd, 0, 0, 0, 1},
+    {1, 2, 0x5e, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_xf_divss, 0, 0, 4, 1},
+    {1, 3, 0x5e, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_xf_divsd, 0, 0, 8, 1},
+    {1, 0, 0x5d, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_xf_minps, 0, 0, 0, 2},
+    {1, 1, 0x5d, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_xf_minpd, 0, 0, 0, 2},
+    {1, 2, 0x5d, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_xf_minss, 0, 0, 4, 2},
+    {1, 3, 0x5d, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_xf_minsd, 0, 0, 8, 2},
+    {1, 0, 0x5f, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_xf_maxps, 0, 0, 0, 2},
+    {1, 1, 0x5f, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_xf_maxpd, 0, 0, 0, 2},
+    {1, 2, 0x5f, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_xf_maxss, 0, 0, 4, 2},
+    {1, 3, 0x5f, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_xf_maxsd, 0, 0, 8, 2},
+    {1, 0, 0x51, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_xf_sqrtps, 0, 0, 0, 1},
+    {1, 1, 0x51, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_xf_sqrtpd, 0, 0, 0, 1},
+    {1, 2, 0x51, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_xf_sqrtss, 0, 0, 4, 1},
+    {1, 3, 0x51, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_xf_sqrtsd, 0, 0, 8, 1},
+    {1, 0, 0xc2, EVK_TOMASK, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_xf_cmpps, 0, 0, 0, 2},
+    {1, 1, 0xc2, EVK_TOMASK, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_xf_cmppd, 0, 0, 0, 2},
+    {1, 2, 0xc2, EVK_TOMASKS, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_xf_cmpss, 0, 0, 4, 2},
+    {1, 3, 0xc2, EVK_TOMASKS, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_xf_cmpsd, 0, 0, 8, 2},
+    // the lane-crossing ops (evex_full) and the in-lane shuffles
+    {2, 1, 0x36, EVK_FULL, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_permd, 0, 64, 0, 0},
+    {2, 1, 0x36, EVK_FULL, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_permq, 0, 64, 0, 0},
+    {2, 1, 0x16, EVK_FULL, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_permd, 0, 64, 0, 0},
+    {2, 1, 0x16, EVK_FULL, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_permq, 0, 64, 0, 0},
+    {2, 1, 0x8d, EVK_FULL, 1, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_permb, 0, 0, 0, 0},
+    {2, 1, 0x8d, EVK_FULL, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_permw, 0, 0, 0, 0},
+    {3, 1, 0x00, EVK_FULL1, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_permqi, 0, 64, 0, 0},
+    {3, 1, 0x01, EVK_FULL1, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_permqi, 0, 64, 0, 0},
+    {2, 1, 0x75, EVK_FULL, 1, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_permi2b, 0, 0, 0, 0},
+    {2, 1, 0x75, EVK_FULL, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_permi2w, 0, 0, 0, 0},
+    {2, 1, 0x7d, EVK_FULL, 1, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_permt2b, 0, 0, 0, 0},
+    {2, 1, 0x7d, EVK_FULL, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_permt2w, 0, 0, 0, 0},
+    {2, 1, 0x76, EVK_FULL, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_permi2d, 0, 0, 0, 0},
+    {2, 1, 0x76, EVK_FULL, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_permi2q, 0, 0, 0, 0},
+    {2, 1, 0x77, EVK_FULL, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_permi2d, 0, 0, 0, 0},
+    {2, 1, 0x77, EVK_FULL, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_permi2q, 0, 0, 0, 0},
+    {2, 1, 0x7e, EVK_FULL, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_permt2d, 0, 0, 0, 0},
+    {2, 1, 0x7e, EVK_FULL, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_permt2q, 0, 0, 0, 0},
+    {2, 1, 0x7f, EVK_FULL, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_permt2d, 0, 0, 0, 0},
+    {2, 1, 0x7f, EVK_FULL, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_permt2q, 0, 0, 0, 0},
+    {3, 1, 0x03, EVK_FULL, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_alignd, 0, 0, 0, 0},
+    {3, 1, 0x03, EVK_FULL, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_alignq, 0, 0, 0, 0},
+    {3, 1, 0x43, EVK_FULL, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_shuf4, 0, 64, 0, 0},
+    {3, 1, 0x43, EVK_FULL, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_shuf4, 0, 64, 0, 0},
+    {3, 1, 0x23, EVK_FULL, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_shuf4, 0, 64, 0, 0},
+    {3, 1, 0x23, EVK_FULL, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_shuf4, 0, 64, 0, 0},
+    {3, 1, 0x38, EVK_FULL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_insert, 0, 64, 16, 0},
+    {3, 1, 0x38, EVK_FULL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_insert, 0, 64, 16, 0},
+    {3, 1, 0x18, EVK_FULL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_insert, 0, 64, 16, 0},
+    {3, 1, 0x18, EVK_FULL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_insert, 0, 64, 16, 0},
+    {3, 1, 0x3a, EVK_FULL8, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_insert, 0, 128, 32, 0},
+    {3, 1, 0x3a, EVK_FULL8, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_insert, 0, 128, 32, 0},
+    {3, 1, 0x1a, EVK_FULL8, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_insert, 0, 128, 32, 0},
+    {3, 1, 0x1a, EVK_FULL8, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_insert, 0, 128, 32, 0},
+    {3, 1, 0x39, EVK_EXTRACT, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_extract, 0, 64, 16, 0},
+    {3, 1, 0x39, EVK_EXTRACT, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_extract, 0, 64, 16, 0},
+    {3, 1, 0x19, EVK_EXTRACT, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_extract, 0, 64, 16, 0},
+    {3, 1, 0x19, EVK_EXTRACT, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_extract, 0, 64, 16, 0},
+    {3, 1, 0x3b, EVK_EXTRACT8, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_extract, 0, 128, 32, 0},
+    {3, 1, 0x3b, EVK_EXTRACT8, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_extract, 0, 128, 32, 0},
+    {3, 1, 0x1b, EVK_EXTRACT8, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_extract, 0, 128, 32, 0},
+    {3, 1, 0x1b, EVK_EXTRACT8, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_extract, 0, 128, 32, 0},
+    {1, 1, 0x70, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_pshufd, 0, 0, 0, 0},
+    {1, 2, 0x70, EVK_L2, 0, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pshufhw, 0, 0, 0, 0},
+    {1, 3, 0x70, EVK_L2, 0, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pshuflw, 0, 0, 0, 0},
+    {1, 0, 0xc6, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_shufps, 0, 0, 0, 0},
+    {1, 1, 0xc6, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_shufpd, 0, 0, 0, 0},
+    {3, 1, 0x04, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_pshufd, 0, 0, 0, 0},
+    {3, 1, 0x05, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_permilpd_i, 0, 0, 0, 0},
+    {2, 1, 0x0c, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_permilps_v, 0, 0, 0, 0},
+    {2, 1, 0x0d, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_permilpd_v, 0, 0, 0, 0},
+    {3, 1, 0x0f, EVK_L3, 0, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_palignr, 0, 0, 0, 0},
+    {1, 0, 0x14, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_vi_punpckldq, 0, 0, 0, 0},
+    {1, 0, 0x15, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_vi_punpckhdq, 0, 0, 0, 0},
+    {1, 1, 0x14, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_vi_punpcklqdq, 0, 0, 0, 0},
+    {1, 1, 0x15, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_vi_punpckhqdq, 0, 0, 0, 0},
+    // VPLZCNT, VPOPCNT, VPCONFLICT, the mask <-> vector moves
+    {2, 1, 0x44, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_plzcntd, 0, 0, 0, 0},
+    {2, 1, 0x44, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_plzcntq, 0, 0, 0, 0},
+    {2, 1, 0x55, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_popcntd, 0, 0, 0, 0},
+    {2, 1, 0x55, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_popcntq, 0, 0, 0, 0},
+    {2, 1, 0xc4, EVK_FULL1, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_pconflictd, 0, 0, 0, 0},
+    {2, 1, 0xc4, EVK_FULL1, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pconflictq, 0, 0, 0, 0},
+    {2, 2, 0x29, EVK_V2M, 1, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pmovb2m, 0, 32, 0, 0},
+    {2, 2, 0x29, EVK_V2M, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pmovw2m, 0, 32, 0, 0},
+    {2, 2, 0x39, EVK_V2M, 1, 2, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pmovd2m, 0, 32, 0, 0},
+    {2, 2, 0x39, EVK_V2M, 2, 3, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pmovq2m, 0, 32, 0, 0},
+    {2, 2, 0x28, EVK_M2V, 1, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pmovm2b, 0, 32, 0, 0},
+    {2, 2, 0x28, EVK_M2V, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pmovm2w, 0, 32, 0, 0},
+    {2, 2, 0x38, EVK_M2V, 1, 2, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pmovm2d, 0, 32, 0, 0},
+    {2, 2, 0x38, EVK_M2V, 2, 3, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pmovm2q, 0, 32, 0, 0},
+    // the extends, the narrowing moves, compress and expand
+    {2, 1, 0x20, EVK_EXT, 0, 1, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov1xbw, 0, 0, 1, 0},
+    {2, 1, 0x21, EVK_EXT, 0, 2, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov1xbd, 0, 0, 2, 0},
+    {2, 1, 0x22, EVK_EXT, 0, 3, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov1xbq, 0, 0, 3, 0},
+    {2, 1, 0x23, EVK_EXT, 0, 2, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov1xwd, 0, 0, 1, 0},
+    {2, 1, 0x24, EVK_EXT, 0, 3, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov1xwq, 0, 0, 2, 0},
+    {2, 1, 0x25, EVK_EXT, 1, 3, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov1xdq, 0, 0, 1, 0},
+    {2, 1, 0x30, EVK_EXT, 0, 1, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov0xbw, 0, 0, 1, 0},
+    {2, 1, 0x31, EVK_EXT, 0, 2, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov0xbd, 0, 0, 2, 0},
+    {2, 1, 0x32, EVK_EXT, 0, 3, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov0xbq, 0, 0, 3, 0},
+    {2, 1, 0x33, EVK_EXT, 0, 2, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov0xwd, 0, 0, 1, 0},
+    {2, 1, 0x34, EVK_EXT, 0, 3, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov0xwq, 0, 0, 2, 0},
+    {2, 1, 0x35, EVK_EXT, 1, 3, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov0xdq, 0, 0, 1, 0},
+    {2, 2, 0x10, EVK_NARROW, 1, 0, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_uqxtn_wb, 0, 0, 1, 0},
+    {2, 2, 0x11, EVK_NARROW, 1, 0, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_uqxtn_db, 0, 0, 2, 0},
+    {2, 2, 0x12, EVK_NARROW, 1, 0, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_uqxtn_qb, 0, 0, 3, 0},
+    {2, 2, 0x13, EVK_NARROW, 1, 1, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_uqxtn_dw, 0, 0, 1, 0},
+    {2, 2, 0x14, EVK_NARROW, 1, 1, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_uqxtn_qw, 0, 0, 2, 0},
+    {2, 2, 0x15, EVK_NARROW, 1, 2, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_uqxtn_qd, 0, 0, 1, 0},
+    {2, 2, 0x20, EVK_NARROW, 1, 0, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_sqxtn_wb, 0, 0, 1, 0},
+    {2, 2, 0x21, EVK_NARROW, 1, 0, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_sqxtn_db, 0, 0, 2, 0},
+    {2, 2, 0x22, EVK_NARROW, 1, 0, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_sqxtn_qb, 0, 0, 3, 0},
+    {2, 2, 0x23, EVK_NARROW, 1, 1, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_sqxtn_dw, 0, 0, 1, 0},
+    {2, 2, 0x24, EVK_NARROW, 1, 1, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_sqxtn_qw, 0, 0, 2, 0},
+    {2, 2, 0x25, EVK_NARROW, 1, 2, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_sqxtn_qd, 0, 0, 1, 0},
+    {2, 2, 0x30, EVK_NARROW, 1, 0, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_xtn_wb, 0, 0, 1, 0},
+    {2, 2, 0x31, EVK_NARROW, 1, 0, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_xtn_db, 0, 0, 2, 0},
+    {2, 2, 0x32, EVK_NARROW, 1, 0, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_xtn_qb, 0, 0, 3, 0},
+    {2, 2, 0x33, EVK_NARROW, 1, 1, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_xtn_dw, 0, 0, 1, 0},
+    {2, 2, 0x34, EVK_NARROW, 1, 1, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_xtn_qw, 0, 0, 2, 0},
+    {2, 2, 0x35, EVK_NARROW, 1, 2, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_pmov_xtn_qd, 0, 0, 1, 0},
+    {2, 1, 0x8b, EVK_COMPRESS, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_compress2, 0, 0, 4, 0},
+    {2, 1, 0x8b, EVK_COMPRESS, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_compress3, 0, 0, 8, 0},
+    {2, 1, 0x8a, EVK_COMPRESS, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_compress2, 0, 0, 4, 0},
+    {2, 1, 0x8a, EVK_COMPRESS, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_compress3, 0, 0, 8, 0},
+    {2, 1, 0x63, EVK_COMPRESS, 1, 0, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_compress0, 0, 0, 1, 0},
+    {2, 1, 0x63, EVK_COMPRESS, 2, 1, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_compress1, 0, 0, 2, 0},
+    {2, 1, 0x89, EVK_EXPAND, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_expand2, 0, 0, 4, 0},
+    {2, 1, 0x89, EVK_EXPAND, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_expand3, 0, 0, 8, 0},
+    {2, 1, 0x88, EVK_EXPAND, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_expand2, 0, 0, 4, 0},
+    {2, 1, 0x88, EVK_EXPAND, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_expand3, 0, 0, 8, 0},
+    {2, 1, 0x62, EVK_EXPAND, 1, 0, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_expand0, 0, 0, 1, 0},
+    {2, 1, 0x62, EVK_EXPAND, 2, 1, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_expand1, 0, 0, 2, 0},
+    // gathers and scatters (gadgets picked by the guest: gen_evex_vsib_word)
+    {2, 1, 0x90, EVK_GATHER, 1, 2, 0, EVT_FIX, 0, 0, NULL, 0, 0, 4, 0},
+    {2, 1, 0x90, EVK_GATHER, 2, 3, 0, EVT_FIX, 0, 0, NULL, 0, 0, 8, 0},
+    {2, 1, 0x91, EVK_GATHER, 1, 2, 0, EVT_FIX, 0, 0, NULL, 0, 0, 4, 0},
+    {2, 1, 0x91, EVK_GATHER, 2, 3, 0, EVT_FIX, 0, 0, NULL, 0, 0, 8, 0},
+    {2, 1, 0x92, EVK_GATHER, 1, 2, 0, EVT_FIX, 0, 0, NULL, 0, 0, 4, 0},
+    {2, 1, 0x92, EVK_GATHER, 2, 3, 0, EVT_FIX, 0, 0, NULL, 0, 0, 8, 0},
+    {2, 1, 0x93, EVK_GATHER, 1, 2, 0, EVT_FIX, 0, 0, NULL, 0, 0, 4, 0},
+    {2, 1, 0x93, EVK_GATHER, 2, 3, 0, EVT_FIX, 0, 0, NULL, 0, 0, 8, 0},
+    {2, 1, 0xa0, EVK_SCATTER, 1, 2, 0, EVT_FIX, 0, 0, NULL, 0, 0, 4, 0},
+    {2, 1, 0xa0, EVK_SCATTER, 2, 3, 0, EVT_FIX, 0, 0, NULL, 0, 0, 8, 0},
+    {2, 1, 0xa1, EVK_SCATTER, 1, 2, 0, EVT_FIX, 0, 0, NULL, 0, 0, 4, 0},
+    {2, 1, 0xa1, EVK_SCATTER, 2, 3, 0, EVT_FIX, 0, 0, NULL, 0, 0, 8, 0},
+    {2, 1, 0xa2, EVK_SCATTER, 1, 2, 0, EVT_FIX, 0, 0, NULL, 0, 0, 4, 0},
+    {2, 1, 0xa2, EVK_SCATTER, 2, 3, 0, EVT_FIX, 0, 0, NULL, 0, 0, 8, 0},
+    {2, 1, 0xa3, EVK_SCATTER, 1, 2, 0, EVT_FIX, 0, 0, NULL, 0, 0, 4, 0},
+    {2, 1, 0xa3, EVK_SCATTER, 2, 3, 0, EVT_FIX, 0, 0, NULL, 0, 0, 8, 0},
+    // VBMI's VPMULTISHIFTQB, VBMI2's VPSHLD/VPSHRD(V), VNNI, IFMA, BITALG, GFNI
+    {2, 1, 0x83, EVK_L3, 2, 0, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pmultishiftqb, 0, 0, 0, 0},
+    {3, 1, 0x70, EVK_L3, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pshldw, 0, 0, 0, 0},
+    {3, 1, 0x71, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_pshldd, 0, 0, 0, 0},
+    {3, 1, 0x71, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pshldq, 0, 0, 0, 0},
+    {3, 1, 0x72, EVK_L3, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pshrdw, 0, 0, 0, 0},
+    {3, 1, 0x73, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_pshrdd, 0, 0, 0, 0},
+    {3, 1, 0x73, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pshrdq, 0, 0, 0, 0},
+    {2, 1, 0x70, EVK_L3, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pshldvw, 0, 8, 0, 0},
+    {2, 1, 0x71, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_pshldvd, 0, 8, 0, 0},
+    {2, 1, 0x71, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pshldvq, 0, 8, 0, 0},
+    {2, 1, 0x72, EVK_L3, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pshrdvw, 0, 8, 0, 0},
+    {2, 1, 0x73, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_pshrdvd, 0, 8, 0, 0},
+    {2, 1, 0x73, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pshrdvq, 0, 8, 0, 0},
+    {2, 1, 0x50, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_pdpbusd, 0, 8, 0, 0},
+    {2, 1, 0x51, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_pdpbusds, 0, 8, 0, 0},
+    {2, 1, 0x52, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_pdpwssd, 0, 8, 0, 0},
+    {2, 1, 0x53, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_pdpwssds, 0, 8, 0, 0},
+    {2, 1, 0xb4, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pmadd52luq, 0, 8, 0, 0},
+    {2, 1, 0xb5, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_pmadd52huq, 0, 8, 0, 0},
+    {2, 1, 0x54, EVK_L2, 1, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_popcntb, 0, 0, 0, 0},
+    {2, 1, 0x54, EVK_L2, 2, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_popcntw, 0, 0, 0, 0},
+    {2, 1, 0x8f, EVK_TOMASK, 1, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_pshufbitqmb, 0, 0, 0, 0},
+    {2, 1, 0xcf, EVK_L3, 1, 0, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_gf2p8mulb, 0, 0, 0, 0},
+    {3, 1, 0xce, EVK_L3, 2, 0, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_gf2p8affineqb, 0, 0, 0, 0},
+    {3, 1, 0xcf, EVK_L3, 2, 0, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_gf2p8affineinvqb, 0, 0, 0, 0},
+    // FMA: 132/213/231 (vex.inc fma_body; the destination in, word bit 36)
+    {2, 1, 0x96, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_maddsub132ps, 0, 8, 0, 1},
+    {2, 1, 0x96, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_maddsub132pd, 0, 8, 0, 1},
+    {2, 1, 0x97, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_msubadd132ps, 0, 8, 0, 1},
+    {2, 1, 0x97, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_msubadd132pd, 0, 8, 0, 1},
+    {2, 1, 0x98, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_madd132ps, 0, 8, 0, 1},
+    {2, 1, 0x98, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_madd132pd, 0, 8, 0, 1},
+    {2, 1, 0x99, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_madd132ss, 0, 8, 4, 1},
+    {2, 1, 0x99, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_madd132sd, 0, 8, 8, 1},
+    {2, 1, 0x9a, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_msub132ps, 0, 8, 0, 1},
+    {2, 1, 0x9a, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_msub132pd, 0, 8, 0, 1},
+    {2, 1, 0x9b, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_msub132ss, 0, 8, 4, 1},
+    {2, 1, 0x9b, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_msub132sd, 0, 8, 8, 1},
+    {2, 1, 0x9c, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_nmadd132ps, 0, 8, 0, 1},
+    {2, 1, 0x9c, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_nmadd132pd, 0, 8, 0, 1},
+    {2, 1, 0x9d, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_nmadd132ss, 0, 8, 4, 1},
+    {2, 1, 0x9d, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_nmadd132sd, 0, 8, 8, 1},
+    {2, 1, 0x9e, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_nmsub132ps, 0, 8, 0, 1},
+    {2, 1, 0x9e, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_nmsub132pd, 0, 8, 0, 1},
+    {2, 1, 0x9f, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_nmsub132ss, 0, 8, 4, 1},
+    {2, 1, 0x9f, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_nmsub132sd, 0, 8, 8, 1},
+    {2, 1, 0xa6, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_maddsub213ps, 0, 8, 0, 1},
+    {2, 1, 0xa6, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_maddsub213pd, 0, 8, 0, 1},
+    {2, 1, 0xa7, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_msubadd213ps, 0, 8, 0, 1},
+    {2, 1, 0xa7, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_msubadd213pd, 0, 8, 0, 1},
+    {2, 1, 0xa8, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_madd213ps, 0, 8, 0, 1},
+    {2, 1, 0xa8, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_madd213pd, 0, 8, 0, 1},
+    {2, 1, 0xa9, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_madd213ss, 0, 8, 4, 1},
+    {2, 1, 0xa9, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_madd213sd, 0, 8, 8, 1},
+    {2, 1, 0xaa, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_msub213ps, 0, 8, 0, 1},
+    {2, 1, 0xaa, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_msub213pd, 0, 8, 0, 1},
+    {2, 1, 0xab, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_msub213ss, 0, 8, 4, 1},
+    {2, 1, 0xab, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_msub213sd, 0, 8, 8, 1},
+    {2, 1, 0xac, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_nmadd213ps, 0, 8, 0, 1},
+    {2, 1, 0xac, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_nmadd213pd, 0, 8, 0, 1},
+    {2, 1, 0xad, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_nmadd213ss, 0, 8, 4, 1},
+    {2, 1, 0xad, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_nmadd213sd, 0, 8, 8, 1},
+    {2, 1, 0xae, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_nmsub213ps, 0, 8, 0, 1},
+    {2, 1, 0xae, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_nmsub213pd, 0, 8, 0, 1},
+    {2, 1, 0xaf, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_nmsub213ss, 0, 8, 4, 1},
+    {2, 1, 0xaf, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_nmsub213sd, 0, 8, 8, 1},
+    {2, 1, 0xb6, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_maddsub231ps, 0, 8, 0, 1},
+    {2, 1, 0xb6, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_maddsub231pd, 0, 8, 0, 1},
+    {2, 1, 0xb7, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_msubadd231ps, 0, 8, 0, 1},
+    {2, 1, 0xb7, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_msubadd231pd, 0, 8, 0, 1},
+    {2, 1, 0xb8, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_madd231ps, 0, 8, 0, 1},
+    {2, 1, 0xb8, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_madd231pd, 0, 8, 0, 1},
+    {2, 1, 0xb9, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_madd231ss, 0, 8, 4, 1},
+    {2, 1, 0xb9, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_madd231sd, 0, 8, 8, 1},
+    {2, 1, 0xba, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_msub231ps, 0, 8, 0, 1},
+    {2, 1, 0xba, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_msub231pd, 0, 8, 0, 1},
+    {2, 1, 0xbb, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_msub231ss, 0, 8, 4, 1},
+    {2, 1, 0xbb, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_msub231sd, 0, 8, 8, 1},
+    {2, 1, 0xbc, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_nmadd231ps, 0, 8, 0, 1},
+    {2, 1, 0xbc, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_nmadd231pd, 0, 8, 0, 1},
+    {2, 1, 0xbd, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_nmadd231ss, 0, 8, 4, 1},
+    {2, 1, 0xbd, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_nmadd231sd, 0, 8, 8, 1},
+    {2, 1, 0xbe, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_nmsub231ps, 0, 8, 0, 1},
+    {2, 1, 0xbe, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fma_nmsub231pd, 0, 8, 0, 1},
+    {2, 1, 0xbf, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_nmsub231ss, 0, 8, 4, 1},
+    {2, 1, 0xbf, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fma_nmsub231sd, 0, 8, 8, 1},
+    // VGETEXP ({sae})
+    {2, 1, 0x4c, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_rcp14ps, 0, 0, 0, 0},
+    {2, 1, 0x4c, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_rcp14pd, 0, 0, 0, 0},
+    {2, 1, 0x4d, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_rcp14ss, 0, 0, 4, 0},
+    {2, 1, 0x4d, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_rcp14sd, 0, 0, 8, 0},
+    {2, 1, 0x4e, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_rsqrt14ps, 0, 0, 0, 0},
+    {2, 1, 0x4e, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_rsqrt14pd, 0, 0, 0, 0},
+    {2, 1, 0x4f, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_rsqrt14ss, 0, 0, 4, 0},
+    {2, 1, 0x4f, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_rsqrt14sd, 0, 0, 8, 0},
+    {2, 1, 0x42, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_getexpps, 0, 0, 0, 2},
+    {2, 1, 0x42, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_getexppd, 0, 0, 0, 2},
+    {2, 1, 0x43, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_getexpss, 0, 0, 4, 2},
+    {2, 1, 0x43, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_getexpsd, 0, 0, 8, 2},
+    // VGETMANT (imm8, {sae})
+    {3, 1, 0x26, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_getmantps, 0, 0, 0, 2},
+    {3, 1, 0x26, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_getmantpd, 0, 0, 0, 2},
+    {3, 1, 0x27, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_getmantss, 0, 0, 4, 2},
+    {3, 1, 0x27, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_getmantsd, 0, 0, 8, 2},
+    // VRNDSCALE (imm8, {sae})
+    {3, 1, 0x08, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_rndscaleps, 0, 0, 0, 2},
+    {3, 1, 0x09, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_rndscalepd, 0, 0, 0, 2},
+    {3, 1, 0x0a, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_rndscaless, 0, 0, 4, 2},
+    {3, 1, 0x0b, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_rndscalesd, 0, 0, 8, 2},
+    // VREDUCE (imm8, {sae})
+    {3, 1, 0x56, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_reduceps, 0, 0, 0, 2},
+    {3, 1, 0x56, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_reducepd, 0, 0, 0, 2},
+    {3, 1, 0x57, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_reducess, 0, 0, 4, 2},
+    {3, 1, 0x57, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_reducesd, 0, 0, 8, 2},
+    // VSCALEF ({er})
+    {2, 1, 0x2c, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_scalefps, 0, 0, 0, 1},
+    {2, 1, 0x2c, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_scalefpd, 0, 0, 0, 1},
+    {2, 1, 0x2d, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_scalefss, 0, 0, 4, 1},
+    {2, 1, 0x2d, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_scalefsd, 0, 0, 8, 1},
+    // VRANGE (imm8, {sae})
+    {3, 1, 0x50, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_rangeps, 0, 0, 0, 2},
+    {3, 1, 0x50, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_rangepd, 0, 0, 0, 2},
+    {3, 1, 0x51, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_rangess, 0, 0, 4, 2},
+    {3, 1, 0x51, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_rangesd, 0, 0, 8, 2},
+    // VFPCLASS (into an opmask; no flags)
+    {3, 1, 0x66, EVK_TOMASK, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fpclassps, 0, EVF_NOVVVV, 0, 0},
+    {3, 1, 0x66, EVK_TOMASK, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fpclasspd, 0, EVF_NOVVVV, 0, 0},
+    {3, 1, 0x67, EVK_TOMASKS, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fpclassss, 0, EVF_NOVVVV, 4, 0},
+    {3, 1, 0x67, EVK_TOMASKS, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fpclasssd, 0, EVF_NOVVVV, 8, 0},
+    // VFIXUPIMM (imm8, {sae}; the destination an operand)
+    {3, 1, 0x54, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_fixupimmps, 0, 8, 0, 2},
+    {3, 1, 0x54, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_fixupimmpd, 0, 8, 0, 2},
+    {3, 1, 0x55, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fixupimmss, 0, 8, 4, 2},
+    {3, 1, 0x55, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_fixupimmsd, 0, 8, 8, 2},
+    // conversions, the same width: VCVT(U)DQ2PS, VCVT(U)QQ2PD ({er}); VCVT(T)PS2(U)DQ, VCVT(T)PD2(U)QQ
+    {1, 0, 0x5b, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_cvtdq2ps, 0, 0, 0, 1},
+    {1, 3, 0x7a, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_cvtudq2ps, 0, 0, 0, 1},
+    {1, 2, 0xe6, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_cvtqq2pd, 0, 0, 0, 1},
+    {1, 2, 0x7a, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_cvtuqq2pd, 0, 0, 0, 1},
+    {1, 1, 0x5b, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_cvtps2dq, 0, 0, 0, 1},
+    {1, 2, 0x5b, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_cvttps2dq, 0, 0, 0, 2},
+    {1, 0, 0x79, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_cvtps2udq, 0, 0, 0, 1},
+    {1, 0, 0x78, EVK_L2, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_cvttps2udq, 0, 0, 0, 2},
+    {1, 1, 0x7b, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_cvtpd2qq, 0, 0, 0, 1},
+    {1, 1, 0x7a, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_cvttpd2qq, 0, 0, 0, 2},
+    {1, 1, 0x79, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_cvtpd2uqq, 0, 0, 0, 1},
+    {1, 1, 0x78, EVK_L2, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_cvttpd2uqq, 0, 0, 0, 2},
+    // conversions that widen (from VL / 2) or narrow (to VL / 2): evex_cvtw/cvtn
+    {1, 0, 0x5a, EVK_CVTW, 1, 3, 2, EVT_DIV, 0, 0, aok_gadget_x86_evex_cvtps2pd, 0, 0, 1, 2},
+    {1, 2, 0xe6, EVK_CVTW, 1, 3, 2, EVT_DIV, 0, 0, aok_gadget_x86_evex_cvtdq2pd, 0, 0, 1, 0},
+    {1, 2, 0x7a, EVK_CVTW, 1, 3, 2, EVT_DIV, 0, 0, aok_gadget_x86_evex_cvtudq2pd, 0, 0, 1, 0},
+    {1, 1, 0x7b, EVK_CVTW, 1, 3, 2, EVT_DIV, 0, 0, aok_gadget_x86_evex_cvtps2qq, 0, 0, 1, 1},
+    {1, 1, 0x7a, EVK_CVTW, 1, 3, 2, EVT_DIV, 0, 0, aok_gadget_x86_evex_cvttps2qq, 0, 0, 1, 2},
+    {1, 1, 0x79, EVK_CVTW, 1, 3, 2, EVT_DIV, 0, 0, aok_gadget_x86_evex_cvtps2uqq, 0, 0, 1, 1},
+    {1, 1, 0x78, EVK_CVTW, 1, 3, 2, EVT_DIV, 0, 0, aok_gadget_x86_evex_cvttps2uqq, 0, 0, 1, 2},
+    {1, 1, 0x5a, EVK_CVTN, 2, 2, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_cvtpd2ps, 0, 0, 0, 1},
+    {1, 0, 0x5b, EVK_CVTN, 2, 2, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_cvtqq2ps, 0, 0, 0, 1},
+    {1, 3, 0x7a, EVK_CVTN, 2, 2, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_cvtuqq2ps, 0, 0, 0, 1},
+    {1, 3, 0xe6, EVK_CVTN, 2, 2, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_cvtpd2dq, 0, 0, 0, 1},
+    {1, 1, 0xe6, EVK_CVTN, 2, 2, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_cvttpd2dq, 0, 0, 0, 2},
+    {1, 0, 0x79, EVK_CVTN, 2, 2, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_cvtpd2udq, 0, 0, 0, 1},
+    {1, 0, 0x78, EVK_CVTN, 2, 2, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_cvttpd2udq, 0, 0, 0, 2},
+    // scalar conversions: to and from general registers, SS <-> SD
+    {1, 2, 0x2d, EVK_CVT2GPR, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvtss2si32_0, 0, 0, 4, 1},
+    {1, 2, 0x2d, EVK_CVT2GPR, 2, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvtss2si64_0, 0, 0, 4, 1},
+    {1, 2, 0x79, EVK_CVT2GPR, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvtss2si32_1, 0, 0, 4, 1},
+    {1, 2, 0x79, EVK_CVT2GPR, 2, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvtss2si64_1, 0, 0, 4, 1},
+    {1, 2, 0x2c, EVK_CVT2GPR, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvttss2si32_0, 0, 0, 4, 2},
+    {1, 2, 0x2c, EVK_CVT2GPR, 2, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvttss2si64_0, 0, 0, 4, 2},
+    {1, 2, 0x78, EVK_CVT2GPR, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvttss2si32_1, 0, 0, 4, 2},
+    {1, 2, 0x78, EVK_CVT2GPR, 2, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvttss2si64_1, 0, 0, 4, 2},
+    {1, 2, 0x2a, EVK_CVTSI, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvtsi2ss32, 0, 0, 4, 1},
+    {1, 2, 0x2a, EVK_CVTSI, 2, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvtsi2ss64, 0, 0, 8, 1},
+    {1, 2, 0x7b, EVK_CVTSI, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvtusi2ss32, 0, 0, 4, 1},
+    {1, 2, 0x7b, EVK_CVTSI, 2, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvtusi2ss64, 0, 0, 8, 1},
+    {1, 3, 0x2d, EVK_CVT2GPR, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvtsd2si32_0, 0, 0, 8, 1},
+    {1, 3, 0x2d, EVK_CVT2GPR, 2, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvtsd2si64_0, 0, 0, 8, 1},
+    {1, 3, 0x79, EVK_CVT2GPR, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvtsd2si32_1, 0, 0, 8, 1},
+    {1, 3, 0x79, EVK_CVT2GPR, 2, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvtsd2si64_1, 0, 0, 8, 1},
+    {1, 3, 0x2c, EVK_CVT2GPR, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvttsd2si32_0, 0, 0, 8, 2},
+    {1, 3, 0x2c, EVK_CVT2GPR, 2, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvttsd2si64_0, 0, 0, 8, 2},
+    {1, 3, 0x78, EVK_CVT2GPR, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvttsd2si32_1, 0, 0, 8, 2},
+    {1, 3, 0x78, EVK_CVT2GPR, 2, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvttsd2si64_1, 0, 0, 8, 2},
+    {1, 3, 0x2a, EVK_CVTSI, 1, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvtsi2sd32, 0, 0, 4, 0},
+    {1, 3, 0x2a, EVK_CVTSI, 2, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvtsi2sd64, 0, 0, 8, 1},
+    {1, 3, 0x7b, EVK_CVTSI, 1, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvtusi2sd32, 0, 0, 4, 0},
+    {1, 3, 0x7b, EVK_CVTSI, 2, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_cvtusi2sd64, 0, 0, 8, 1},
+    {1, 2, 0x5a, EVK_SCAL, 1, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_cvtss2sd, 0, 0, 4, 2},
+    {1, 3, 0x5a, EVK_SCAL, 2, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_cvtsd2ss, 0, 0, 8, 1},
+    // VCVTPH2PS ({sae}), VCVTPS2PH (imm8, {sae}; to a register or memory)
+    {2, 1, 0x13, EVK_CVTW, 1, 2, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_cvtph2ps, 0, 0, 1, 2},
+    {3, 1, 0x1d, EVK_CVTNR, 1, 1, 0, EVT_DIV, 0, 0, aok_gadget_x86_evex_cvtps2ph, 0, 0, 1, 2},
+    // AVX512DQ's float logic: the integer ops at the float element sizes
+    {1, 0, 0x54, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_vi_pand, 0, 0, 0, 0},
+    {1, 1, 0x54, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_vi_pand, 0, 0, 0, 0},
+    {1, 0, 0x55, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_vi_pandn, 0, 0, 0, 0},
+    {1, 1, 0x55, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_vi_pandn, 0, 0, 0, 0},
+    {1, 0, 0x56, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_vi_por, 0, 0, 0, 0},
+    {1, 1, 0x56, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_vi_por, 0, 0, 0, 0},
+    {1, 0, 0x57, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_vi_pxor, 0, 0, 0, 0},
+    {1, 1, 0x57, EVK_L3, 2, 3, 3, EVT_FV, 0, 0, aok_gadget_x86_evex_vi_pxor, 0, 0, 0, 0},
+    // VMOVSLDUP/SHDUP/DDUP; VPBROADCASTMB2Q/MW2D; (V)(U)COMISS/SD ({sae})
+    {1, 2, 0x12, EVK_L2, 1, 2, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_movsldup, 0, 0, 0, 0},
+    {1, 2, 0x16, EVK_L2, 1, 2, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_movshdup, 0, 0, 0, 0},
+    {1, 3, 0x12, EVK_L2, 2, 3, 0, EVT_DUP, 0, 0, aok_gadget_x86_evex_movddup, 0, 0, 0, 0},
+    {2, 2, 0x2a, EVK_M2V, 2, 3, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_bcastmb2q, 0, 32, 0, 0},
+    {2, 2, 0x3a, EVK_M2V, 1, 2, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_bcastmw2d, 0, 32, 0, 0},
+    {1, 0, 0x2f, EVK_FLAGS, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_comiss, 0, 0, 4, 2},
+    {1, 0, 0x2e, EVK_FLAGS, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_ucomiss, 0, 0, 4, 2},
+    {1, 1, 0x2f, EVK_FLAGS, 2, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_comisd, 0, 0, 8, 2},
+    {1, 1, 0x2e, EVK_FLAGS, 2, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_ucomisd, 0, 0, 8, 2},
+    // the EVEX.128 element moves: VMOVSS/SD, VMOVLPS/HPS/LPD/HPD/HLPS/LHPS, VMOVD/VMOVQ, VPINSR*, VPEXTR*,
+    // VEXTRACTPS, VINSERTPS
+    {1, 2, 0x10, EVK_SCAL, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_movss, 0, EVF_MEMNOVVVV, 4, 0},
+    {1, 3, 0x10, EVK_SCAL, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_movsd, 0, EVF_MEMNOVVVV, 8, 0},
+    {1, 2, 0x11, EVK_SSTORE, 1, 2, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_movss, 0, 0, 4, 0},
+    {1, 3, 0x11, EVK_SSTORE, 2, 3, 0, EVT_FIX, 0, 0, aok_gadget_x86_evex_movsd, 0, 0, 8, 0},
+    {1, 0, 0x12, EVK_L3, 1, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_movlo, 0, EVF_L128, 8, 0},
+    {1, 1, 0x12, EVK_L3, 2, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_movlo, 0, EVF_L128 | EVF_MEMONLY, 8, 0},
+    {1, 0, 0x13, EVK_STORE, 1, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_mov, 0, EVF_L128 | EVF_MEMONLY, 8, 0},
+    {1, 1, 0x13, EVK_STORE, 2, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_mov, 0, EVF_L128 | EVF_MEMONLY, 8, 0},
+    {1, 0, 0x16, EVK_L3, 1, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_movhi, 0, EVF_L128, 8, 0},
+    {1, 1, 0x16, EVK_L3, 2, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_movhi, 0, EVF_L128 | EVF_MEMONLY, 8, 0},
+    {1, 0, 0x17, EVK_STORE, 1, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_hi2lo, 0, EVF_L128 | EVF_MEMONLY, 8, 0},
+    {1, 1, 0x17, EVK_STORE, 2, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_hi2lo, 0, EVF_L128 | EVF_MEMONLY, 8, 0},
+    {1, 1, 0x6e, EVK_INS, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_insd, 0, EVF_L128 | EVF_ZEROS1, 4, 0},
+    {1, 1, 0x6e, EVK_INS, 2, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_insq, 0, EVF_L128 | EVF_ZEROS1, 8, 0},
+    {1, 1, 0x7e, EVK_EXTR, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_extrd, 0, EVF_L128, 4, 0},
+    {1, 1, 0x7e, EVK_EXTR, 2, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_extrq, 0, EVF_L128, 8, 0},
+    {1, 2, 0x7e, EVK_L2, 2, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_movq0, 0, EVF_L128, 8, 0},
+    {1, 1, 0xd6, EVK_STORE, 2, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_movq0, 0, EVF_L128, 8, 0},
+    {1, 1, 0xc4, EVK_INS, 1, 1, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_insw, 0, EVF_L128, 2, 0},
+    {1, 1, 0xc5, EVK_EXTR, 1, 1, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_extrw, 0, EVF_L128 | EVF_REGONLY | EVF_EXTR_SWAP, 2, 0},
+    {3, 1, 0x14, EVK_EXTR, 1, 0, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_extrb, 0, EVF_L128, 1, 0},
+    {3, 1, 0x15, EVK_EXTR, 1, 1, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_extrw, 0, EVF_L128, 2, 0},
+    {3, 1, 0x17, EVK_EXTR, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_extrd, 0, EVF_L128, 4, 0},
+    {3, 1, 0x20, EVK_INS, 1, 0, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_insb, 0, EVF_L128, 1, 0},
+    {1, 1, 0xc4, EVK_INS, 2, 1, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_insw, 0, EVF_L128, 2, 0},
+    {1, 1, 0xc5, EVK_EXTR, 2, 1, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_extrw, 0, EVF_L128 | EVF_REGONLY | EVF_EXTR_SWAP, 2, 0},
+    {3, 1, 0x14, EVK_EXTR, 2, 0, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_extrb, 0, EVF_L128, 1, 0},
+    {3, 1, 0x15, EVK_EXTR, 2, 1, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_extrw, 0, EVF_L128, 2, 0},
+    {3, 1, 0x17, EVK_EXTR, 2, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_extrd, 0, EVF_L128, 4, 0},
+    {3, 1, 0x20, EVK_INS, 2, 0, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_insb, 0, EVF_L128, 1, 0},
+    {3, 1, 0x16, EVK_EXTR, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_extrd, 0, EVF_L128, 4, 0},
+    {3, 1, 0x16, EVK_EXTR, 2, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_extrq, 0, EVF_L128, 8, 0},
+    {3, 1, 0x21, EVK_L3, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_insertps, 0, EVF_L128, 4, 0},
+    {3, 1, 0x22, EVK_INS, 1, 2, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_insd, 0, EVF_L128, 4, 0},
+    {3, 1, 0x22, EVK_INS, 2, 3, 0, EVT_FIX, 0, 1, aok_gadget_x86_evex_insq, 0, EVF_L128, 8, 0},
+    // VDBPSADBW; BF16: VCVTNEPS2BF16, VCVTNE2PS2BF16, VDPBF16PS
+    {3, 1, 0x42, EVK_L3, 1, 1, 0, EVT_FVM, 0, 0, aok_gadget_x86_evex_dbpsadbw, 0, 0, 0, 0},
+    {2, 2, 0x72, EVK_CVTN, 1, 1, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_cvtneps2bf16, 0, 0, 0, 0},
+    {2, 3, 0x72, EVK_FULL, 1, 1, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_cvtne2ps2bf16, 0, 0, 0, 0},
+    {2, 2, 0x52, EVK_L3, 1, 2, 2, EVT_FV, 0, 0, aok_gadget_x86_evex_dpbf16ps, 0, 8, 0, 0},
+    // AES and PCLMULQDQ (VAES, VPCLMULQDQ; the SSE and VEX forms through vex_to_evex)
+    {2, 1, 0xdc, EVK_L3, 0, 2, 0, EVT_FVM, 0, 1, aok_gadget_x86_evex_aesenc, 0, 0, 0, 0},
+    {2, 1, 0xdd, EVK_L3, 0, 2, 0, EVT_FVM, 0, 1, aok_gadget_x86_evex_aesenclast, 0, 0, 0, 0},
+    {2, 1, 0xde, EVK_L3, 0, 2, 0, EVT_FVM, 0, 1, aok_gadget_x86_evex_aesdec, 0, 0, 0, 0},
+    {2, 1, 0xdf, EVK_L3, 0, 2, 0, EVT_FVM, 0, 1, aok_gadget_x86_evex_aesdeclast, 0, 0, 0, 0},
+    {2, 1, 0xdb, EVK_L2, 0, 2, 0, EVT_FVM, 0, 1, aok_gadget_x86_evex_aesimc, 0, EVF_LEGACY, 0, 0},
+    {3, 1, 0xdf, EVK_L2, 0, 2, 0, EVT_FVM, 0, 1, aok_gadget_x86_evex_aeskeygenassist, 0, EVF_LEGACY, 0, 0},
+    {3, 1, 0x44, EVK_L3, 0, 2, 0, EVT_FVM, 0, 1, aok_gadget_x86_evex_pclmulqdq, 0, 0, 0, 0},
+};
+struct evex_insn {
+    unsigned map, pp, op, w, vvvv, reg, rm, ll, aaa;
+    bool z, b, mem;
+    uint8_t imm;
+    bool vvvv_hi;               // 32-bit mode: vvvv's bit 3 was set (vvvv holds the other bits)
+};
+static const struct evex_entry *evex_lookup(const struct evex_insn *v) {
+    for (unsigned i = 0; i < sizeof(evex_table) / sizeof(evex_table[0]); i++) {
+        const struct evex_entry *e = &evex_table[i];
+        if (e->map == v->map && e->pp == v->pp && e->op == v->op &&
+                (e->wreq == 0 || e->wreq == (v->w ? 2 : 1)) && (e->grp == 0 || e->grp == (v->reg & 7) + 1))
+            return e;
+    }
+    return NULL;
+}
+// disp8 * N for the memory operand
+static unsigned evex_disp_scale(const struct evex_entry *e, const struct evex_insn *v) {
+    if (v->b && e->bcast != 0 && (e->kind == EVK_CVTW || e->kind == EVK_CVTN))
+        return 1u << e->bcast;
+    if (e->tuple == EVT_FV && v->b)
+        return 1u << e->bcast;
+    if (e->tuple == EVT_FIX)
+        return e->ld;
+    if (e->tuple == EVT_DIV)
+        return (16u << v->ll) >> e->ld;
+    if (e->tuple == EVT_DUP)
+        return v->ll == 0 ? 8 : 16u << v->ll;
+    return 16u << v->ll;
+}
+// VPEXTR*, VEXTRACTPS, VMOVD/VMOVQ out: evex_extr's word, or -1 for #UD:
+// vvvv 1111b, no masking, EVEX.128. g the GPR (amd64; i386 slot 0).
+static long gen_evex_extr_word(const struct evex_entry *e, const struct evex_insn *v, unsigned g) {
+    if ((v->vvvv & 15) != 0 || v->vvvv_hi || v->aaa != 0 || v->z || v->b || v->ll != 0)
+        return -1;
+    if ((e->flags & EVF_REGONLY) && v->mem)
+        return -1;
+    unsigned src = (e->flags & EVF_EXTR_SWAP) ? v->rm : v->reg;
+    return (long) (g | (unsigned long) (src & 31) << 10 | (unsigned long) v->imm << 24 | (v->mem ? 1ul << 32 : 0));
+}
+// VCVT(T)SS/SD2(U)SI's word (evex.inc evex_cvt2gpr), or -1 for #UD: vvvv
+// 1111b, no masking, EVEX.b on a register only ({er}, or {sae} truncating).
+static long gen_evex_cvt2gpr_word(const struct evex_entry *e, const struct evex_insn *v, unsigned g) {
+    if ((v->vvvv & 15) != 0 || v->vvvv_hi || v->aaa != 0 || v->z || (v->b && v->mem))
+        return -1;
+    unsigned long w = g | (unsigned long) (v->rm & 31) << 10 | (v->mem ? 1ul << 15 : 0);
+    if (v->b)
+        w |= 1ul << 51 | (e->fp == 1 ? 1ul << 48 | (unsigned long) v->ll << 49 : 0);
+    return (long) w;
+}
+// A gather's or scatter's word (evex.inc evg_*), or -1 for #UD: memory with
+// a SIB (index: its index register, 0-31), an opmask, no EVEX.z or b,
+// vvvv 1111b, a gather's destination not its index.
+static long gen_evex_vsib_word(const struct evex_entry *e, const struct evex_insn *v, bool sib,
+        unsigned index, unsigned scale) {
+    if (!v->mem || !sib || v->aaa == 0 || v->z || v->b || (v->vvvv & 15) != 0 || v->vvvv_hi || v->ll == 3)
+        return -1;
+    if (e->kind == EVK_GATHER && index == v->reg)
+        return -1;
+    return (long) (v->reg | index << 5 | scale << 10 | v->w << 12 | (v->op & 1) << 13 | v->ll << 16 |
+            v->aaa << 18 | (e->kind == EVK_SCATTER ? 1u << 21 : 0));
+}
+struct evex_plan {
+    bool ud;
+    unsigned long word;
+    unsigned ld_bytes, bcast;   // the memory source: a loader for these bytes, or a broadcast of 1 << bcast
+    unsigned st_bytes;          // a store of the result (from EVEX_STAGE)
+    bool st_masked;             // ... of only the elements the mask enables
+    unsigned align;             // the memory operand must be aligned to this
+    int gpr_stage;              // a GPR to stage as s2 (VPBROADCAST from a GPR), or -1
+    bool gpr_w;                 // ... all 64 bits of it
+    bool ld_masked;             // the load reads only the enabled elements (with ld_word)
+    unsigned long ld_word;
+};
+// False: v is not in the table (the caller's old path).
+static bool evex_plan(const struct evex_insn *v, struct evex_plan *p) {
+    const struct evex_entry *e = evex_lookup(v);
+    if (e == NULL)
+        return false;
+    memset(p, 0, sizeof(*p));
+    p->ud = true;
+    p->gpr_stage = -1;
+    bool scalar = e->kind == EVK_SCAL || e->kind == EVK_TOMASKS || e->kind == EVK_CVTSI || e->kind == EVK_FLAGS ||
+            (e->kind == EVK_SSTORE && !v->mem);
+    bool round = v->b && !v->mem && e->fp != 0;   // {er} or {sae}: L'L is no length
+    unsigned ll = round || scalar ? (scalar ? 0 : 2) : v->ll;
+    unsigned bytes = 16u << ll;
+    if (((e->flags & EVF_MEMONLY) && !v->mem) || ((e->flags & EVF_REGONLY) && v->mem) ||
+            ((e->flags & EVF_MIN256) && v->ll == 0) || ((e->flags & EVF_MIN512) && v->ll < 2))
+        return true;
+    if ((v->ll == 3 && !round) || (v->z && v->aaa == 0) || (e->nomask && (v->aaa != 0 || v->z)))
+        return true;
+    if (((e->flags & EVF_L128) && v->ll != 0) || ((e->flags & EVF_MEMNOVVVV) && v->mem && (v->vvvv != 0 || v->vvvv_hi)))
+        return true;
+    if (v->b && (v->mem ? e->bcast == 0 : e->fp == 0))
+        return true;                            // no broadcast for this op, or no rounding control
+    unsigned dst = v->reg, s1 = v->vvvv, s2 = v->rm;
+    bool stage = v->mem, to_stage = false;
+    unsigned aaa = v->aaa;
+    bool z = v->z;
+    switch (e->kind) {
+    case EVK_L3:
+        break;
+    case EVK_SHI:
+        dst = v->vvvv;
+        s1 = 0;
+        break;
+    case EVK_BCAST:
+        if (v->vvvv != 0 || v->vvvv_hi)
+            return true;
+        break;
+    case EVK_BCASTG:
+        if (v->vvvv != 0 || v->vvvv_hi)
+            return true;
+        p->gpr_stage = (int) v->rm;
+        p->gpr_w = v->w;
+        stage = true;
+        break;
+    case EVK_SCAL:
+    case EVK_FULL:
+    case EVK_FULL8:
+        break;
+    case EVK_FULL1:
+        if (v->vvvv != 0 || v->vvvv_hi)
+            return true;
+        s1 = 0;
+        break;
+    case EVK_EXTRACT:
+    case EVK_EXTRACT8:
+        if (v->vvvv != 0 || v->vvvv_hi)
+            return true;
+        s1 = v->reg;
+        if (v->mem) {
+            if (v->z)
+                return true;                    // zeroing into memory
+            stage = false;
+            to_stage = true;
+            p->st_bytes = e->kind == EVK_EXTRACT8 ? 32 : 16;
+            p->st_masked = v->aaa != 0;
+            aaa = 0;
+            z = false;
+            dst = 0;
+        } else {
+            dst = v->rm;
+        }
+        break;
+    case EVK_EXT:
+        if (v->vvvv != 0 || v->vvvv_hi)
+            return true;
+        break;
+    case EVK_NARROW:
+    case EVK_COMPRESS:
+        if (v->vvvv != 0 || v->vvvv_hi)
+            return true;
+        s1 = v->reg;
+        if (v->mem) {
+            if (v->z)
+                return true;                    // zeroing into memory
+            stage = false;
+            to_stage = true;
+            p->st_bytes = e->kind == EVK_NARROW ? bytes >> e->ld : bytes;
+            p->st_masked = v->aaa != 0;
+            dst = 0;
+        } else {
+            dst = v->rm;
+        }
+        aaa = 0;                                // (the body masks: word bits 54-57)
+        z = false;
+        break;
+    case EVK_EXPAND:
+        if (v->vvvv != 0 || v->vvvv_hi)
+            return true;
+        aaa = 0;
+        z = false;
+        break;
+    case EVK_CVTW:
+    case EVK_CVTN:
+        if (v->vvvv != 0 || v->vvvv_hi)
+            return true;
+        s1 = v->rm;
+        break;
+    case EVK_CVTNR:
+        if (v->vvvv != 0 || v->vvvv_hi)
+            return true;
+        s2 = v->reg;
+        stage = false;
+        if (v->mem) {
+            if (v->z)
+                return true;                    // zeroing into memory
+            to_stage = true;
+            p->st_bytes = bytes >> 1;
+            p->st_masked = v->aaa != 0;
+            z = false;                          // (aaa stays: the frame's masked-off elements raise
+            dst = 0;                            //  nothing; the stage takes the result unmasked)
+        } else {
+            dst = v->rm;
+        }
+        break;
+    case EVK_FLAGS:
+        if (v->vvvv != 0 || v->vvvv_hi)
+            return true;
+        s1 = v->reg;
+        dst = 0;
+        break;
+    case EVK_INS:
+        if ((e->flags & EVF_ZEROS1) && (v->vvvv != 0 || v->vvvv_hi))
+            return true;
+        if (!v->mem) {
+            p->gpr_stage = (int) v->rm;
+            p->gpr_w = v->w;
+            stage = true;
+        }
+        break;
+    case EVK_EXTR:
+        return true;                            // (gen_evex_extr_word's)
+    case EVK_SSTORE:
+        s2 = v->reg;
+        if (v->mem) {
+            if (v->z || v->vvvv != 0 || v->vvvv_hi)
+                return true;
+            stage = false;
+            to_stage = true;
+            p->st_bytes = e->ld;
+            p->st_masked = v->aaa != 0;
+            aaa = 0;
+            z = false;
+            dst = 0;
+        } else {
+            stage = false;
+            dst = v->rm;
+        }
+        break;
+    case EVK_CVTSI:
+        if (!v->mem) {
+            p->gpr_stage = (int) v->rm;
+            p->gpr_w = v->w;
+            stage = true;
+        }
+        break;
+    case EVK_CVT2GPR:
+        return true;                            // (gen_evex_cvt2gpr_word's)
+    case EVK_V2M:
+        if (v->vvvv != 0 || v->vvvv_hi || v->aaa != 0 || v->reg > 7)
+            return true;
+        dst = v->reg;
+        break;
+    case EVK_M2V:
+        if (v->vvvv != 0 || v->vvvv_hi || v->aaa != 0 || v->z)
+            return true;
+        s2 = 0;
+        break;
+    case EVK_TOMASKS:
+    case EVK_TOMASK:
+        if (v->z || v->reg > 7)
+            return true;                        // zeroing is the only kind; EVEX.R/R' on a k register (SDE)
+        if ((e->flags & EVF_NOVVVV) && (v->vvvv != 0 || v->vvvv_hi))
+            return true;
+        dst = v->reg;
+        break;
+    case EVK_L2:
+    case EVK_LOAD:
+        if (v->vvvv != 0 || v->vvvv_hi)
+            return true;
+        s1 = v->rm;
+        break;
+    case EVK_STORE:
+        if (v->vvvv != 0 || v->vvvv_hi)
+            return true;
+        s2 = v->reg;
+        if (v->mem) {
+            if (v->z)
+                return true;                    // zeroing into memory
+            stage = false;
+            to_stage = true;
+            p->st_bytes = e->ld ? e->ld : bytes;
+            p->st_masked = v->aaa != 0;
+            aaa = 0;                            // (the store applies it)
+            z = false;
+            dst = 0;
+        } else {
+            dst = v->rm;
+        }
+        break;
+    }
+    if (v->mem && e->align)
+        p->align = bytes;
+    if (stage && p->gpr_stage < 0) {
+        if (v->b)
+            p->bcast = e->bcast;
+        else
+            p->ld_bytes = e->tuple == EVT_DIV ? bytes >> e->ld : e->tuple == EVT_DUP && ll == 0 ? 8 :
+                    e->kind == EVK_EXPAND ? bytes : e->ld ? e->ld : bytes;
+    }
+    p->ud = false;
+    p->word = (dst & 31) | (unsigned long) (s1 & 31) << 5 | (unsigned long) (s2 & 31) << 10 |
+            (stage ? 1ul << 15 : 0) | (unsigned long) ll << 16 | (unsigned long) (aaa & 7) << 18 |
+            (z ? 1ul << 21 : 0) | (unsigned long) e->esz << 22 | (unsigned long) v->imm << 24 |
+            (to_stage ? 1ul << 32 : 0) | (unsigned long) (e->flags & 15) << 33 |
+            (e->fp ? 1ul << 37 : 0) | (scalar ? 1ul << 38 : 0);
+    if (e->kind == EVK_EXTRACT || e->kind == EVK_EXTRACT8)   // the result's VL, the source's at 52-53
+        p->word = (p->word & ~(3ul << 16)) | (e->kind == EVK_EXTRACT8 ? 1ul << 16 : 0) | (unsigned long) ll << 52;
+    if (e->kind == EVK_FULL8 || e->kind == EVK_EXTRACT8)
+        p->word |= 1ul << 39;
+    if (e->kind == EVK_M2V)                     // the source k, for the body
+        p->word |= (unsigned long) (v->rm & 7) << 54;
+    if (e->kind == EVK_NARROW || e->kind == EVK_COMPRESS || e->kind == EVK_EXPAND)   // the body's mask
+        p->word |= (unsigned long) (v->aaa & 7) << 54 | (v->z ? 1ul << 57 : 0);
+    if (e->kind == EVK_NARROW) {                // the result's VL; the source's at 52-53
+        unsigned rb = bytes >> e->ld;
+        p->word = (p->word & ~(3ul << 16)) | (rb > 16 ? 1ul << 16 : 0) | (unsigned long) ll << 52;
+        if (p->st_masked)                       // a store of rb bytes, element by element
+            p->word |= 1ul << 58 | (unsigned long) __builtin_ctz(rb) << 59;
+    }
+    if (e->kind == EVK_CVTN || e->kind == EVK_CVTNR)   // the destination's VL half the source's (at 52-53)
+        p->word = (p->word & ~(3ul << 16)) | (unsigned long) (ll ? ll - 1 : 0) << 16 | (unsigned long) ll << 52 |
+                (ll == 0 && !to_stage ? 1ul << 47 : 0);
+    if (e->kind == EVK_CVTNR && p->st_masked)   // a store of VL / 2 bytes, element by element
+        p->word |= 1ul << 58 | (unsigned long) __builtin_ctz(bytes >> 1) << 59;
+    if ((e->kind == EVK_SSTORE || e->kind == EVK_STORE) && p->st_masked && e->ld)   // (one element's bytes)
+        p->word |= 1ul << 58 | (unsigned long) __builtin_ctz(e->ld) << 59;
+    if (e->flags & EVF_ZEROS1)
+        p->word |= 1ul << 46;
+    if (e->kind == EVK_COMPRESS && p->st_masked)
+        p->word |= 1ul << 62;                   // the store: the first popcount(k) elements
+    p->ld_word = p->word;
+    p->ld_masked = v->aaa != 0 && (p->bcast != 0 || (p->ld_bytes == bytes && e->tuple != EVT_FIX)) &&
+            e->kind != EVK_CVTW && e->kind != EVK_CVTN && e->kind != EVK_CVTNR;  // (not the mask's elements: whole)
+    if (e->kind == EVK_EXPAND && v->mem && v->aaa != 0) {   // read only the first popcount(k) elements
+        p->ld_masked = true;
+        p->ld_word = p->word | (unsigned long) (v->aaa & 7) << 18 | 1ul << 62;
+    }
+    if (round)                                  // {sae}; {er} sets the rounding too
+        p->word |= 1ul << 51 | (e->fp == 1 ? 1ul << 48 | (unsigned long) v->ll << 49 : 0);
+    // the store gadget's own word: the mask and element size
+    if (p->st_masked)
+        p->word |= (unsigned long) (v->aaa & 7) << 40 | (unsigned long) e->esz << 44;
+    return true;
+}
+
 
 /* ---- This front end's emitter ------------------------------------------------- */
 
@@ -1053,6 +2071,9 @@ static int vex_ud(Ctx *c, Insn *d, const uint8_t *code)
     return END;
 }
 
+static int evex_at(Ctx *c, Insn *d, const uint8_t *code, unsigned p0,
+                   unsigned p1, unsigned p2, unsigned op, int from);
+
 /*
  * A VEX insn, @lead (C4 or C5) and the legacy prefixes before it read. In
  * 64-bit code; 32-bit code's (where C4 and C5 are also les and lds) and
@@ -1110,6 +2131,15 @@ static int vex(Ctx *c, Insn *d, const uint8_t *code, unsigned lead)
         c->hf = HF_NONE;
         return NEXT;
     }
+    if (vex_via_evex(v.map, v.pp, v.op)) {      /* GFNI, AES, VPCLMUL, VNNI: EVEX's ops */
+        unsigned p0, p1, p2;
+
+        if (!c->avx) {
+            return UNKNOWN;
+        }
+        vex_to_evex(r, x, b, v.map, v.w, v.vvvv, v.l, v.pp, &p0, &p1, &p2);
+        return evex_at(c, d, code, p0, p1, p2, v.op, EVF_VEX);
+    }
     d->rr = r ? 8 : 0;
     d->rx = x ? 8 : 0;
     d->rb = b ? 8 : 0;
@@ -1118,8 +2148,8 @@ static int vex(Ctx *c, Insn *d, const uint8_t *code, unsigned lead)
     v.rm = (d->rm & 7) | d->rb;
     v.mem = d->mod != 3;
     v.vsib_index = -1;
-    if (d->bad || vex_via_evex(v.map, v.pp, v.op)) {
-        return UNKNOWN;                         /* (GFNI, AES, VPCLMUL, VNNI: EVEX's) */
+    if (d->bad) {
+        return UNKNOWN;
     }
     e = vex_lookup(&v);
     if (e && e->kind == VXK_BMI ? !(c->bmi1 && c->bmi2) : !c->avx) {
@@ -1195,4 +2225,479 @@ static int vex(Ctx *c, Insn *d, const uint8_t *code, unsigned lead)
     default:                    /* gathers, masked moves, the specials: TCG's */
         return UNKNOWN;
     }
+}
+
+/* ---- EVEX: this front end's emitter -------------------------------------------- */
+
+/* gadgets-vec.S's EVEX memory gadgets. */
+MEMD(vldb4) MEMD(vldb8) MEMD(vldbm4) MEMD(vldbm8) MEMD(vldm) MEMD(vstm)
+MEMD(vgather) MEMD(vscatter) MEMD(vwpm)
+static const MemTab vldb_tab[2][2] = {
+    { MEMT(vldb4) MEMT(vldb8) }, { MEMT(vldbm4) MEMT(vldbm8) },
+};
+static const MemTab evex_mem_tab[5] = {
+    MEMT(vldm) MEMT(vstm) MEMT(vwpm) MEMT(vgather) MEMT(vscatter)
+};
+#define vldm_tab        evex_mem_tab[0]
+#define vstm_tab        evex_mem_tab[1]
+#define vwpm_tab        evex_mem_tab[2]
+#define vgather_tab     evex_mem_tab[3]
+#define vscatter_tab    evex_mem_tab[4]
+
+/*
+ * A masked operand's elements (gadgets-vec.S's vm_elems): the EVEX word's
+ * opmask, the field at bit @ks (and the log2 of the elements' size 4 bits
+ * up), over the operand's elements: 16 << VL bytes, or 1 << bits 59-61 with
+ * bit 58 (a narrowing store's).
+ */
+static uint64_t vm_elems(CPUX86State *env, uint64_t w, int ks,
+                         unsigned *bytes, unsigned *esz)
+{
+    uint64_t k = env->opmask_regs[(w >> ks) & 7];
+    unsigned n;
+
+    *esz = (w >> (ks + 4)) & 3;
+    *bytes = (w >> 58) & 1 ? 1u << ((w >> 59) & 7) : 16u << ((w >> 16) & 3);
+    n = *bytes >> *esz;
+    return n < 64 ? k & ((1ull << n) - 1) : k;
+}
+
+/*
+ * Which of an operand's two pages, [0, *split) and [*split, bytes), an
+ * enabled element has a byte in. Compress and expand (word bit 62) touch
+ * the first popcount(k) elements, but fault as SDE has them, by the enabled
+ * elements' own positions: those reach at least as far as the packed ones,
+ * so the first page if any element is enabled, the second by position.
+ */
+static void vm_needs(uint64_t w, uint64_t k, uint64_t addr, unsigned bytes,
+                     unsigned esz, unsigned *split, bool need[2])
+{
+    unsigned s = MIN(TARGET_PAGE_SIZE - (addr & ~TARGET_PAGE_MASK), bytes);
+    unsigned lo = (s + (1u << esz) - 1) >> esz;
+
+    *split = s;
+    need[0] = (lo >= 64 ? k : k & ((1ull << lo) - 1)) != 0;
+    need[1] = s < bytes && (k >> (s >> esz)) != 0;
+    if ((w >> 62) & 1) {
+        need[0] = k != 0;
+    }
+}
+
+/*
+ * A masked load to the stage (gadgets-vec.S's vldm, past its fast path): a
+ * page an enabled element needs is read whole, one none does is not read
+ * and its bytes are zeros. @sz is the host's word: | 16, the operand must
+ * be aligned to its size.
+ */
+void aok_x86_helper_vldm(CPUX86State *env, uint64_t addr, uint64_t pc,
+                         uint32_t sz, uint64_t w);
+void aok_x86_helper_vldm(CPUX86State *env, uint64_t addr, uint64_t pc,
+                         uint32_t sz, uint64_t w)
+{
+    MemOpIdx oi = make_memop_idx(MO_UB, cpu_mmu_index(env_cpu(env), false));
+    unsigned bytes, esz, split;
+    uint8_t buf[64];
+    bool need[2];
+    uint64_t k;
+
+    x86_sync(env, pc);
+    k = vm_elems(env, w, 18, &bytes, &esz);
+    if ((sz & 16) && (addr & (bytes - 1))) {
+        raise_exception_err_ra(env, EXCP0D_GPF, 0, 0);
+    }
+    vm_needs(w, k, addr, bytes, esz, &split, need);
+    for (unsigned i = 0; i < bytes; i++) {
+        buf[i] = need[i >= split] ? cpu_ldb_mmu(env, addr + i, oi, 0) : 0;
+    }
+    memcpy(env->aok_vstage, buf, bytes);
+}
+
+/*
+ * A masked store from the stage (vstm, past its fast path): the enabled
+ * elements (compress: the first popcount of them), each page they need
+ * checked first, so that a fault leaves memory as it was. @probe: only
+ * that (vwpm), the store's faults before a frame that changes state (MXCSR)
+ * computes what it stores.
+ */
+static void x86_vstm(CPUX86State *env, uint64_t addr, uint64_t pc, uint32_t sz,
+                     uint64_t w, bool probe)
+{
+    int mmu_idx = cpu_mmu_index(env_cpu(env), false);
+    MemOpIdx oi = make_memop_idx(MO_UB, mmu_idx);
+    unsigned bytes, esz, split;
+    bool need[2];
+    uint64_t k;
+
+    x86_sync(env, pc);
+    k = vm_elems(env, w, 40, &bytes, &esz);
+    if ((sz & 16) && (addr & (bytes - 1))) {
+        raise_exception_err_ra(env, EXCP0D_GPF, 0, 0);
+    }
+    vm_needs(w, k, addr, bytes, esz, &split, need);
+    if (need[0]) {
+        probe_write(env, addr, split, mmu_idx, 0);
+    }
+    if (need[1]) {
+        probe_write(env, addr + split, bytes - split, mmu_idx, 0);
+    }
+    if (probe) {
+        return;
+    }
+    if ((w >> 62) & 1) {
+        unsigned n = ctpop64(k);
+
+        k = n >= 64 ? -1ull : (1ull << n) - 1;
+    }
+    for (unsigned i = 0; i < bytes; i++) {
+        if (((k >> (i >> esz)) & 1) && need[i >= split]) {
+            cpu_stb_mmu(env, addr + i, env->aok_vstage[i], oi, 0);
+        }
+    }
+}
+
+void aok_x86_helper_vstm(CPUX86State *env, uint64_t addr, uint64_t pc,
+                         uint32_t sz, uint64_t w);
+void aok_x86_helper_vstm(CPUX86State *env, uint64_t addr, uint64_t pc,
+                         uint32_t sz, uint64_t w)
+{
+    x86_vstm(env, addr, pc, sz, w, false);
+}
+
+void aok_x86_helper_vwpm(CPUX86State *env, uint64_t addr, uint64_t pc,
+                         uint32_t sz, uint64_t w);
+void aok_x86_helper_vwpm(CPUX86State *env, uint64_t addr, uint64_t pc,
+                         uint32_t sz, uint64_t w)
+{
+    x86_vstm(env, addr, pc, sz, w, true);
+}
+
+/*
+ * Whether the CPU offers what an EVEX-table op needs that AVX-512F's frames
+ * do not say by themselves: the VEX and legacy forms of AES, PCLMULQDQ,
+ * GFNI and AVX-VNNI, their 256-bit and EVEX forms, and EVEX.128/256's
+ * AVX512VL. (AVX-512's other subsets go with AVX512F here: the CPU offers
+ * all of them or none.)
+ */
+static bool evex_cpuid_ok(const CPUX86State *env, const struct evex_insn *v, int from)
+{
+    uint32_t ecx1 = env->features[FEAT_1_ECX];
+    uint32_t ecx7 = env->features[FEAT_7_0_ECX];
+    bool wide = from == EVF_EVEX || v->ll != 0;
+
+    if (from == EVF_EVEX && v->ll < 2 &&
+        !(env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_AVX512VL)) {
+        return false;
+    }
+    if (v->map == 2 && v->op >= 0xdb && v->op <= 0xdf) {          /* AES */
+        return (ecx1 & CPUID_EXT_AES) && (!wide || (ecx7 & CPUID_7_0_ECX_VAES));
+    }
+    if (v->map == 3 && v->op == 0xdf) {                             /* AESKEYGENASSIST */
+        return ecx1 & CPUID_EXT_AES;
+    }
+    if (v->map == 3 && v->op == 0x44) {                             /* PCLMULQDQ */
+        return (ecx1 & CPUID_EXT_PCLMULQDQ) &&
+               (!wide || (ecx7 & CPUID_7_0_ECX_VPCLMULQDQ));
+    }
+    if ((v->map == 2 && v->op == 0xcf) ||
+        (v->map == 3 && (v->op == 0xce || v->op == 0xcf))) {        /* GFNI */
+        return ecx7 & CPUID_7_0_ECX_GFNI;
+    }
+    if (from == EVF_VEX && v->map == 2 && v->op >= 0x50 && v->op <= 0x53) {
+        return env->features[FEAT_7_1_EAX] & CPUID_7_1_EAX_AVX_VNNI;
+    }
+    return true;
+}
+
+/*
+ * An EVEX insn from its P0-P2 and opcode, d at its ModRM (64-bit code).
+ * @from: EVF_EVEX, or a VEX or legacy SSE encoding of an op the EVEX table
+ * has (GFNI, AES, PCLMULQDQ, AVX-VNNI), P0-P2 made from its fields
+ * (vex_to_evex): no disp8*N, the prefixes already checked; SSE's operand is
+ * 16-byte aligned and the bits above 128 are left alone (word bit 63). As
+ * iSH-AOK's gen_amd64_evex_at.
+ */
+static int evex_at(Ctx *c, Insn *d, const uint8_t *code, unsigned p0,
+                   unsigned p1, unsigned p2, unsigned op, int from)
+{
+    const CPUX86State *env = c->env;
+    bool from_vex = from != EVF_EVEX;
+    const struct evex_entry *e;
+    struct evex_insn v = { 0 };
+    struct evex_plan p;
+    const uint8_t *mp;
+    bool r, x, b, r2, v2;
+    long word;
+
+    v.map = p0 & 7;
+    v.op = op;
+    v.w = p1 >> 7;
+    v.pp = p1 & 3;
+    v.z = p2 >> 7;
+    v.ll = (p2 >> 5) & 3;
+    v.b = (p2 >> 4) & 1;
+    v.aaa = p2 & 7;
+    r = !(p0 & 0x80);
+    x = !(p0 & 0x40);
+    b = !(p0 & 0x20);
+    r2 = !(p0 & 0x10);
+    v2 = !(p2 & 8);
+    v.vvvv = ((~p1 >> 3) & 15) | (v2 ? 16 : 0);
+    if (v.map == 0 || v.map > 3 || (p0 & 0x08) || !(p1 & 4)) {
+        return vex_ud(c, d, code);      /* map 0, 4-7, or a reserved bit */
+    }
+    d->rr = (r ? 8 : 0) | (r2 ? 16 : 0);
+    d->rx = x ? 8 : 0;
+    d->rb = b ? 8 : 0;
+    mp = d->p;
+    modrm(d);
+    if (d->bad) {
+        return UNKNOWN;
+    }
+    v.reg = d->reg;
+    v.mem = d->mod != 3;
+    v.rm = (mp[0] & 7) | d->rb | (!v.mem && x ? 16 : 0);
+    e = evex_lookup(&v);
+    if (!e) {
+        for (unsigned i = 0; i < ARRAY_SIZE(evex_table); i++) {
+            if (evex_table[i].map == v.map && evex_table[i].pp == v.pp &&
+                evex_table[i].op == v.op &&
+                (evex_table[i].grp == 0 || evex_table[i].grp == (v.reg & 7) + 1)) {
+                return vex_ud(c, d, code);  /* here, but not with this W */
+            }
+        }
+        return from_vex ? UNKNOWN : vex_ud(c, d, code);
+    }
+    if (!from_vex && (d->o16 || d->rep || d->repne || d->lock || d->rex)) {
+        return vex_ud(c, d, code);      /* a legacy prefix or REX before 62 */
+    }
+    if ((e->flags & EVF_LEGACY) && (from == EVF_EVEX || v.ll != 0)) {
+        return vex_ud(c, d, code);
+    }
+    if (!evex_cpuid_ok(env, &v, from)) {
+        return vex_ud(c, d, code);
+    }
+    if (evex_has_imm8(v.map, v.op)) {
+        v.imm = f8(d);
+    }
+    if (d->bad) {
+        return UNKNOWN;
+    }
+    if (v.mem && d->mod == 1 && !from_vex) {
+        d->m.disp *= evex_disp_scale(e, &v);
+    }
+
+    if (e->kind == EVK_EXTR) {
+        word = from_vex ? -1 : gen_evex_extr_word(e, &v, (e->flags & EVF_EXTR_SWAP) ?
+                                                  v.reg & 15 : v.rm & 15);
+        if (word < 0) {
+            return vex_ud(c, d, code);
+        }
+        FIN();
+        E1(e->gadget, word);
+        if (v.mem) {
+            vmem(c, d, vst_tab[vlog2(e->ld)], true, VSTAGE, e->ld, false);
+        }
+        c->hf = HF_NONE;
+        return NEXT;
+    }
+    if (e->kind == EVK_CVT2GPR) {
+        word = from_vex ? -1 : gen_evex_cvt2gpr_word(e, &v, v.reg & 15);
+        if (word < 0) {
+            return vex_ud(c, d, code);
+        }
+        FIN();
+        if (v.mem) {
+            vmem(c, d, vld_tab[vlog2(e->ld)], false, 0, e->ld, false);
+        }
+        E1(e->gadget, word);
+        c->hf = HF_NONE;
+        return NEXT;
+    }
+    if (e->kind == EVK_GATHER || e->kind == EVK_SCATTER) {
+        bool sib = v.mem && (mp[0] & 7) == 4;
+        unsigned s = sib ? mp[1] : 0;
+        Insn base = *d;
+
+        word = from_vex ? -1 :
+               gen_evex_vsib_word(e, &v, sib, ((s >> 3) & 7) | (x ? 8 : 0) | (v2 ? 16 : 0),
+                                  s >> 6);
+        if (word < 0) {
+            return vex_ud(c, d, code);
+        }
+        FIN();
+        base.m.index = -1;      /* the address without the index: the vector register's */
+        vmem(c, &base, e->kind == EVK_GATHER ? vgather_tab : vscatter_tab, true, word,
+             v.w ? 8 : 4, false);
+        return NEXT;
+    }
+
+    evex_plan(&v, &p);
+    if (p.ud) {
+        return vex_ud(c, d, code);
+    }
+    if (from == EVF_SSE) {
+        p.word |= 1ull << 63;
+        if (v.mem && !p.align) {
+            p.align = 16;
+        }
+    }
+    FIN();
+    if (p.gpr_stage >= 0) {
+        E1(G(vex_gst_amd64), (p.gpr_stage & 15) | (p.gpr_w ? 16 : 0));
+    }
+    if (p.bcast) {
+        vmem(c, d, vldb_tab[p.ld_masked][p.bcast == 3], p.ld_masked, p.ld_word,
+             1u << p.bcast, false);
+    } else if (p.ld_bytes && p.ld_masked) {
+        vmem(c, d, vldm_tab, true, p.ld_word, p.ld_bytes, p.align);
+    } else if (p.ld_bytes) {
+        vmem(c, d, p.align ? vlda_tab[vlog2(p.ld_bytes)] : vld_tab[vlog2(p.ld_bytes)],
+             false, 0, p.ld_bytes, p.align);
+    }
+    if (p.st_bytes && e->kind == EVK_CVTNR) {
+        /* VCVTPS2PH to memory: the store's faults before MXCSR changes */
+        if (p.st_masked) {
+            vmem(c, d, vwpm_tab, true, p.word, p.st_bytes, false);
+        } else {
+            vmem(c, d, vwp_tab[vlog2(p.st_bytes)], false, 0, p.st_bytes, false);
+        }
+    }
+    aok_emit_gadget(&c->g, e->gadget);
+    aok_emit(&c->g, p.word);
+    if (p.st_bytes) {
+        if (p.st_masked) {
+            vmem(c, d, vstm_tab, true, p.word, p.st_bytes, p.align);
+        } else {
+            vmem(c, d, p.align ? vsta_tab[vlog2(p.st_bytes)] : vst_tab[vlog2(p.st_bytes)],
+                 true, VSTAGE, p.st_bytes, p.align);
+        }
+    }
+    c->hf = HF_NONE;
+    if (e->kind == EVK_FLAGS) {
+        set_flags(c, HF_NONE, CC_OP_EFLAGS);
+    }
+    return NEXT;
+}
+
+/* An EVEX insn (62 read), in 64-bit code with AVX-512 enabled; TCG's otherwise, which raises #UD. */
+static int evex(Ctx *c, Insn *d, const uint8_t *code)
+{
+    unsigned p0, p1, p2, op;
+
+    if (!c->c64 || !c->avx512) {
+        return UNKNOWN;
+    }
+    p0 = f8(d);
+    p1 = f8(d);
+    p2 = f8(d);
+    op = f8(d);
+    if (d->bad) {
+        return UNKNOWN;
+    }
+    return evex_at(c, d, code, p0, p1, p2, op, EVF_EVEX);
+}
+
+/*
+ * The legacy SSE forms of GFNI, AES and PCLMULQDQ (66 0F 38 or 3A, @esc
+ * read): EVEX's ops, as iSH-AOK computes them. The rest of 0F 38 and 0F 3A
+ * is TCG's.
+ */
+static int sse_evex(Ctx *c, Insn *d, const uint8_t *code, unsigned esc)
+{
+    unsigned map = esc == 0x38 ? 2 : 3, op, vvvv = 0, p0, p1, p2;
+
+    if (!c->c64 || !c->sse || d->end - d->p < 2) {
+        return UNKNOWN;
+    }
+    op = d->p[0];
+    if (!d->o16 || d->rep || d->repne || d->lock || d->a32 ||
+        !sse_via_evex(map, op)) {
+        return UNKNOWN;
+    }
+    /* s1 is the destination (the ModRM reg); AESIMC, AESKEYGENASSIST have none */
+    if (!sse_via_evex_unary(map, op)) {
+        vvvv = ((d->p[1] >> 3) & 7) | d->rr;
+    }
+    d->p++;
+    vex_to_evex(d->rr != 0, d->rx != 0, d->rb != 0, map, map == 3, vvvv, false, 1,
+                &p0, &p1, &p2);
+    return evex_at(c, d, code, p0, p1, p2, op, EVF_SSE);
+}
+
+/*
+ * Whether the 64-bit insn at @p is one only these gadgets compute: EVEX's,
+ * the opmask insns, and the VEX and legacy forms of the EVEX table's ops
+ * (TCG has neither AVX-512 nor GFNI nor AVX-VNNI, and would raise #UD).
+ * Then a TB that is TCG's otherwise (one being stepped) is this
+ * translator's, of that insn alone (x86_aok_translate_code).
+ */
+static bool x86_aok_only(const uint8_t *p, const uint8_t *end, bool avx,
+                         bool avx512)
+{
+    struct vex_insn v = { 0 };
+    const struct vex_entry *e;
+    bool o16 = false;
+    unsigned b;
+
+    for (;;) {
+        if (end - p < 6) {
+            return false;
+        }
+        b = *p++;
+        if (b == 0x66) {
+            o16 = true;
+        } else if (!(b == 0x67 || b == 0xf0 || b == 0xf2 || b == 0xf3 ||
+                     b == 0x26 || b == 0x2e || b == 0x36 || b == 0x3e ||
+                     b == 0x64 || b == 0x65)) {
+            break;
+        }
+    }
+    if ((b & 0xf0) == 0x40) {
+        b = *p++;
+    }
+    switch (b) {
+    case 0x62:
+        return avx512;
+    case 0xc4:
+    case 0xc5:
+        if (b == 0xc5) {
+            v.map = 1;
+            v.l = (p[0] >> 2) & 1;
+            v.pp = p[0] & 3;
+            p += 1;
+        } else {
+            v.map = p[0] & 0x1f;
+            v.w = p[1] >> 7;
+            v.l = (p[1] >> 2) & 1;
+            v.pp = p[1] & 3;
+            p += 2;
+        }
+        v.op = p[0];
+        v.reg = (p[1] >> 3) & 7;
+        if (vex_via_evex(v.map, v.pp, v.op)) {
+            return avx;
+        }
+        e = vex_lookup(&v);
+        return avx512 && e && e->kind == VXK_KOP;
+    case 0x0f:
+        return o16 && (p[0] == 0x38 || p[0] == 0x3a) &&
+               sse_via_evex(p[0] == 0x38 ? 2 : 3, p[1]);
+    default:
+        return false;
+    }
+}
+
+/* The end of such a TB: at the next insn, the main loop's. */
+void aok_x86_helper_eob(CPUX86State *env, uint64_t pc, uint64_t a, uint64_t b);
+void aok_x86_helper_eob(CPUX86State *env, uint64_t pc, uint64_t a, uint64_t b)
+{
+    x86_sync(env, pc);
+}
+
+/* ... and of one being stepped (EFLAGS.TF): its #DB, after the insn. */
+void aok_x86_helper_tf(CPUX86State *env, uint64_t pc, uint64_t a, uint64_t b);
+void aok_x86_helper_tf(CPUX86State *env, uint64_t pc, uint64_t a, uint64_t b)
+{
+    x86_sync(env, pc);
+    helper_single_step(env);
 }

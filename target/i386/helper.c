@@ -45,6 +45,15 @@ void cpu_sync_avx_hflag(CPUX86State *env)
     } else{
         env->hflags &= ~HF_AVX_EN_MASK;
     }
+    /* (AVX-512 is the AOK gadgets', which compute it where it is enabled) */
+    if ((env->hflags & HF_AVX_EN_MASK) &&
+        (env->xcr0 & (XSTATE_OPMASK_MASK | XSTATE_ZMM_Hi256_MASK |
+                      XSTATE_Hi16_ZMM_MASK)) ==
+        (XSTATE_OPMASK_MASK | XSTATE_ZMM_Hi256_MASK | XSTATE_Hi16_ZMM_MASK)) {
+        env->hflags |= HF_AVX512_EN_MASK;
+    } else {
+        env->hflags &= ~HF_AVX512_EN_MASK;
+    }
 }
 
 void cpu_sync_bndcs_hflags(CPUX86State *env)

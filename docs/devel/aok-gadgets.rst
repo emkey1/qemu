@@ -521,6 +521,25 @@ with the gadgets.
   the instruction to be run again. ``fldcw`` goes through QEMU's helper as
   well, which sets softfloat's modes for the instructions that are still
   TCG's, and ``ldmxcsr`` and ``stmxcsr`` are a call each.
+* **VEX and EVEX** (``gadgets-vec.S``, ``vec/``) are iSH-AOK's frames, which
+  compute an operation 128 bits at a time exactly as x86 does (its NaNs,
+  DAZ and FTZ, denormal flags, tininess after rounding), taken on
+  2026-10-14 and this tree's own since: AVX, AVX2, FMA3, F16C, BMI1/2, the
+  opmask instructions, and AVX-512 (F, DQ, CD, BW, VL, IFMA, VBMI, VBMI2,
+  VNNI, BITALG, VPOPCNTDQ, BF16) with GFNI, VAES, VPCLMULQDQ and AVX-VNNI in
+  every form, the legacy SSE ones of GFNI, AES and PCLMULQDQ included. TCG
+  has no AVX-512, so the CPU offers it (CPUID, XCR0's opmask and ZMM state)
+  only where these gadgets run (not with ``QEMU_AOK=0``,
+  ``QEMU_AOK_X86_NOVEC`` or ``QEMU_AOK_X86_NOAVX512``), a TB flag says
+  whether XCR0 enables it, TCG's XSAVE and XRSTOR carry its state, and a
+  VEX write of TCG's zeroes the register to bit 511 as the hardware's does.
+  A memory operand is staged before the frame and stored after it (a store
+  that follows a frame that changes MXCSR is probed first); with an opmask
+  only the enabled elements are touched, so that a masked-off one may be on
+  a page that is not there, and a gather or scatter goes element by
+  element, restartable as x86's. iSH-AOK's test programs, with answers
+  from an AMD Ryzen and Intel SDE, run in the gate image
+  (``aok/x64/vec-image.sh`` in AOK VM).
 * **A TB stays in its page.** One whose first instruction runs into the next
   page is that one instruction, as TCG makes it.
 * Left to TCG: everything outside those two kinds of code, MMX, the x87's
@@ -530,11 +549,18 @@ with the gadgets.
   the stream), the system calls, interrupts and the returns from them, the
   control and debug registers, loads of ``ss`` and ``cs``, string I/O,
   ``cmpxchg16b``, the rotates through carry, 16-bit ``adc``/``sbb`` and stack
-  operations, 16-bit addressing, a bit string addressed by a register, and
-  anything with VEX or EVEX.
+  operations, 16-bit addressing, a bit string addressed by a register,
+  the 0F 38 and 0F 3A maps but for GFNI, AES and PCLMULQDQ, VEX's gathers,
+  masked moves and string compares, and
+  32-bit code's VEX. Not yet anywhere: EVEX in 32-bit code, and a memory
+  operand of an EVEX instruction with a 0x67 prefix (both raise #UD).
 
 A TB is translated only with no single-step flag pending, outside the shadow
-of a ``mov`` to ``ss``, system management mode and SVM guests, with MPX off.
+of a ``mov`` to ``ss``, system management mode and SVM guests, with MPX off,
+and when the main loop does not want one instruction alone. The exception
+is an instruction TCG does not have (EVEX's, an opmask one, GFNI's or
+AVX-VNNI's): stepped with EFLAGS.TF, or wanted alone, it is a TB of its own
+here, ending in the step's ``#DB`` or the main loop.
 The resume flag is no bar: a TB entered with it (the instruction a fault was
 returned to) clears it in its first gadget. Before that such TBs were TCG's,
 and whatever followed a page fault in its block was run by another engine

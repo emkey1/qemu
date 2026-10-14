@@ -272,7 +272,8 @@ typedef struct Ctx {
     bool abm, bmi1;         /* f3 before bsf and bsr makes tzcnt and lzcnt */
     bool bmi2;
     bool avx;               /* VEX's vector insns are gadgets-vec.S's here */
-    bool avx512;            /* and the opmask ones too */
+    bool avx512;            /* and EVEX's (AVX-512), and the opmask ones */
+    const CPUX86State *env; /* the features the CPU offers */
     bool lahf;              /* lahf and sahf exist here */
     bool sse;               /* SSE insns raise nothing here */
     bool x87;               /* nor do x87 ones (no EM, no TS) */
@@ -631,6 +632,8 @@ static bool x86_novec;
 static bool x86_nox87;
 /* QEMU_AOK_X86_NO32, QEMU_AOK_X86_NO64: that kind of code is TCG's. */
 static bool x86_no32, x86_no64;
+/* QEMU_AOK_X86_NOONE: a stepped AVX-512 insn TCG's too (which raises #UD). */
+static bool x86_noone;
 
 /* Emit what makes x86 condition @cc one of the host's, and return that. */
 static int cond_arm(Ctx *c, unsigned cc)
@@ -2343,6 +2346,17 @@ static int jcc(Ctx *c, unsigned cc, int64_t rel)
     return END;
 }
 
+/*
+ * Whether the CPU may offer AVX-512 (target/i386/cpu.c): only TCG with these
+ * gadgets computes it, so not with QEMU_AOK=0, QEMU_AOK_X86_NOVEC or
+ * QEMU_AOK_X86_NO64, nor with QEMU_AOK_X86_NOAVX512.
+ */
+bool x86_aok_avx512(void)
+{
+    return aok_enabled && !x86_novec && !x86_no64 &&
+           !getenv("QEMU_AOK_X86_NOAVX512");
+}
+
 /* Opcodes this translator is told to leave to TCG: QEMU_AOK_X86_SKIP. */
 static bool x86_skip[512];
 
@@ -2359,6 +2373,7 @@ static void __attribute__((constructor)) x86_aok_init(void)
     x86_nox87 = getenv("QEMU_AOK_X86_NOX87");
     x86_no32 = getenv("QEMU_AOK_X86_NO32");
     x86_no64 = getenv("QEMU_AOK_X86_NO64");
+    x86_noone = getenv("QEMU_AOK_X86_NOONE");
     s = getenv("QEMU_AOK_X86_SKIP");
 
     /* "88,89,1af": one-byte opcodes, and 0F ones as 1xx */
@@ -2845,6 +2860,9 @@ static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
     c->op = 0x100 | b;
     if (x86_skip[c->op]) {
         return UNKNOWN;
+    }
+    if (b == 0x38 || b == 0x3a) {
+        return sse_evex(c, d, code, b);
     }
     if ((b >= 0x10 && b <= 0x17) || (b >= 0x28 && b <= 0x2f) ||
         (b >= 0x50 && b <= 0x7f && b != 0x77) || b == 0xc6 ||
@@ -3528,6 +3546,9 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
     }
     if (c->c64 && (b == 0xc4 || b == 0xc5)) {
         return vex(c, d, code, b);
+    }
+    if (c->c64 && b == 0x62) {
+        return evex(c, d, code);
     }
     /* rep ret, and bnd before a branch, are that ret and that branch. */
     if ((d->rep || d->repne) &&
@@ -4219,12 +4240,33 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
      * an ordinary TB: one in RAM that may check for interrupts and need not
      * stop after a set number of insns.
      */
+    bool one = false;
+
     if (!host_pc || !(cflags & CF_PCREL) || TARGET_PAGE_BITS != 12 ||
-        (cflags & (CF_COUNT_MASK | CF_SINGLE_STEP | CF_MEMI_ONLY |
-                   CF_USE_ICOUNT | CF_NOIRQ | CF_BP_PAGE | CF_STEP_ATOMIC)) ||
-        (flags & (HF_INHIBIT_IRQ_MASK | HF_TF_MASK | HF_VM_MASK |
-                  HF_SMM_MASK | HF_GUEST_MASK | HF_MPX_EN_MASK))) {
+        (cflags & (CF_SINGLE_STEP | CF_MEMI_ONLY | CF_USE_ICOUNT |
+                   CF_STEP_ATOMIC)) ||
+        (flags & (HF_INHIBIT_IRQ_MASK | HF_VM_MASK | HF_SMM_MASK |
+                  HF_GUEST_MASK | HF_MPX_EN_MASK))) {
         return 0;
+    }
+    if ((cflags & (CF_COUNT_MASK | CF_NOIRQ | CF_BP_PAGE)) ||
+        (flags & HF_TF_MASK)) {
+        /*
+         * Stepped (EFLAGS.TF), or one insn alone for the main loop's sake
+         * (after a write to the TB's own code, say): TCG's, unless TCG has
+         * not got the insn (AVX-512). Then it is this translator's, with
+         * the main loop's after it, or the step's #DB.
+         */
+        one = (flags & HF_CS64_MASK) && !x86_no64 && !x86_noone &&
+              x86_aok_only(host_pc, (const uint8_t *)host_pc +
+                           (TARGET_PAGE_SIZE - (pc & ~TARGET_PAGE_MASK)),
+                           !(flags & (HF_EM_MASK | HF_TS_MASK)) &&
+                           (flags & HF_OSFXSR_MASK) && (flags & HF_AVX_EN_MASK),
+                           flags & HF_AVX512_EN_MASK);
+        if (!one) {
+            return 0;
+        }
+        *max_insns = 1;
     }
     /*
      * And either 64-bit code, or 32-bit code in protected mode with a
@@ -4243,6 +4285,7 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     }
 
     c->page_off = pc & ~TARGET_PAGE_MASK;
+    c->env = env;
     c->mp = cflags & CF_PARALLEL;
     c->no_goto_ptr = cflags & CF_NO_GOTO_PTR;
     c->cpl = flags & HF_CPL_MASK;
@@ -4268,7 +4311,12 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
              (env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_AVX2) &&
              (env->features[FEAT_1_ECX] & CPUID_EXT_FMA) &&
              (env->features[FEAT_1_ECX] & CPUID_EXT_F16C);
-    c->avx512 = false;
+    /*
+     * EVEX's (AVX-512's), with it enabled too: XCR0's opmask and ZMM state,
+     * which the CPU offers only where these gadgets compute it.
+     */
+    c->avx512 = c->avx && (flags & HF_AVX512_EN_MASK) &&
+                (env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_AVX512F);
     c->live = !x86_nolive;
     if (!translate(c, cs, tb, *max_insns, pc, host_pc, &r)) {
         c->live = false;
@@ -4279,7 +4327,10 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
         aok_stats.declined_op[(c->op >> 1) & 0x7f]++;
         return 0;
     }
-    if (r != END) {
+    if (one) {
+        E4(G(call_c_exit), flags & HF_TF_MASK ? aok_x86_helper_tf : aok_x86_helper_eob,
+           c->off, 0, 0);
+    } else if (r != END) {
         E0(c->c64 ? G(jmp) : G(jmp32));
         way(c, 0, c->off);
     }

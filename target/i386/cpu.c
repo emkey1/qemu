@@ -51,6 +51,10 @@
 #endif
 #include "system/qtest.h"
 #include "tcg/tcg-cpu.h"
+#if defined(CONFIG_AOK_GADGETS) && defined(TARGET_X86_64) && \
+    !defined(CONFIG_USER_ONLY)
+#include "tcg/aok/aok-i386.h"
+#endif
 
 #include "disas/capstone.h"
 #include "cpu-internal.h"
@@ -8209,6 +8213,37 @@ static uint8_t x86_cpu_get_host_avx10_version(void)
     return ebx & 0xff;
 }
 
+#if defined(CONFIG_AOK_GADGETS) && defined(TARGET_X86_64) && \
+    !defined(CONFIG_USER_ONLY)
+/*
+ * What the AOK gadgets add to TCG's: AVX-512 and the extensions that come
+ * with it, the opmask and ZMM state, and the VEX and legacy forms of GFNI,
+ * VPCLMULQDQ and AVX-VNNI, which they compute with AVX-512's ops
+ * (target/i386/tcg/aok/vec). The same set iSH-AOK offers.
+ */
+static uint64_t aok_avx512_features(FeatureWord w)
+{
+    switch (w) {
+    case FEAT_7_0_EBX:
+        return CPUID_7_0_EBX_AVX512F | CPUID_7_0_EBX_AVX512DQ |
+               CPUID_7_0_EBX_AVX512IFMA | CPUID_7_0_EBX_AVX512CD |
+               CPUID_7_0_EBX_AVX512BW | CPUID_7_0_EBX_AVX512VL;
+    case FEAT_7_0_ECX:
+        return CPUID_7_0_ECX_AVX512_VBMI | CPUID_7_0_ECX_AVX512_VBMI2 |
+               CPUID_7_0_ECX_GFNI | CPUID_7_0_ECX_VPCLMULQDQ |
+               CPUID_7_0_ECX_AVX512VNNI | CPUID_7_0_ECX_AVX512BITALG |
+               CPUID_7_0_ECX_AVX512_VPOPCNTDQ;
+    case FEAT_7_1_EAX:
+        return CPUID_7_1_EAX_AVX_VNNI | CPUID_7_1_EAX_AVX512_BF16;
+    case FEAT_XSAVE_XCR0_LO:
+        return XSTATE_OPMASK_MASK | XSTATE_ZMM_Hi256_MASK |
+               XSTATE_Hi16_ZMM_MASK;
+    default:
+        return 0;
+    }
+}
+#endif
+
 uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w)
 {
     FeatureWordInfo *wi = &feature_word_info[w];
@@ -8253,6 +8288,12 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w)
         }
     } else if (tcg_enabled() || qtest_enabled()) {
         r = wi->tcg_features;
+#if defined(CONFIG_AOK_GADGETS) && defined(TARGET_X86_64) && \
+    !defined(CONFIG_USER_ONLY)
+        if (x86_aok_avx512()) {
+            r |= aok_avx512_features(w);
+        }
+#endif
     } else {
         return ~0;
     }

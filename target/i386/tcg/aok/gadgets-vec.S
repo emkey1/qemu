@@ -27,9 +27,9 @@
  *   The FP environment. A frame of the floating-point kind (VEX_FP set
  *   where it is defined) computes on the host's FP unit with FPCR's rounding
  *   mode MXCSR's (aok_x86_fp_begin installs it when a stream first uses the
- *   unit), and what the host raised is folded into MXCSR's flags before the
- *   gadget dispatches; the double gadgets of gadgets.S leave only inexact in
- *   FPSR, which the first frame after them folds too.
+ *   unit), and what the host raised accumulates in FPSR, as the double
+ *   gadgets' inexact does, until the stream ends and it is MXCSR's
+ *   (x86_aok_fold_fpsr).
  *
  *   The flags. A frame that sets EFLAGS does so as QEMU's CC_OP_EFLAGS has
  *   them, all six in cc_src (x86_vflags).
@@ -55,12 +55,13 @@ _addr   .req x7
 _ea     .req x6
 
 /*
- * The FP environment of a floating-point frame. On entry: the stream's
- * first use of the unit gives FPCR MXCSR's rounding (a call to C, before the
- * frame has read anything), and an inexact some double gadget left in FPSR
- * is MXCSR's PE now; FPSR is then clear, so on the way out it holds exactly
- * what this frame raised, which goes to MXCSR's flags: IOC IE, DZC ZE, OFC
- * OE, UFC UE, IXC PE, IDC DE.
+ * The FP environment of a floating-point frame: the stream's first use of
+ * the unit gives FPCR MXCSR's rounding (aok_x86_fp_begin, a call to C before
+ * the frame has read anything, which clears FPSR). What the frames raise
+ * then accumulates in FPSR, as the bodies expect (they keep what was there
+ * where they look at a flag of their own), and is MXCSR's when the stream
+ * ends (aok_fp_end, x86_aok_fold_fpsr): IOC IE, DZC ZE, OFC OE, UFC UE, IXC
+ * PE, IDC DE.
  */
 .macro vfp_enter
     cbnz _fpact, .Lvfp_on\@
@@ -69,34 +70,11 @@ _ea     .req x6
     mov _fpok, x0
     mov _fpact, #1
 .Lvfp_on\@:
-    mrs x9, fpsr
-    cbz x9, .Lvfp_clean\@
-    tbz x9, #4, .Lvfp_clear\@
-    ldr w10, [_cpu, #CPU_mxcsr]
-    orr w10, w10, #0x20
-    str w10, [_cpu, #CPU_mxcsr]
-.Lvfp_clear\@:
-    msr fpsr, xzr
-.Lvfp_clean\@:
-.endm
-.macro vfp_leave
-    mrs x9, fpsr
-    cbz x9, .Lvfp_none\@
-    and w10, w9, #1
-    and w11, w9, #0x1e
-    orr w10, w10, w11, lsl #1
-    ubfx w11, w9, #7, #1
-    orr w10, w10, w11, lsl #1
-    ldr w11, [_cpu, #CPU_mxcsr]
-    orr w11, w11, w10
-    str w11, [_cpu, #CPU_mxcsr]
-    msr fpsr, xzr
-.Lvfp_none\@:
 .endm
 
 /*
  * A gadget, and its end. While VEX_FP is set (around the floating-point
- * frames in vex.inc) both see to the FP environment.
+ * frames in vex.inc and evex.inc) a gadget begins the FP environment.
  */
 .set VEX_FP, 0
 .macro .gadget name
@@ -109,9 +87,6 @@ SYM(aok_gadget_x86_\name):
 .endm
 .purgem gret
 .macro gret pop=0
-    .if VEX_FP
-    vfp_leave
-    .endif
     ldr x9, [_ip, #(\pop * 8)]
     add _ip, _ip, #(\pop * 8 + 8)
     br x9
@@ -400,14 +375,21 @@ vec_mem_aligned \form, \n, _mp
  * vm_elems: x16 = the elements the opmask enables (the field at bit \ks of
  * the EVEX word in x8, the log2 of their size 4 bits up, in x15), w14 = the
  * operand's bytes: 16 << VL, or 1 << bits 59-61 with bit 58 (a narrowing
- * store's). Clobbers x9, x11.
+ * store's). With the host's word's bit 5 the mask is not an opmask's but
+ * VM_KSTAGE's (VEX's VMASKMOV, vmskk). Clobbers x9, x11.
  */
+#define VM_KSTAGE       (VEX_STAGE + 248)
 .macro vm_elems ks
-    ubfx x9, x8, #\ks, #3
+    ldr x9, [_ip, #-16]
+    tbz x9, #5, 3f
+    mov x11, #VM_KSTAGE                  /* (VEX's VMASKMOV: vmskk's) */
+    ldr x16, [_cpu, x11]
+    b 4f
+3:  ubfx x9, x8, #\ks, #3
     mov x11, #CPU_avx512_k
     add x11, _cpu, x11
     ldr x16, [x11, x9, lsl #3]
-    ubfx x15, x8, #(\ks + 4), #2
+4:  ubfx x15, x8, #(\ks + 4), #2
     ubfx w9, w8, #16, #2
     mov w14, #16
     lsl w14, w14, w9
@@ -783,3 +765,76 @@ evex_mem_one \form
 evex_mem_one \form, _mp
 .endr
 .set X86_MP, 0
+
+/*
+ * VEX's VMASKMOVPS/PD and VPMASKMOVD/Q: the mask is each element's sign in
+ * a vector register. vmskk: [mask register (0-3) | qword elements (4)],
+ * its bits to VM_KSTAGE for the vldm or vstm after it (with the host's
+ * word's bit 5), which touch only the enabled elements. vmskld: [dst (0-3)
+ * | mask register (4-7) | qword elements (8) | L (9)], the loaded stage
+ * into dst, the masked-off elements zero, and zero past L as VEX's are.
+ */
+.gadget vmskk
+    ldr x8, [_ip]
+    and x9, x8, #15
+    lsl x9, x9, #6
+    add x9, x9, #CPU_xmm
+    add x9, _cpu, x9
+    ldp q0, q1, [x9]
+    tbnz x8, #4, 1f
+    ushr v0.4s, v0.4s, #31
+    ushr v1.4s, v1.4s, #31
+    adr x10, vmskk_weights
+    ldr q2, [x10]
+    mul v0.4s, v0.4s, v2.4s
+    mul v1.4s, v1.4s, v2.4s
+    addv s0, v0.4s
+    addv s1, v1.4s
+    fmov w11, s0
+    fmov w12, s1
+    orr w11, w11, w12, lsl #4
+    b 2f
+1:  ushr v0.2d, v0.2d, #63
+    ushr v1.2d, v1.2d, #63
+    mov x11, v0.d[0]
+    mov x12, v0.d[1]
+    orr x11, x11, x12, lsl #1
+    mov x12, v1.d[0]
+    orr x11, x11, x12, lsl #2
+    mov x12, v1.d[1]
+    orr x11, x11, x12, lsl #3
+2:  mov x9, #VM_KSTAGE
+    str x11, [_cpu, x9]
+    gret 1
+.balign 16
+vmskk_weights:
+    .word 1, 2, 4, 8
+
+.gadget vmskld
+    ldr x8, [_ip]
+    ubfx x9, x8, #4, #4
+    lsl x9, x9, #6
+    add x9, x9, #CPU_xmm
+    add x9, _cpu, x9
+    and x10, x8, #15
+    lsl x10, x10, #6
+    add x10, x10, #CPU_xmm
+    add x10, _cpu, x10
+    mov x11, #VEX_STAGE
+    add x11, _cpu, x11
+    ldp q0, q1, [x11]
+    ldp q2, q3, [x9]
+    tbnz x8, #8, 1f
+    cmlt v2.4s, v2.4s, #0
+    cmlt v3.4s, v3.4s, #0
+    b 2f
+1:  cmlt v2.2d, v2.2d, #0
+    cmlt v3.2d, v3.2d, #0
+2:  and v0.16b, v0.16b, v2.16b
+    and v1.16b, v1.16b, v3.16b
+    tbnz x8, #9, 3f
+    movi v1.2d, #0
+3:  stp q0, q1, [x10]
+    stp xzr, xzr, [x10, #32]
+    stp xzr, xzr, [x10, #48]
+    gret 1

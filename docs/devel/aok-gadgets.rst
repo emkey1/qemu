@@ -496,14 +496,23 @@ with the gadgets.
   lookup with the indices computed at translation. Without VEX an
   operation's memory operand must be aligned: the fast path sees that, and
   anything else is ``cputlb``'s to raise.
-* **Floating point.** An arithmetic instruction is a call of the helper
-  TCG's code would call, which is softfloat. For doubles (``addsd`` to
-  ``divsd``, ``sqrtsd``, the packed four, ``comisd`` and ``ucomisd``,
-  ``cvtsi2sd``, ``cvttsd2si``) the gadget first tries the host's FP unit, in
-  the cases where it gives softfloat's answer with softfloat's flags:
-  ``gadgets.S`` lists what differs between SSE and AArch64 (denormal
-  operands, which NaN, tininess) and what that leaves, which is normal
-  numbers and zeros under a plain MXCSR, raising at most inexact.
+* **Floating point** is VEX's frames (below), which are x86's where QEMU's
+  softfloat helpers are not: which NaN an operation returns (SSE's is the
+  first source, softfloat's the x87's), MINPS and MAXPS under DAZ, RCPPS's
+  table, the flags. A legacy SSE instruction is its VEX form with the
+  destination as the first source, its word saying that bits 511:128 stay
+  (and a 16-byte operand in memory must be aligned): the arithmetic, square
+  roots, compares and the conversions of SSE and SSE2, SSE3's, and the
+  SSSE3 and SSE4.1 instructions that have a VEX form (legacy BLENDV's
+  implicit xmm0 is the VEX form's mask register), each where the CPU offers
+  it. For doubles (``addsd`` to ``divsd``, ``sqrtsd``, the packed four) a
+  gadget first tries the host's FP unit, where it is exact: ``gadgets.S``
+  lists what differs between SSE and AArch64 (denormal operands, which NaN,
+  tininess) and what that leaves, which is normal numbers and zeros under a
+  plain MXCSR, raising at most inexact; anything else falls into the frame
+  behind it. What the host raises accumulates in FPSR until the stream
+  ends and is MXCSR's then. ``QEMU_AOK_X86_SSEHELPERS=1`` gives the old
+  way back: QEMU's helpers, with the host first for doubles.
 * **The x87** is not softfloat's here. The 80-bit arithmetic, the register
   stack with its tags and faults, every D8-DF instruction's register form,
   the transcendentals and what a memory form does once it has its operand
@@ -534,8 +543,8 @@ with the gadgets.
   whether XCR0 enables it, TCG's XSAVE and XRSTOR carry its state, and a
   VEX write of TCG's zeroes the register to bit 511 as the hardware's does.
   A memory operand is staged before the frame and stored after it (a store
-  that follows a frame that changes MXCSR is probed first); with an opmask
-  only the enabled elements are touched, so that a masked-off one may be on
+  that follows a frame that changes MXCSR is probed first); with an opmask,
+  or VEX's VMASKMOV's mask register, only the enabled elements are touched, so that a masked-off one may be on
   a page that is not there, and a gather or scatter goes element by
   element, restartable as x86's. iSH-AOK's test programs, with answers
   from an AMD Ryzen and Intel SDE, run in the gate image
@@ -550,9 +559,8 @@ with the gadgets.
   control and debug registers, loads of ``ss`` and ``cs``, string I/O,
   ``cmpxchg16b``, the rotates through carry, 16-bit ``adc``/``sbb`` and stack
   operations, 16-bit addressing, a bit string addressed by a register,
-  the 0F 38 and 0F 3A maps but for GFNI, AES and PCLMULQDQ, VEX's gathers,
-  masked moves and string compares, and
-  32-bit code's VEX. Not yet anywhere: EVEX in 32-bit code, and a memory
+  SSE4.2's string compares and CRC32, SHA, SSE4.1's PEXTR*, EXTRACTPS and
+  MOVNTDQA, VEX's gathers and string compares, and 32-bit code's VEX. Not yet anywhere: EVEX in 32-bit code, and a memory
   operand of an EVEX instruction with a 0x67 prefix (both raise #UD).
 
 A TB is translated only with no single-step flag pending, outside the shadow

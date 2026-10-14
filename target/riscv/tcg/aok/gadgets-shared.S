@@ -1,18 +1,16 @@
 /*
- * AOK gadgets for RISC-V guests: the ones shared with iSH-AOK.
+ * AOK gadgets for RISC-V guests: the ones taken from iSH-AOK.
  *
  * The integer gadgets, the loads and stores, the branches, and the fused
- * pairs made of them are not written here. shared/ holds iSH-AOK's own
- * sources for them (jit/guest-riscv64/alu.S, frag.h and pairs.h there),
- * copied by scripts/aok-gadgets-sync.sh and assembled as they are: what is
- * improved there arrives here with the next copy. Do not edit them here.
+ * pairs made of them are in shared/: iSH-AOK's sources for them
+ * (jit/guest-riscv64/alu.S, frag.h and pairs.h there), taken on 2026-10-14
+ * and this tree's own since (shared/SOURCE).
  *
- * This file is the other half of the arrangement, the definitions a host of
- * those sources owes them (frag.h, "A second host"): the registers, how a
- * gadget begins and ends, how guest memory is reached, how a TB is left,
- * and which of the gadgets pairs.h names this host has
- * (shared/host-gadgets.h, written by the same script from what this file
- * assembles to).
+ * This file is what a host of those sources gives them (frag.h, "A second
+ * host"): the registers, how a gadget begins and ends, how guest memory is
+ * reached, how a TB is left, and which of the gadgets pairs.h names this
+ * host has (shared/host-gadgets.h, which scripts/aok-host-gadgets.sh writes
+ * from what this file assembles to).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */

@@ -1,14 +1,12 @@
 /*
- * AOK gadgets for AArch64 guests: the ones shared with iSH-AOK.
+ * AOK gadgets for AArch64 guests: the ones taken from iSH-AOK.
  *
- * The integer gadgets and the bodies of the loads and stores are not written
- * here. shared/ holds iSH-AOK's own sources for them (jit/guest-arm64 there:
- * alu_spec.S, frag.h), copied by scripts/aok-gadgets-sync.sh and assembled as
- * they are: what is improved there arrives here with the next copy. Do not
- * edit them here.
+ * The integer gadgets, the bodies of the loads, stores and branches, and the
+ * fused pairs are in shared/: iSH-AOK's sources for them (jit/guest-arm64
+ * there: alu_spec.S, frag.h, pairs.h), taken on 2026-10-14 and this tree's
+ * own since (shared/SOURCE).
  *
- * This file is the other half of the arrangement, the definitions a host of
- * those sources owes them (frag.h, "A second host"): the registers, how a
+ * This file is what a host of those sources gives them (frag.h, "A second host"): the registers, how a
  * gadget begins and ends, where the guest's flags are, how guest memory is
  * reached.
  *
@@ -169,6 +167,50 @@ handle_miss_\id:
     a64_slow aok_a64_helper_st, \id, \ahead
 .endm
 
+/* ---- Leaving a TB, as frag.h's branches do --------------------------------------
+ *
+ * A way out is two words, [pc delta][slot] (a64_leave), and a code address in
+ * the stream is a delta from the TB's first insn, as everywhere here.
+ */
+#define F_WAY_WORDS 2
+#define F_X0 (AOK_A64_ENV_X30 - 30 * 8)
+.macro branch_leave off
+    a64_leave \off
+.endm
+.macro pc_param reg
+    add \reg, _pc, \reg
+.endm
+
+/*
+ * The indirect branches, which are a host's own (frag.h), under iSH-AOK's
+ * names so that its pairs can end in them. br and ret: [rn offset][tbi]
+ * [link delta, unused][flags | cflags << 32][cs_base]; blr the same, the link
+ * written. A pair's first half may hand the target over in a register (fn).
+ */
+.macro f_br_cached_body id, last, a1, a2, a3, a4, a5, fn=_, fm=_
+    ldp x9, x11, [_ip]
+    f_src 10, x9, \fn
+    a64_tbi
+    str x10, [_pcp]
+    add _ip, _ip, #24
+    b SYM(aok_a64_lookup_pc)
+.endm
+.macro f_br_cached_stub id, last, a1, a2, a3, a4, a5, fn=_, fm=_
+.endm
+.macro f_blr_cached_body id, last, a1, a2, a3, a4, a5, fn=_, fm=_
+    ldp x9, x11, [_ip]
+    ldr x13, [_ip, #16]
+    f_src 10, x9, \fn
+    add x13, _pc, x13
+    a64_tbi
+    str x13, [_cpu, #AOK_A64_ENV_X30]
+    str x10, [_pcp]
+    add _ip, _ip, #24
+    b SYM(aok_a64_lookup_pc)
+.endm
+.macro f_blr_cached_stub id, last, a1, a2, a3, a4, a5, fn=_, fm=_
+.endm
+
     .text
 
 #include "shared/alu_spec.S"
@@ -178,8 +220,8 @@ handle_miss_\id:
  * iSH-AOK's names for them (memory.S, math.S, simd_spec.S there).
  */
 f_gadget mov_const, f_mov_const, _, _, _, _, _
-f_gadget umov64, f_umov, ldr, x12, _, _, _
-f_gadget umov32, f_umov, ldr, w12, _, _, _
+f_gadget vspec_umov64, f_umov, ldr, x12, _, _, _
+f_gadget vspec_umov32, f_umov, ldr, w12, _, _, _
 
 f_gadget load8_fast,      f_load,  8, ldrb,  w17, _, _
 f_gadget load16_fast,     f_load, 16, ldrh,  w17, _, _
@@ -195,22 +237,25 @@ f_gadget store16_fast,    f_store, 16, strh, w17, _, _
 f_gadget store32_fast,    f_store, 32, str,  w17, _, _
 f_gadget store64_fast,    f_store, 64, str,  x17, _, _
 
-/* Register offset: _rx (the index as it is), _rxs (sxtw), _rxu (uxtw). */
-.irp ext, 0, 1, 2
-f_gadget load8_rx\ext,      f_load_rx,  8, ldrb,  w17, \ext, _
-f_gadget load16_rx\ext,     f_load_rx, 16, ldrh,  w17, \ext, _
-f_gadget load32_rx\ext,     f_load_rx, 32, ldr,   w17, \ext, _
-f_gadget load64_rx\ext,     f_load_rx, 64, ldr,   x17, \ext, _
-f_gadget loads8_32_rx\ext,  f_load_rx,  8, ldrsb, w17, \ext, _
-f_gadget loads8_64_rx\ext,  f_load_rx,  8, ldrsb, x17, \ext, _
-f_gadget loads16_32_rx\ext, f_load_rx, 16, ldrsh, w17, \ext, _
-f_gadget loads16_64_rx\ext, f_load_rx, 16, ldrsh, x17, \ext, _
-f_gadget loads32_64_rx\ext, f_load_rx, 32, ldrsw, x17, \ext, _
-f_gadget store8_rx\ext,     f_store_rx,  8, strb, w17, \ext, _
-f_gadget store16_rx\ext,    f_store_rx, 16, strh, w17, \ext, _
-f_gadget store32_rx\ext,    f_store_rx, 32, str,  w17, \ext, _
-f_gadget store64_rx\ext,    f_store_rx, 64, str,  x17, \ext, _
-.endr
+/* Register offset, under iSH-AOK's names: _rxl (the index as it is), _rxs (sxtw), _rxu (uxtw). */
+.macro a64_rx ext, sfx
+f_gadget load8_rx\sfx,      f_load_rx,  8, ldrb,  w17, \ext, _
+f_gadget load16_rx\sfx,     f_load_rx, 16, ldrh,  w17, \ext, _
+f_gadget load32_rx\sfx,     f_load_rx, 32, ldr,   w17, \ext, _
+f_gadget load64_rx\sfx,     f_load_rx, 64, ldr,   x17, \ext, _
+f_gadget loads8_32_rx\sfx,  f_load_rx,  8, ldrsb, w17, \ext, _
+f_gadget loads8_64_rx\sfx,  f_load_rx,  8, ldrsb, x17, \ext, _
+f_gadget loads16_32_rx\sfx, f_load_rx, 16, ldrsh, w17, \ext, _
+f_gadget loads16_64_rx\sfx, f_load_rx, 16, ldrsh, x17, \ext, _
+f_gadget loads32_64_rx\sfx, f_load_rx, 32, ldrsw, x17, \ext, _
+f_gadget store8_rx\sfx,     f_store_rx,  8, strb, w17, \ext, _
+f_gadget store16_rx\sfx,    f_store_rx, 16, strh, w17, \ext, _
+f_gadget store32_rx\sfx,    f_store_rx, 32, str,  w17, \ext, _
+f_gadget store64_rx\sfx,    f_store_rx, 64, str,  x17, \ext, _
+.endm
+a64_rx 0, l
+a64_rx 1, s
+a64_rx 2, u
 
 /* Pairs: offset, post-index, pre-index. (A pair of words is one 64-bit access.) */
 f_gadget ldp64_fast, f_ldp, 128, 8, x17, _fval2, _
@@ -594,3 +639,57 @@ v_struct vld1_\n\()_d, \n, 8, d0, d1, d2, d3, 1
 v_struct vst1_\n\()_q, \n, 16, q0, q1, q2, q3, 0
 v_struct vst1_\n\()_d, \n, 8, d0, d1, d2, d3, 0
 .endr
+
+/* ---- Branches: frag.h's bodies, under iSH-AOK's names -------------------------- */
+f_gadget b, f_b, _, _, _, _, _
+f_gadget bl, f_bl, _, _, _, _, _
+f_gadget br_cached, f_br_cached, _, _, _, _, _
+f_gadget blr_cached, f_blr_cached, _, _, _, _, _
+f_gadget ret_cached, f_br_cached, _, _, _, _, _
+/* cbz, cbnz: [rt offset][taken way][other way]; _bk for a branch backwards */
+.macro a64_cb name, reg, jmp, jmp_bk
+    f_gadget \name, f_cb, \reg, \jmp, _, _, _
+    f_gadget \name\()_bk, f_cb_bk, \reg, \jmp_bk, _, _, _
+.endm
+a64_cb cbz_x,  x9, cbz,  cbnz
+a64_cb cbz_w,  w9, cbz,  cbnz
+a64_cb cbnz_x, x9, cbnz, cbz
+a64_cb cbnz_w, w9, cbnz, cbz
+/* tbz, tbnz: [rt offset][bit mask][taken way][other way] */
+.macro a64_tb name, jmp, jmp_bk
+    f_gadget \name, f_tb, \jmp, _, _, _, _
+    f_gadget \name\()_bk, f_tb_bk, \jmp_bk, _, _, _, _
+.endm
+a64_tb tb_z,  cbz,  cbnz
+a64_tb tb_nz, cbnz, cbz
+/*
+ * b.cond: [taken way][other way], reloading the flags or (_nf) not; and a
+ * cmp with the b.cond after it, one gadget: [rn][imm] or [rn | rm << 8],
+ * then the two ways (register numbers: F_X0).
+ */
+.irp cc, CONDS
+f_gadget bcond_\cc, f_bcond, \cc, _, _, _, _
+f_gadget bcond_nf_\cc, f_bcond_nf, \cc, _, _, _, _
+f_gadget fused_cmpi64_\cc, f_fused_cmpi, subs, xzr, x15, x11, \cc
+f_gadget fused_cmpi32_\cc, f_fused_cmpi, subs, wzr, w15, w11, \cc
+f_gadget fused_cmpr64_\cc, f_fused_cmpr, subs, xzr, x15, x13, \cc
+f_gadget fused_cmpr32_\cc, f_fused_cmpr, subs, wzr, w15, w13, \cc
+.endr
+
+/*
+ * ---- Fused pairs ------------------------------------------------------------------
+ *
+ * iSH-AOK's list (shared/pairs.h), less the pairs with a gadget this front end
+ * does not have (shared/host-gadgets.h, which scripts/aok-host-gadgets.sh
+ * writes by assembling this file without them).
+ */
+#include "shared/host-gadgets.h"
+#define FUSE2(a, b) A64_HOST(HOST_##a, HOST_##b)(a, b)
+#define A64_HOST(x, y) A64_HOST_(x, y)
+#define A64_HOST_(x, y) A64_HOST_##x##y
+#define A64_HOST_00(a, b)
+#define A64_HOST_01(a, b)
+#define A64_HOST_10(a, b)
+#define A64_HOST_11(a, b) fuse2 a##__##b, R_##a, K_##b, F_##a, F_##b
+#include "shared/pairs.h"
+#undef FUSE2

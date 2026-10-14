@@ -71,14 +71,14 @@ LOGIC_SH(bic) LOGIC_SH(orn) LOGIC_SH(eon)
     DECL(ospec_##op##_uxtb32) DECL(ospec_##op##_uxth32) \
     DECL(ospec_##op##_sxtb32) DECL(ospec_##op##_sxth32)
 EXT_OP(add) EXT_OP(sub)
-DECL(mov_const) D2(umov)
+DECL(mov_const) D2(vspec_umov)
 #define LOADS(X, s) X(load8##s) X(load16##s) X(load32##s) X(load64##s) \
     X(loads8_32##s) X(loads8_64##s) X(loads16_32##s) X(loads16_64##s) \
     X(loads32_64##s)
 #define STORES(X, s) X(store8##s) X(store16##s) X(store32##s) X(store64##s)
 LOADS(DECL, _fast) STORES(DECL, _fast)
-LOADS(DECL, _rx0) STORES(DECL, _rx0) LOADS(DECL, _rx1) STORES(DECL, _rx1)
-LOADS(DECL, _rx2) STORES(DECL, _rx2)
+LOADS(DECL, _rxl) STORES(DECL, _rxl) LOADS(DECL, _rxs) STORES(DECL, _rxs)
+LOADS(DECL, _rxu) STORES(DECL, _rxu)
 LOADS(DECL, _wb0) STORES(DECL, _wb0) LOADS(DECL, _wb1) STORES(DECL, _wb1)
 LOADS(DECL, _user) STORES(DECL, _user)
 DECL(load16_ord) DECL(load32_ord) DECL(load64_ord)
@@ -103,8 +103,7 @@ ALUS(adds) ALUS(subs) ALUS(ands) ALUS(bics)
     DECL(op##_uxtb32) DECL(op##_uxth32) DECL(op##_uxtx32) \
     DECL(op##_sxtb32) DECL(op##_sxth32)
 ALUXS(adds) ALUXS(subs)
-DECL(b) DECL(bl) D2(cbz) D2(cbnz) DECL(tbz) DECL(tbnz)
-DECL(br) DECL(blr) DECL(br_exit) DECL(blr_exit) DECL(lookup) DECL(barrier)
+DECL(br_exit) DECL(blr_exit) DECL(lookup) DECL(barrier)
 DECL(call) DECL(call_exit) DECL(mrs_sp_el0)
 
 /* FP and SIMD registers: loads and stores (gadgets-shared.S) ... */
@@ -143,8 +142,87 @@ THUNKS(fcsel) THUNKS(aes) THUNKS(sha3) THUNKS(sha2) THUNKS(crc)
 #define COND_TABLE(p) { { CONDS(ENTRY, p, ) }, { CONDS(ENTRY, p##nf_, ) } }
 #define COND_DECL(p) CONDS(DECL, p, ) CONDS(DECL, p##nf_, )
 
-COND_DECL(b_)
-static const Gadget bcond_tab[2][14] = COND_TABLE(b_);
+/*
+ * The branches are iSH-AOK's (frag.h's bodies, gadgets-shared.S), and so is
+ * a cmp with the b.cond after it as one gadget: [nf][cond], [sf][cond].
+ */
+DECL(b) DECL(bl) DECL(br_cached) DECL(blr_cached) DECL(ret_cached)
+#define BK(name) DECL(name) DECL(name##_bk)
+BK(cbz_x) BK(cbz_w) BK(cbnz_x) BK(cbnz_w) BK(tb_z) BK(tb_nz)
+COND_DECL(bcond_)
+static const Gadget bcond_tab[2][14] = COND_TABLE(bcond_);
+CONDS(DECL, fused_cmpi64_, ) CONDS(DECL, fused_cmpi32_, )
+CONDS(DECL, fused_cmpr64_, ) CONDS(DECL, fused_cmpr32_, )
+static const Gadget fused_cmpi_tab[2][14] = {
+    { CONDS(ENTRY, fused_cmpi32_, ) }, { CONDS(ENTRY, fused_cmpi64_, ) }
+};
+static const Gadget fused_cmpr_tab[2][14] = {
+    { CONDS(ENTRY, fused_cmpr32_, ) }, { CONDS(ENTRY, fused_cmpr64_, ) }
+};
+
+/*
+ * The fused pairs: iSH-AOK's list (shared/pairs.h), read as the RISC-V front
+ * end reads its own (translate.c there), less the pairs with a gadget this
+ * front end does not have (shared/host-gadgets.h). FUSE2(a, b) names a pair;
+ * HR_a says that a leaves its result in a host register as well, K_b how many
+ * operands b can take from one, and OPS_b which operand words those are: a
+ * register's offset, or its number (the set's reg_base is x0's offset).
+ */
+#include "shared/host-gadgets.h"
+#define PAIR_OP_NONE AOK_PAIR_OP_NONE
+#define PAIR_OP_SLOT AOK_PAIR_OP_SLOT
+#define PAIR_OP_REG AOK_PAIR_OP_REG
+#define PAIR_OP_REG8 AOK_PAIR_OP_REG8
+#define PAIR_OP_REG_NOT31 AOK_PAIR_OP_REG_NOT31
+#define FUSE2(a, b) A64_HOST(HOST_##a, HOST_##b)(a, b)
+#define A64_HOST(x, y) A64_HOST_(x, y)
+#define A64_HOST_(x, y) A64_HOST_##x##y
+#define A64_HOST_00(a, b)
+#define A64_HOST_01(a, b)
+#define A64_HOST_10(a, b)
+#define A64_HOST_11(a, b) A64_FUSE2_SEL(HR_##a, K_##b)(a, b)
+#define A64_FUSE2_SEL(h, k) A64_FUSE2_SEL_(h, k)
+#define A64_FUSE2_SEL_(h, k) A64_FUSE2_##h##_##k
+#define A64_FUSE2_0_0(a, b) \
+    A64_PAIR(a, b, NULL, NULL, {0, PAIR_OP_NONE}, {0, PAIR_OP_NONE})
+#define A64_FUSE2_0_1(a, b) A64_FUSE2_0_0(a, b)
+#define A64_FUSE2_0_2(a, b) A64_FUSE2_0_0(a, b)
+#define A64_FUSE2_1_0(a, b) A64_FUSE2_0_0(a, b)
+#define A64_FUSE2_1_1(a, b) A64_FW1(a, b) \
+    A64_PAIR(a, b, G(f2n_##a##__##b), NULL, OPS_##b, {0, PAIR_OP_NONE})
+#define A64_FUSE2_1_2(a, b) A64_FW1(a, b) A64_FW2(a, b) \
+    A64_PAIR(a, b, G(f2n_##a##__##b), G(f2m_##a##__##b), OPS_##b)
+
+#define A64_PAIR(a, b, fn, fm, ...) DECL(a) DECL(b) DECL(f2_##a##__##b)
+#define A64_FW1(a, b) DECL(f2n_##a##__##b)
+#define A64_FW2(a, b) DECL(f2m_##a##__##b)
+#include "shared/pairs.h"
+#undef A64_PAIR
+#undef A64_FW1
+#undef A64_FW2
+
+static const AokPair a64_pair_list[] = {
+#define A64_PAIR(a, b, fn, fm, ...) \
+    { G(a), G(b), G(f2_##a##__##b), { fn, fm }, 1 + NP_##a, { __VA_ARGS__ } },
+#define A64_FW1(a, b)
+#define A64_FW2(a, b)
+#include "shared/pairs.h"
+#undef A64_PAIR
+#undef A64_FW1
+#undef A64_FW2
+#undef FUSE2
+};
+
+static AokPairSet a64_pairs = { a64_pair_list, ARRAY_SIZE(a64_pair_list) };
+static bool a64_pairs_on;
+
+static void __attribute__((constructor)) a64_pairs_init(void)
+{
+    a64_pairs_on = !getenv("QEMU_AOK_NO_PAIRS");
+    a64_pairs.forward = !getenv("QEMU_AOK_NO_FWD");
+    a64_pairs.reg_base = offsetof(CPUARMState, xregs[0]);
+    aok_pair_set_init(&a64_pairs);
+}
 
 #define CSEL_DECL(op) COND_DECL(op##64_) COND_DECL(op##32_)
 CSEL_DECL(csel) CSEL_DECL(csinc) CSEL_DECL(csinv) CSEL_DECL(csneg)
@@ -195,6 +273,9 @@ typedef struct Ctx {
      */
     bool nf;
     int tbi;                /* an indirect branch's operand (gadgets.S) */
+    const uint8_t *code;    /* the TB's first insn, for a look at the next */
+    bool fused_bcond;       /* this step took the b.cond after it as well */
+    bool no_fuse;           /* QEMU_AOK_NO_FUSE: no cmp + b.cond gadgets */
     ARMCPU *cpu;
     int el, fp_excp_el;
     bool bti, pauth_active, pauth, fgt, no_goto_ptr;
@@ -1134,6 +1215,34 @@ static bool decode_bitmask(uint64_t *result, unsigned immn, unsigned imms,
     return true;
 }
 
+/*
+ * A cmp and the b.cond after it, as one gadget (frag.h's fused_cmpi and
+ * fused_cmpr): the compare runs, NZCV is stored, and the branch tests the
+ * host's flags. The b.cond is this step's too, and the TB ends: iSH-AOK's
+ * gen_arm64_peek_bcond, for the same compares. @n operand words, a and b.
+ */
+static bool fuse_bcond(Ctx *c, const Gadget tab[14], uint64_t a, uint64_t b,
+                       int n)
+{
+    uint32_t next;
+    int64_t imm19;
+
+    if (c->no_fuse || c->page_off + c->off + 8 > TARGET_PAGE_SIZE ||
+        c->g.n_insns + 2 > c->g.max_insns) {
+        return false;
+    }
+    next = ldl_le_p(c->code + c->off + 4);
+    if ((next & 0xff000010) != 0x54000000 || (next & 15) >= 14) {
+        return false;
+    }
+    imm19 = sextract64(next, 5, 19) << 2;
+    emit(c, tab[next & 15], n, a, b);
+    way(c, 0, c->off + 4 + imm19);
+    way(c, 1, c->off + 8);
+    c->fused_bcond = true;
+    return true;
+}
+
 static int dp_imm(Ctx *c, uint32_t insn)
 {
     unsigned sf = insn >> 31, rd = insn & 31, rn = (insn >> 5) & 31;
@@ -1158,6 +1267,9 @@ static int dp_imm(Ctx *c, uint32_t insn)
         bool sub = insn & (1 << 30), s = insn & (1 << 29);
 
         if (s && rd == 31) {
+            if (sub && rn != 31 && fuse_bcond(c, fused_cmpi_tab[sf], rn, imm, 2)) {
+                return END;
+            }
             E2(sub ? SF(ospec_cmpi) : SF(ospec_cmni), rsp(rn), imm);
         } else if (s) {
             E3(sub ? SF(ospec_subsi) : SF(ospec_addsi), wz(rd), rsp(rn), imm);
@@ -1243,7 +1355,7 @@ static int dp_imm(Ctx *c, uint32_t insn)
             return UNKNOWN;
         }
         if (imms == 0) {
-            E2(SF(umov), wz(rd), rz(rm));
+            E2(SF(vspec_umov), wz(rd), rz(rm));
         } else if (rn == rm) {
             E3(SF(ospec_ror), wz(rd), rz(rn), imms);
         } else {
@@ -1303,7 +1415,7 @@ static int dp_reg(Ctx *c, uint32_t insn)
             } else if (imm6) {
                 E4(shifted[which][shift][sf], wz(rd), rz(rn), rz(rm), imm6);
             } else if (which == 2 && rn == 31) {
-                E2(SF(umov), wz(rd), rz(rm));               /* mov */
+                E2(SF(vspec_umov), wz(rd), rz(rm));               /* mov */
             } else if (which == 3 && rn == 31) {
                 E2(SF(ospec_mvn), wz(rd), rz(rm));
             } else {
@@ -1322,6 +1434,10 @@ static int dp_reg(Ctx *c, uint32_t insn)
                 if (imm6) {
                     E4(fl[op][shift][sf], wz(rd), rz(rn), rz(rm), imm6);
                 } else if (rd == 31) {
+                    if (op && rn != 31 && rm != 31 &&
+                        fuse_bcond(c, fused_cmpr_tab[sf], rn | rm << 8, 0, 1)) {
+                        return END;
+                    }
                     E2(op ? SF(ospec_cmpr) : SF(ospec_cmnr), rz(rn), rz(rm));
                 } else {
                     E3(op ? SF(ospec_subsr) : SF(ospec_addsr),
@@ -1429,7 +1545,7 @@ static int dp_reg(Ctx *c, uint32_t insn)
             return UNKNOWN;
         }
         if (cond >= 14) {
-            E2(SF(umov), wz(rd), rz(rn));
+            E2(SF(vspec_umov), wz(rd), rz(rn));
         } else {
             E3(csel_tab[op << 1 | (imm6 & 1)][sf][c->nf][cond],
                wz(rd), rz(rn), rz(rm));
@@ -1582,7 +1698,7 @@ static int sysreg(Ctx *c, uint32_t insn)
            (!isread && !(ri->type & ARM_CP_SUPPRESS_TB_END));
     if (isread && !ends && !ri->readfn) {
         if (!check) {
-            E2(G(umov64), wz(rt), ri->fieldoffset);
+            E2(G(vspec_umov64), wz(rt), ri->fieldoffset);
             return NEXT;
         }
         if (key == ENCODE_AA64_CP_REG(3, 0, 4, 1, 0) && !(ri->fgt && c->fgt)) {
@@ -1609,12 +1725,11 @@ static int branch_sys(Ctx *c, uint32_t insn)
     if ((insn & 0x7c000000) == 0x14000000) {            /* b, bl */
         int64_t imm = sextract64(insn, 0, 26) << 2;
 
-        if (insn >> 31) {
-            emit(c, G(bl), 1, (uint64_t)c->off + 4);
-        } else {
-            E0(G(b));
-        }
+        E0(insn >> 31 ? G(bl) : G(b));
         way(c, 0, c->off + imm);
+        if (insn >> 31) {
+            aok_emit(&c->g, c->off + 4);        /* bl: [way][link delta] */
+        }
         return END;
     }
     if ((insn & 0xff000010) == 0x54000000) {            /* b.cond */
@@ -1630,17 +1745,30 @@ static int branch_sys(Ctx *c, uint32_t insn)
         }
         return END;
     }
+    /*
+     * cbz, cbnz, tbz, tbnz: the _bk layout for a branch backwards, which keeps
+     * the taken path straight-line (frag.h).
+     */
     if ((insn & 0x7e000000) == 0x34000000) {            /* cbz, cbnz */
-        emit(c, insn & (1 << 24) ? SF(cbnz) : SF(cbz), 1, rz(rt));
+        static const Gadget cb[2][2][2] = {     /* [cbnz][sf][backwards] */
+            { { G(cbz_w), G(cbz_w_bk) }, { G(cbz_x), G(cbz_x_bk) } },
+            { { G(cbnz_w), G(cbnz_w_bk) }, { G(cbnz_x), G(cbnz_x_bk) } },
+        };
+
+        emit(c, cb[(insn >> 24) & 1][sf][imm19 < 0], 1, rz(rt));
         way(c, 0, c->off + imm19);
         way(c, 1, c->off + 4);
         return END;
     }
     if ((insn & 0x7e000000) == 0x36000000) {            /* tbz, tbnz */
+        static const Gadget tb[2][2] = {        /* [tbnz][backwards] */
+            { G(tb_z), G(tb_z_bk) }, { G(tb_nz), G(tb_nz_bk) },
+        };
         unsigned bit = (insn >> 31) << 5 | ((insn >> 19) & 31);
+        int64_t imm14 = sextract64(insn, 5, 14) << 2;
 
-        E2(insn & (1 << 24) ? G(tbnz) : G(tbz), rz(rt), 1ull << bit);
-        way(c, 0, c->off + (sextract64(insn, 5, 14) << 2));
+        E2(tb[(insn >> 24) & 1][imm14 < 0], rz(rt), 1ull << bit);
+        way(c, 0, c->off + imm14);
         way(c, 1, c->off + 4);
         return END;
     }
@@ -1649,7 +1777,7 @@ static int branch_sys(Ctx *c, uint32_t insn)
          * br, blr, ret. On a CPU with BTI they set PSTATE.BTYPE, which is in
          * the next TB's flags: left to TCG there.
          */
-        bool link = ((insn >> 21) & 3) == 1;
+        bool link = ((insn >> 21) & 3) == 1, ret = ((insn >> 21) & 3) == 2;
         unsigned rn = (insn >> 5) & 31;
 
         if (c->bti) {
@@ -1658,7 +1786,8 @@ static int branch_sys(Ctx *c, uint32_t insn)
         if (c->no_goto_ptr) {
             E3(link ? G(blr_exit) : G(br_exit), rz(rn), c->tbi, c->off + 4);
         } else {
-            E3(link ? G(blr) : G(br), rz(rn), c->tbi, c->off + 4);
+            E3(link ? G(blr_cached) : ret ? G(ret_cached) : G(br_cached),
+               rz(rn), c->tbi, c->off + 4);
             aok_emit_lookup_operands(&c->g);
         }
         return END;
@@ -2555,7 +2684,7 @@ static int ldst_kind(unsigned size, unsigned opc)
 static int ldst(Ctx *c, uint32_t insn)
 {
     static const Gadget imm_tab[13] = TAB13(_fast);
-    static const Gadget rx_tab[3][13] = { TAB13(_rx0), TAB13(_rx1), TAB13(_rx2) };
+    static const Gadget rx_tab[3][13] = { TAB13(_rxl), TAB13(_rxs), TAB13(_rxu) };
     static const Gadget wb_tab[2][13] = { TAB13(_wb0), TAB13(_wb1) };
     static const Gadget user_tab[13] = TAB13(_user);
     unsigned rt = insn & 31, rn = (insn >> 5) & 31, size = insn >> 30;
@@ -2747,6 +2876,8 @@ int arm_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     }
 
     c.page_off = pc & ~TARGET_PAGE_MASK;
+    c.code = code;
+    c.no_fuse = getenv("QEMU_AOK_NO_FUSE");
     c.cpu = cpu;
     c.no_sys = getenv("QEMU_AOK_NO_SYS");
     c.no_exc = getenv("QEMU_AOK_NO_EXC");
@@ -2814,8 +2945,17 @@ int arm_aok_translate_code(CPUState *cs, TranslationBlock *tb,
             c.g.p = start;
             break;
         }
+        if (a64_pairs_on) {
+            aok_gen_pair(&c.g, start, &a64_pairs);
+        }
         aok_gen_insn_end(&c.g, c.page_off + c.off, 0);
         c.off += 4;
+        if (c.fused_bcond) {
+            /* The b.cond the step took with it: no words of its own. */
+            c.fused_bcond = false;
+            aok_gen_insn_end(&c.g, c.page_off + c.off, 0);
+            c.off += 4;
+        }
         if (r == END) {
             break;
         }
@@ -2826,8 +2966,14 @@ int arm_aok_translate_code(CPUState *cs, TranslationBlock *tb,
         return 0;
     }
     if (r != END) {
+        /* Not an insn, but a gadget like another to the insn before it. */
+        uint64_t *start = c.g.p;
+
         emit(&c, G(b), 0);
         way(&c, 0, c.off);
+        if (a64_pairs_on) {
+            aok_gen_pair(&c.g, start, &a64_pairs);
+        }
     }
     return aok_gen_finish(&c.g, c.off);
 }

@@ -228,8 +228,25 @@ void aok_gen_pair(AokGen *g, uint64_t *from, const AokPairSet *set)
         }
         /* The first's result goes to the register its first operand names. */
         for (unsigned k = 0; set->forward && k < 2 && p->fused_fw[k]; k++) {
-            if (p->op[k].kind == AOK_PAIR_OP_SLOT &&
-                from[1 + p->op[k].index] == prev[1]) {
+            uint64_t word = from[1 + p->op[k].index], slot = ~(uint64_t)0;
+
+            switch (p->op[k].kind) {
+            case AOK_PAIR_OP_SLOT:
+                slot = word;
+                break;
+            case AOK_PAIR_OP_REG:
+                slot = set->reg_base + 8 * (word & 0x1f);
+                break;
+            case AOK_PAIR_OP_REG8:
+                slot = set->reg_base + 8 * ((word >> 8) & 0x1f);
+                break;
+            case AOK_PAIR_OP_REG_NOT31:
+                if ((word & 0x1f) != 31) {
+                    slot = set->reg_base + 8 * (word & 0x1f);
+                }
+                break;
+            }
+            if (slot == prev[1]) {
                 fused = p->fused_fw[k];
                 aok_stats.pairs_fw++;
                 break;

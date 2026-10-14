@@ -70,6 +70,53 @@ SYM(aok_gadget_a64_\name):
     orr w16, w16, w17, lsl #28
     msr nzcv, x16
 .endm
+
+/*
+ * A way out is aok_gadget_goto's two operands, [pc delta][slot]. Each is its
+ * own copy of aok_goto_tail rather than a jump to it, so that each ends in an
+ * indirect branch of its own (the RISC-V front end's gadgets-shared.S has
+ * why).
+ */
+.macro a64_leave off
+    ldp x9, x10, [_ip, #\off]
+    ldr w11, [_exitreq]
+    add _pc, _pc, x9
+    ldr _ip, [x10]
+    str _pc, [_pcp]
+    tbnz w11, #31, 7f
+    gret AOK_ENTER_WORDS
+7:  b SYM(aok_exit_requested)
+.endm
+
+/*
+ * br, blr, ret: [rn offset][tbi][link delta][flags | cflags << 32][cs_base].
+ * The target is read before the link is written, since blr's register may be
+ * x30, and has its top byte seen to as TCG's gen_top_byte_ignore does it:
+ * tbi 0, as it is; 1, 2, 3, sign-extended from bit 55 where the address is in
+ * the half that has TBI (the low one, the high one, both); 4, for a regime
+ * with one range, its top byte cleared. Then the lookup (gadgets.S's
+ * aok_a64_lookup_pc).
+ */
+.macro a64_tbi
+    cbz x11, 4f
+    sbfx x12, x10, #0, #56
+    cmp x11, #2
+    b.hi 3f
+    b.eq 2f
+    and x10, x12, x10           /* 1: only where bit 55 is clear */
+    b 4f
+2:  orr x10, x12, x10           /* 2: only where bit 55 is set */
+    b 4f
+3:  cmp x11, #4
+    csel x10, x12, x10, ne      /* 3: both halves */
+    b.ne 4f
+    and x10, x10, #0x00ffffffffffffff
+4:
+.endm
+
+/* The fourteen conditions, in the order of their encodings. */
+#define CONDS eq, ne, cs, cc, mi, pl, vs, vc, hi, ls, ge, lt, gt, le
+
 #endif
 
 #endif

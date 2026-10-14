@@ -1,5 +1,5 @@
-/* Written by scripts/aok-gadgets-sync.sh: which of the gadgets that
- * iSH-AOK's pair table names this front end has. Do not edit. */
+/* Written by scripts/aok-host-gadgets.sh: which of the gadgets the
+ * pair table names this front end has. Do not edit. */
 #define HOST_add_ri 1
 #define HOST_add_rr 1
 #define HOST_add_uw_rr 1

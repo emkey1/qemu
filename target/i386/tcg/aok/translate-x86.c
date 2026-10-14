@@ -207,6 +207,11 @@ static const Gadget ret_tab[2][2] = MPT(ret);
 
 /* What the assembly sources know of CPUX86State (aok-i386-asm.h). */
 QEMU_BUILD_BUG_ON(offsetof(CPUX86State, regs) != AOK_X86_ENV_REGS);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, mxcsr) != AOK_X86_ENV_MXCSR);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, xmm_regs) != AOK_X86_ENV_XMM);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, opmask_regs) != AOK_X86_ENV_OPMASK);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, aok_vstage) != AOK_X86_ENV_VSTAGE);
+QEMU_BUILD_BUG_ON(sizeof(ZMMReg) != 64);
 QEMU_BUILD_BUG_ON(sizeof(((CPUX86State *)0)->regs[0]) != 8);
 QEMU_BUILD_BUG_ON(R_EAX != 0 || R_ECX != 1 || R_EDX != 2);
 QEMU_BUILD_BUG_ON(offsetof(CPUX86State, regs[R_ESP]) != AOK_X86_ENV_RSP);
@@ -265,6 +270,9 @@ typedef struct Ctx {
     int cpl;
     bool io_ok;             /* a port may be read and written with no check */
     bool abm, bmi1;         /* f3 before bsf and bsr makes tzcnt and lzcnt */
+    bool bmi2;
+    bool avx;               /* VEX's vector insns are gadgets-vec.S's here */
+    bool avx512;            /* and the opmask ones too */
     bool lahf;              /* lahf and sahf exist here */
     bool sse;               /* SSE insns raise nothing here */
     bool x87;               /* nor do x87 ones (no EM, no TS) */
@@ -617,6 +625,8 @@ static unsigned x86_nohf;
 static bool x86_nolive;
 /* QEMU_AOK_X86_NOFP: every floating-point insn is softfloat's. */
 static bool x86_nofp;
+/* QEMU_AOK_X86_NOVEC: no VEX insns (gadgets-vec.S), for bisecting */
+static bool x86_novec;
 /* QEMU_AOK_X86_NOX87: the x87 is TCG's (softfloat's). */
 static bool x86_nox87;
 /* QEMU_AOK_X86_NO32, QEMU_AOK_X86_NO64: that kind of code is TCG's. */
@@ -749,6 +759,77 @@ void aok_x86_helper_vst(CPUX86State *env, uint64_t addr, uint64_t pc,
 {
     x86_sync(env, pc);
     cpu_st16_mmu(env, addr, int128_make128(in[0], in[1]), x86_oi16(env, sz), 0);
+}
+
+/*
+ * The vector frames' memory operands of 32 and 64 bytes (gadgets-vec.S), as
+ * TCG's gen_ldy_env_A0() makes them: sixteen bytes at a time, the first
+ * access checking the alignment of the whole when @sz says it must be
+ * aligned (| 16). A load fills @out only once every access has succeeded. A
+ * store raises whatever it would before it writes a byte: the #GP of an
+ * operand that must be aligned and is not, and then each page's fault.
+ */
+void aok_x86_helper_vldn(CPUX86State *env, uint64_t addr, uint64_t pc,
+                         uint32_t sz, uint64_t *out);
+void aok_x86_helper_vldn(CPUX86State *env, uint64_t addr, uint64_t pc,
+                         uint32_t sz, uint64_t *out)
+{
+    unsigned n = 1u << (sz & 15);
+    int mmu_idx = cpu_mmu_index(env_cpu(env), false);
+    uint64_t v[8];
+
+    x86_sync(env, pc);
+    for (unsigned i = 0; i < n / 16; i++) {
+        MemOp align = !i && (sz & 16) ? (n == 64 ? MO_ALIGN_64 : MO_ALIGN_32) : 0;
+        Int128 x = cpu_ld16_mmu(env, addr + 16 * i,
+                                make_memop_idx(MO_128 | MO_LE | MO_ATOM_IFALIGN_PAIR |
+                                               align, mmu_idx), 0);
+
+        v[2 * i] = int128_getlo(x);
+        v[2 * i + 1] = int128_gethi(x);
+    }
+    memcpy(out, v, n);
+}
+
+static void x86_vprobe(CPUX86State *env, uint64_t addr, unsigned n,
+                       bool aligned)
+{
+    int mmu_idx = cpu_mmu_index(env_cpu(env), false);
+    unsigned first = -(addr | TARGET_PAGE_MASK);
+
+    if (aligned && (addr & (n - 1))) {
+        raise_exception_err_ra(env, EXCP0D_GPF, 0, 0);
+    }
+    probe_write(env, addr, MIN(n, first), mmu_idx, 0);
+    if (first < n) {
+        probe_write(env, addr + first, n - first, mmu_idx, 0);
+    }
+}
+
+void aok_x86_helper_vstn(CPUX86State *env, uint64_t addr, uint64_t pc,
+                         uint32_t sz, const uint64_t *in);
+void aok_x86_helper_vstn(CPUX86State *env, uint64_t addr, uint64_t pc,
+                         uint32_t sz, const uint64_t *in)
+{
+    unsigned n = 1u << (sz & 15);
+    int mmu_idx = cpu_mmu_index(env_cpu(env), false);
+
+    x86_sync(env, pc);
+    x86_vprobe(env, addr, n, sz & 16);
+    for (unsigned i = 0; i < n / 16; i++) {
+        cpu_st16_mmu(env, addr + 16 * i, int128_make128(in[2 * i], in[2 * i + 1]),
+                     make_memop_idx(MO_128 | MO_LE | MO_ATOM_IFALIGN_PAIR, mmu_idx), 0);
+    }
+}
+
+/* Whether a store of 1 << @sz bytes may be made, and nothing stored. */
+void aok_x86_helper_vprobe(CPUX86State *env, uint64_t addr, uint64_t pc,
+                           uint32_t sz, uint64_t unused);
+void aok_x86_helper_vprobe(CPUX86State *env, uint64_t addr, uint64_t pc,
+                           uint32_t sz, uint64_t unused)
+{
+    x86_sync(env, pc);
+    x86_vprobe(env, addr, 1u << (sz & 15), false);
 }
 
 static void x86_st(CPUX86State *env, uint64_t addr, unsigned sz, uint64_t v)
@@ -1141,8 +1222,22 @@ uint64_t aok_x86_fp_begin(CPUX86State *env);
 uint64_t aok_x86_fp_begin(CPUX86State *env)
 {
     uint64_t fpcr;
+    unsigned rc = (env->mxcsr >> 13) & 3;
 
     __asm__ volatile("mrs %0, fpcr\n\tmsr fpsr, xzr" : "=r"(fpcr));
+    /*
+     * The vector frames (gadgets-vec.S) round as MXCSR says, on the host's
+     * unit: FPCR's RMode is RC's (x86 down is AArch64's RM, up its RP), and
+     * nothing else of FPCR changes; DAZ and FTZ are the frames' own. The
+     * double gadgets compute only where MXCSR asks for nearest even and
+     * nothing more, which the answer says (_fpok), and then RMode is zero.
+     */
+    if (rc && !(fpcr & 0x07f89f00)) {
+        uint64_t rmode = (rc & 1) << 1 | rc >> 1;
+
+        __asm__ volatile("msr fpcr, %0" :: "r"(rmode << 22));
+        return 0;
+    }
     /* The host's RMode, FZ, DN, AHP, FZ16, and its trap enables. */
     return !(env->mxcsr & (MXCSR_RC | MXCSR_FZ | MXCSR_DAZ)) &&
            !(fpcr & 0x07f89f00);
@@ -2260,6 +2355,7 @@ static void __attribute__((constructor)) x86_aok_init(void)
     }
     x86_nolive = getenv("QEMU_AOK_X86_NOLIVE");
     x86_nofp = getenv("QEMU_AOK_X86_NOFP");
+    x86_novec = getenv("QEMU_AOK_X86_NOVEC");
     x86_nox87 = getenv("QEMU_AOK_X86_NOX87");
     x86_no32 = getenv("QEMU_AOK_X86_NO32");
     x86_no64 = getenv("QEMU_AOK_X86_NO64");
@@ -2288,6 +2384,8 @@ static void __attribute__((constructor)) x86_aok_init(void)
         c->next = d->p;                 \
         c->end = d->end;                \
     } while (0)
+
+#include "translate-vec.c.inc"
 
 /* ---- SSE -------------------------------------------------------------------
  *
@@ -3428,6 +3526,9 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
     if (b == 0x0f) {
         return insn_0f(c, d, code, sz);
     }
+    if (c->c64 && (b == 0xc4 || b == 0xc5)) {
+        return vex(c, d, code, b);
+    }
     /* rep ret, and bnd before a branch, are that ret and that branch. */
     if ((d->rep || d->repne) &&
         !(b == 0xc2 || b == 0xc3 || b == 0xe8 || b == 0xe9 || b == 0xeb ||
@@ -4156,6 +4257,18 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     c->fp = !x86_nofp;
     c->x87 = !(flags & (HF_EM_MASK | HF_TS_MASK)) && !x86_nox87;
     c->sse3 = env->features[FEAT_1_ECX] & CPUID_EXT_SSE3;
+    c->bmi2 = env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_BMI2;
+    /*
+     * VEX's vector insns (gadgets-vec.S): with AVX enabled (CR4 and XCR0, a
+     * TB flag) and SSE's state usable, on a CPU with AVX2, FMA and F16C,
+     * all of which the frames compute. Otherwise every VEX insn is TCG's,
+     * which raises what is due.
+     */
+    c->avx = c->sse && (flags & HF_AVX_EN_MASK) && !x86_novec &&
+             (env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_AVX2) &&
+             (env->features[FEAT_1_ECX] & CPUID_EXT_FMA) &&
+             (env->features[FEAT_1_ECX] & CPUID_EXT_F16C);
+    c->avx512 = false;
     c->live = !x86_nolive;
     if (!translate(c, cs, tb, *max_insns, pc, host_pc, &r)) {
         c->live = false;

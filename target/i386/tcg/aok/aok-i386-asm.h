@@ -42,6 +42,15 @@
 #define AOK_X86_ENV_FPTAGS  0x300
 #define AOK_X86_ENV_FPREGS  0x310
 
+/*
+ * The vector state (aok/vec): xmm_regs[32] (a ZMMReg of 64 bytes each, the
+ * XMM bytes first), MXCSR, the opmasks k0-k7, and the frames' scratch area.
+ */
+#define AOK_X86_ENV_MXCSR   0x3d0
+#define AOK_X86_ENV_XMM     0x3e0
+#define AOK_X86_ENV_OPMASK  0xd30
+#define AOK_X86_ENV_VSTAGE  0xc30
+
 /* The lazy flags are the flags themselves, in cc_src. */
 #define AOK_CC_OP_EFLAGS    0
 

@@ -2058,6 +2058,14 @@ typedef struct CPUArchState {
     ZMMReg xmm_regs[CPU_NB_EREGS] QEMU_ALIGNED(16);
     ZMMReg xmm_t0 QEMU_ALIGNED(16);
     MMXReg mmx_t0;
+#ifdef CONFIG_AOK_GADGETS
+    /*
+     * For the AOK gadgets' vector frames (target/i386/tcg/aok/vec): a memory
+     * operand of up to 512 bits staged for the operation, a result staged for
+     * its store, and the frames' scratch words.
+     */
+    uint8_t aok_vstage[256] QEMU_ALIGNED(16);
+#endif
 
     uint64_t opmask_regs[NB_OPMASK_REGS];
 #ifdef TARGET_X86_64

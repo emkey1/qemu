@@ -74,9 +74,9 @@ The parts
 ``target/riscv/tcg/aok/``
   RISC-V's translator and gadgets.
 
-``target/riscv/tcg/aok/shared/``, ``scripts/aok-gadgets-sync.sh``
-  The gadgets RISC-V shares with iSH-AOK, as copies of its sources, and the
-  script that brings the copies up to date (`Gadgets shared with iSH-AOK`_).
+``target/riscv/tcg/aok/shared/``, ``scripts/aok-host-gadgets.sh``
+  The gadgets RISC-V took from iSH-AOK, and the script that writes which of
+  the gadgets its pair table names exist (`Gadgets taken from iSH-AOK`_).
 
 Outside those, the changes to TCG are small:
 
@@ -137,15 +137,15 @@ instructions of one TB that nothing could have come between.
 This is iSH-AOK's scheme (``jit_pair_fuse`` in its ``jit/gen.c``). Which
 pairs exist is a list too, measured there from what programs execute.
 
-Gadgets shared with iSH-AOK
-===========================
+Gadgets taken from iSH-AOK
+==========================
 
 RISC-V's integer gadgets, its loads and stores, its branches and direct
-jumps, and the pairs made of them are not written in this tree.
-``shared/alu.S``, ``shared/frag.h`` and ``shared/pairs.h`` are iSH-AOK's
-``jit/guest-riscv64`` files of those names, unchanged, and
-``gadgets-shared.S`` assembles them with this tree's definitions of what they
-ask of a host. ``frag.h`` states that contract under "A second host":
+jumps, and the pairs made of them came from iSH-AOK: ``shared/alu.S``,
+``shared/frag.h`` and ``shared/pairs.h`` were its ``jit/guest-riscv64`` files
+of those names, and ``gadgets-shared.S`` assembles them with this tree's
+definitions of what they ask of a host. ``frag.h`` states that contract
+under "A second host":
 
 * the registers for the CPU state and the stream, and how a gadget begins
   and ends;
@@ -162,13 +162,15 @@ ask of a host. ``frag.h`` states that contract under "A second host":
 as a body under the name of iSH-AOK's ``jalr_cached``, and so takes the pairs
 that end in that.
 
-``scripts/aok-gadgets-sync.sh [CHECKOUT]`` copies the three files from a
-checkout of iSH-AOK and writes ``shared/host-gadgets.h`` (which gadgets exist
-here, read off the assembled object) and ``shared/SOURCE`` (the commit). It
-does the same for AArch64's two files (see below).
-``--check`` says whether the copies are current. **Do not edit the copies**:
-change iSH-AOK and copy again, so that a gadget improved or a pair added
-there arrives here with nothing ported by hand.
+Until 2026-10-14 these were copies, kept in step with iSH-AOK through a
+repository both engines built from (aok-gadgets). They are this tree's own
+now and are edited here (``shared/SOURCE`` has the origin and the licence):
+the two engines differ in their CPU state, in how a block is left, in their
+flags and in how they reach guest memory, and keeping one source for both
+cost more than it saved. Something iSH-AOK improves is ported by hand when it
+is worth it. ``scripts/aok-host-gadgets.sh`` writes
+``shared/host-gadgets.h``, which of the gadgets a pair table names exist
+here, read off the assembled object, for RISC-V and AArch64 alike.
 
 ``translate.c`` reads ``pairs.h`` as iSH-AOK's translator does. All 332 pairs
 are built. Not all can occur yet: iSH-AOK's translator also folds a few
@@ -505,8 +507,8 @@ with the gadgets.
 * **The x87** is not softfloat's here. The 80-bit arithmetic, the register
   stack with its tags and faults, every D8-DF instruction's register form,
   the transcendentals and what a memory form does once it has its operand
-  are the aok-gadgets repository's ``x87/``, in integer registers, which
-  iSH-AOK's JIT builds too (``shared/``, copies; ``x87-host.S`` is this
+  are iSH-AOK's x87 sources, in integer registers (``shared/``, this
+  tree's own since 2026-10-14; ``x87-host.S`` is this
   host's side: QEMU keeps TOP beside the status word and a tag byte a
   register, and the shared code is told so in four macros). Their answers
   are the hardware's, which softfloat's are not: of iSH-AOK's 167,517

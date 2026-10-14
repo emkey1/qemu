@@ -6,9 +6,9 @@
  * The x87 itself is not written here. Its arithmetic (80 bits, in integer
  * registers, exact to the hardware), its register stack, every D8-DF
  * instruction's register form, the transcendentals and what a memory form
- * does once it has its operand are the aok-gadgets repository's x87/, which
- * iSH-AOK's JIT builds too and tests against 122,880 answers from an AMD
- * Ryzen. They are in shared/ as copies (scripts/aok-gadgets-sync.sh), and
+ * does once it has its operand are in shared/: iSH-AOK's x87 sources,
+ * which its JIT tests against 122,880 answers from an AMD Ryzen, taken on
+ * 2026-10-14 and this tree's own since (shared/SOURCE).
  * shared/x87-arith.S says what a host owes them. This file is that: where
  * QEMU keeps the x87's state, how a gadget here reaches guest memory, and
  * the two instructions that only read a word of the state.

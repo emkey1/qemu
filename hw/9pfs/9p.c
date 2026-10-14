@@ -1672,6 +1672,8 @@ static bool fid_has_valid_file_handle(V9fsState *s, V9fsFidState *fidp)
     return s->ops->has_valid_file_handle(fidp->fid_type, &fidp->fs);
 }
 
+static bool same_stat_id(const struct stat *a, const struct stat *b);
+
 static void coroutine_fn v9fs_getattr(void *opaque)
 {
     int32_t fid;
@@ -1705,6 +1707,31 @@ static void coroutine_fn v9fs_getattr(void *opaque)
     retval = stat_to_v9stat_dotl(pdu, &stbuf, &v9stat_dotl);
     if (retval < 0) {
         goto out;
+    }
+    /*
+     * A share with no security model gives every file the host's owner:
+     * the files are this process's, and it cannot record another. Linux's
+     * 9p client then holds every guest user but root to the "other" bits,
+     * so none could write to a directory of the share, nor to a file it had
+     * just made. A file this process owns is reported as owned by the user
+     * asking instead (the fid's: Linux attaches once per user), and with
+     * that user's own group, as Debian and Alpine give each user one. This
+     * is how iSH-AOK reports the same directory, its shared /AOK/persist,
+     * which AOK VM hands its guests this way (fs/real.c in iSH-AOK,
+     * realfs_shared_owner). A chown to the asker changes nothing, and one
+     * to anyone else is the host's EPERM (v9fs_setattr).
+     *
+     * Except for the share's own directory, which Linux keeps from the
+     * mount, and so as the owner the one who mounted it (root, at boot) was
+     * told: it is reported open to all instead, as /tmp is.
+     */
+    if ((pdu->s->ctx.export_flags & V9FS_SEC_MASK) == V9FS_SM_NONE &&
+        stbuf.st_uid == geteuid() && fidp->uid != (uid_t)-1) {
+        v9stat_dotl.st_uid = fidp->uid;
+        v9stat_dotl.st_gid = fidp->uid;
+        if (same_stat_id(&pdu->s->root_st, &stbuf)) {
+            v9stat_dotl.st_mode |= S_ISVTX | 0777;
+        }
     }
 
     /*  fill st_gen if requested and supported by underlying fs */
@@ -1822,6 +1849,28 @@ static void coroutine_fn v9fs_setattr(void *opaque)
         }
         if (!(v9iattr.valid & P9_ATTR_GID)) {
             v9iattr.gid = -1;
+        }
+        /*
+         * With no security model, a file this process owns is reported as
+         * the asker's (v9fs_getattr), and that is the one owner a chown can
+         * give it: it changes nothing but the status time, which the host's
+         * chown to no owner gives. Any other owner is the host's EPERM, as
+         * in iSH-AOK.
+         */
+        if ((pdu->s->ctx.export_flags & V9FS_SEC_MASK) == V9FS_SM_NONE &&
+            fidp->uid != (uid_t)-1 &&
+            (v9iattr.uid == -1 || (uid_t)v9iattr.uid == fidp->uid) &&
+            (v9iattr.gid == -1 || (gid_t)v9iattr.gid == fidp->uid)) {
+            struct stat st;
+
+            err = v9fs_co_lstat(pdu, &fidp->path, &st);
+            if (err < 0) {
+                goto out;
+            }
+            if (st.st_uid == geteuid()) {
+                v9iattr.uid = -1;
+                v9iattr.gid = -1;
+            }
         }
         err = v9fs_co_chown(pdu, &fidp->path, v9iattr.uid,
                             v9iattr.gid);

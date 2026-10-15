@@ -901,6 +901,38 @@ g_adc sbb32_rr, w, sbcs, AOK_CC_OP_SBB, 32, 0
 g_adc sbb64_rr, x, sbcs, AOK_CC_OP_SBB, 64, 0
 g_adc sbb32_ri, w, sbcs, AOK_CC_OP_SBB, 32, 1
 g_adc sbb64_ri, x, sbcs, AOK_CC_OP_SBB, 64, 1
+/*
+ * The same at 16 bits, the rest of the register staying: the lazy state
+ * only (the host's flags of a 32-bit sum are not a 16-bit one's).
+ */
+.macro g_adc16 name, sbb, ccop, imm
+.gadget \name
+    ldp x8, x9, [_ip]
+    ldr x13, [_ip, #16]
+    ldrh w10, [_cpu, x8]
+    .if \imm
+    and w11, w9, #0xffff
+    .else
+    ldrh w11, [_cpu, x9]
+    .endif
+    ldrb w13, [_cpu, x13]
+    .if \sbb
+    sub w12, w10, w11
+    sub w12, w12, w13
+    .else
+    add w12, w10, w11
+    add w12, w12, w13
+    .endif
+    and w12, w12, #0xffff
+    strh w12, [_cpu, x8]
+    str x13, [_cpu, #AOK_X86_ENV_CC_SRC2]
+    setcc \ccop, 16
+    gret 3
+.endm
+g_adc16 adc16_rr, 0, AOK_CC_OP_ADC, 0
+g_adc16 adc16_ri, 0, AOK_CC_OP_ADC, 1
+g_adc16 sbb16_rr, 1, AOK_CC_OP_SBB, 0
+g_adc16 sbb16_ri, 1, AOK_CC_OP_SBB, 1
 
 /*
  * Shifts of a register by a count that is not zero (the translator has
@@ -1195,6 +1227,26 @@ g_bitscan tzcnt64, tzcnt, x, (AOK_CC_OP_BMILG + 3)
 g_bitscan lzcnt32, lzcnt, w, (AOK_CC_OP_BMILG + 2)
 g_bitscan lzcnt64, lzcnt, x, (AOK_CC_OP_BMILG + 3)
 
+/* popcnt: [destination][source]; ZF that the source is zero, the rest clear. */
+.macro g_popcnt name, r
+.gadget \name
+    ldp x8, x9, [_ip]
+    ldr \r\()10, [_cpu, x9]
+    fmov d16, x10
+    cnt v16.8b, v16.8b
+    addv b16, v16.8b
+    fmov w12, s16
+    str x12, [_cpu, x8]
+    cmp \r\()10, #0
+    cset w13, eq
+    lsl w13, w13, #6
+    str x13, [_cpu, #AOK_X86_ENV_CC_SRC]
+    str wzr, [_cpu, #AOK_X86_ENV_CC_OP]
+    gret 2
+.endm
+g_popcnt popcnt32, w
+g_popcnt popcnt64, x
+
 /* cli and sti; and the barriers of lfence, sfence and mfence. */
 .gadget cli
     ldr x9, [_cpu, #AOK_X86_ENV_EFLAGS]
@@ -1233,6 +1285,31 @@ g_bitscan lzcnt64, lzcnt, x, (AOK_CC_OP_BMILG + 3)
     ldr q16, [_cpu, x9]
     str q16, [_cpu, x8]
     gret 2
+/*
+ * A bit string's operand (bt, bts, btr, btc of memory by a register): the
+ * address an ea gadget left moved by the register's bit number, signed, in
+ * units of the operand: [the register]. bt_ea32_32: 32-bit code, whose
+ * address wraps at 32 bits.
+ */
+.gadget bt_ea64
+    ldr x8, [_ip]
+    ldr x9, [_cpu, x8]
+    asr x9, x9, #6
+    add _ea, _ea, x9, lsl #3
+    gret 1
+.gadget bt_ea32
+    ldr x8, [_ip]
+    ldrsw x9, [_cpu, x8]
+    asr x9, x9, #5
+    add _ea, _ea, x9, lsl #2
+    gret 1
+.gadget bt_ea32_32
+    ldr x8, [_ip]
+    ldrsw x9, [_cpu, x8]
+    asr x9, x9, #5
+    add w6, w6, w9, lsl #2
+    gret 1
+
 /* The low 32 bits, the rest staying (movss). */
 .gadget vmov32
     ldp x8, x9, [_ip]
@@ -1471,6 +1548,14 @@ g_hf hf_logic\bits, logic, \bits
     ldr x11, [_cpu, x9]
     csel x10, x11, x10, \cc
     str x10, [_cpu, x8]
+    gret 2
+/* (16 bits: the rest of the register stays, whichever way) */
+.gadget cmov16_\cc
+    ldp x8, x9, [_ip]
+    ldrh w10, [_cpu, x8]
+    ldrh w11, [_cpu, x9]
+    csel w10, w11, w10, \cc
+    strh w10, [_cpu, x8]
     gret 2
 .endm
 .irp cc, CONDS

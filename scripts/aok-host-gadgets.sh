@@ -30,6 +30,9 @@ one() {
     echo "$1: $(grep -c ' 1$' "$dir/shared/host-gadgets.h") of $(echo "$3" | wc -w | tr -d ' ') pairable gadgets"
 }
 # RISC-V's table marks a pairable gadget #define F_name 1; AArch64's names
-# its family, #define F_name f_family, args.
-one riscv aok_gadget_rv_ "$(sed -n 's/^#define F_\([A-Za-z0-9_]*\) 1$/\1/p' "$here/target/riscv/tcg/aok/shared/pairs.h" | sort -u)"
-one arm aok_gadget_a64_ "$(sed -n 's/^#define F_\([A-Za-z0-9_]*\) f_.*/\1/p' "$here/target/arm/tcg/aok/shared/pairs.h" | sort -u)"
+# its family, #define F_name f_family, args. (A front end not in this tree is
+# skipped.)
+t=$here/target/riscv/tcg/aok/shared/pairs.h
+[ ! -f "$t" ] || one riscv aok_gadget_rv_ "$(sed -n 's/^#define F_\([A-Za-z0-9_]*\) 1$/\1/p' "$t" | sort -u)"
+t=$here/target/arm/tcg/aok/shared/pairs.h
+[ ! -f "$t" ] || one arm aok_gadget_a64_ "$(sed -n 's/^#define F_\([A-Za-z0-9_]*\) f_.*/\1/p' "$t" | sort -u)"

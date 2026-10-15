@@ -23,7 +23,8 @@ loads the guest registers it uses into host registers and stores them back
 when it ends, each of those a gadget too. An AOK gadget is one guest
 instruction, working on the CPU state in memory. The front ends' pages have
 what that is worth on each guest; in short, the same programs take 1.7 to
-3.7 times fewer host cycles than under TCTI, on a Mac and on an iPad alike.
+3.7 times fewer host cycles than under TCTI on an Apple M5 Max, 1.5 to 3.7 on
+an iPad's M4 and 1.4 to 4.4 on an A10X.
 
 What it is, and is not
 ======================

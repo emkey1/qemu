@@ -94,20 +94,21 @@ Host CPU cycles a guest program takes under TCTI (``QEMU_AOK=0``, the same
 binary) and under the gadgets, with ``-M virt -cpu cortex-a72``, one guest CPU
 and Alpine 3.24 (its 6.18 kernel and userland): what the QEMU process spends
 between a program's first line of output and its last, the median of two runs.
-On an Apple M5 Max (macOS); the last column is the same ratio on an iPad Pro
-with an M4, in an iOS app, where nothing may be generated at run time and TCTI
-is what the gadgets replace.
+On an Apple M5 Max (macOS); the last two columns are the same ratio in an iOS
+app, where nothing may be generated at run time and TCTI is what the gadgets
+replace, on an iPad Pro with an M4 (two runs) and on a 2017 iPad Pro with an
+A10X (four runs, all of them on its performance cores).
 
-==================== ========= ============ =========== =======
-Workload             TCTI      AOK gadgets  TCTI / AOK  M4
-==================== ========= ============ =========== =======
-CoreMark              10.7 G     3.6 G      3.01        3.09
-n-body (doubles)      10.8 G     3.0 G      3.54        3.27
-Python                31.3 G     9.0 G      3.49        3.69
-xz -3                 10.1 G     4.4 G      2.30        2.82
-sha256sum              4.6 G     1.9 G      2.43        2.45
-awk                   10.8 G     4.0 G      2.71        2.96
-==================== ========= ============ =========== =======
+==================== ========= ============ =========== ======= =======
+Workload             TCTI      AOK gadgets  TCTI / AOK  M4      A10X
+==================== ========= ============ =========== ======= =======
+CoreMark              10.7 G     3.6 G      3.01        3.09    2.58
+n-body (doubles)      10.8 G     3.0 G      3.54        3.27    4.38
+Python                31.3 G     9.0 G      3.49        3.69    3.67
+xz -3                 10.1 G     4.4 G      2.30        2.82    3.08
+sha256sum              4.6 G     1.9 G      2.43        2.45    2.10
+awk                   10.8 G     4.0 G      2.71        2.96    4.15
+==================== ========= ============ =========== ======= =======
 
 The fused pairs, with the forwarded result and ``cmp`` and ``b.cond`` as one
 gadget, against none of the three (``QEMU_AOK_NO_PAIRS=1``,
@@ -126,10 +127,11 @@ flags and FPSR hashed. An encoding that does not exist is a SIGILL and hashed
 as that, so the transcript checks both which instructions a guest CPU has and
 what each computes. The reference for this one is TCG with a JIT backend:
 against QEMU 11.0.3 on a ``cortex-a72`` the transcripts are identical. The
-threaded interpreter in this tree is not a reference here. It differs from
-the JIT, from the gadgets and from hardware (the same guest under HVF) in
-``cmlt #0`` and ``cmle #0`` on 8-, 16- and 32-bit lanes, and in ``sshl`` on
-16- and 32-bit lanes.
+threaded interpreter in this tree is not a reference here: its vector
+compares swap LT with LE and LTU with LEU (tctiSH/tctiSH#4), so it differs
+from the JIT, from the gadgets and from hardware (the same guest under HVF) in
+``cmlt #0`` and ``cmle #0`` on a lane that is zero, and in ``sshl`` by a
+shift of -128 on 16-, 32- and 64-bit lanes.
 
 The gates pass under UTM's machine options (``virt,virtualization=on,
 gic-version=3``) and with ``-cpu max`` as well.

@@ -29,6 +29,9 @@
  */
 
 #include "qemu/osdep.h"
+#ifdef CONFIG_AOK_GADGETS
+#include "accel/tcg/aok.h"
+#endif
 #include "qemu/datadir.h"
 #include "qemu/units.h"
 #include "qemu/option.h"
@@ -2440,6 +2443,9 @@ void virt_machine_done(Notifier *notifier, void *data)
                                        vms->memmap[VIRT_PLATFORM_BUS].size,
                                        vms->irqmap[VIRT_PLATFORM_BUS]);
     }
+#ifdef CONFIG_AOK_GADGETS
+    aok_fdt_announce(ms->fdt);
+#endif
     if (arm_load_dtb(info->dtb_start, info, info->dtb_limit, as, ms, cpu) < 0) {
         exit(1);
     }

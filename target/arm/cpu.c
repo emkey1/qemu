@@ -33,6 +33,9 @@
 #include "accel/tcg/cpu-ops.h"
 #endif /* CONFIG_TCG */
 #include "internals.h"
+#ifdef CONFIG_AOK_GADGETS
+#include "tcg/aok/aok-arm.h"
+#endif
 #include "cpu-features.h"
 #include "exec/target_page.h"
 #include "hw/core/qdev-properties.h"
@@ -2590,6 +2593,12 @@ static const TCGCPUOps arm_tcg_ops = {
 
     .initialize = arm_translate_init,
     .translate_code = arm_translate_code,
+#if defined(CONFIG_AOK_GADGETS) && !defined(CONFIG_USER_ONLY)
+    /* (A64 only: the function declines everything else, or is a stub.) */
+    .aok_translate_code = arm_aok_translate_code,
+    .aok_pc_offset = offsetof(CPUARMState, pc),
+    .aok_fold_fpsr = arm_aok_fold_fpsr,
+#endif
     .get_tb_cpu_state = arm_get_tb_cpu_state,
     .synchronize_from_tb = arm_cpu_synchronize_from_tb,
     .debug_excp_handler = arm_debug_excp_handler,

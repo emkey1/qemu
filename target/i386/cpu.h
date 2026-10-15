@@ -2008,6 +2008,16 @@ typedef struct CPUArchState {
     uint32_t hflags; /* TB flags, see HF_xxx constants. These flags
                         are known at translation time. */
     uint32_t hflags2; /* various other flags, see HF2_xxx constants. */
+#ifdef CONFIG_AOK_GADGETS
+    /*
+     * For AOK gadgets, whose operands are offsets of registers in this
+     * structure: eight bytes that are always zero (an absent base or index),
+     * and two temporaries a memory operand can be loaded to, so that a
+     * register form of an instruction also serves its memory form.
+     */
+    uint64_t aok_zero;
+    uint64_t aok_tmp[2];
+#endif
 
     /* segments */
     SegmentCache segs[6]; /* selector values */
@@ -2053,6 +2063,14 @@ typedef struct CPUArchState {
     ZMMReg xmm_regs[CPU_NB_EREGS] QEMU_ALIGNED(16);
     ZMMReg xmm_t0 QEMU_ALIGNED(16);
     MMXReg mmx_t0;
+#ifdef CONFIG_AOK_GADGETS
+    /*
+     * For the AOK gadgets' vector frames (target/i386/tcg/aok/vec): a memory
+     * operand of up to 512 bits staged for the operation, a result staged for
+     * its store, and the frames' scratch words.
+     */
+    uint8_t aok_vstage[256] QEMU_ALIGNED(16);
+#endif
 
     uint64_t opmask_regs[NB_OPMASK_REGS];
 #ifdef TARGET_X86_64

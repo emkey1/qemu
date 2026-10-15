@@ -1,0 +1,8 @@
+Origin: iSH-AOK's jit/gadgets-aarch64 (x87-arith.S, x87-stack.S, x87-reg.S,
+x87-trans.S, x87-mem.S), by way of the aok-gadgets repository at 8fb4109,
+2026-10-14.
+This tree's own since then: edit them here. Nothing keeps them in step with
+iSH-AOK any more; an improvement made there is ported by hand when it is
+worth it.
+licence: GPL-2.0-only OR GPL-3.0-only (iSH-AOK's LICENSE.md: GPLv3, and GPLv2 as well for
+what was contributed after its commit 0e3a4144, which all of these were)

@@ -354,10 +354,16 @@ static void gen_writeback(DisasContext *s, X86DecodedInsn *decode, int opn, TCGv
     case X86_OP_MMX:
         break;
     case X86_OP_SSE:
-        if (!op->has_ea && (s->prefix & PREFIX_VEX) && op->ot <= MO_128) {
+        /*
+         * A VEX write zeroes the register past its length, to bit 511: the
+         * AOK gadgets' AVX-512 has the bits above 255.
+         */
+        if (!op->has_ea && (s->prefix & PREFIX_VEX) && op->ot <= MO_256) {
+            int n = op->ot <= MO_128 ? 1 : 2;
+
             tcg_gen_gvec_dup_imm(MO_64,
-                                 offsetof(CPUX86State, xmm_regs[op->n].ZMM_X(1)),
-                                 16, 16, 0);
+                                 offsetof(CPUX86State, xmm_regs[op->n].ZMM_X(n)),
+                                 64 - 16 * n, 64 - 16 * n, 0);
         }
         break;
 #ifndef CONFIG_USER_ONLY
@@ -1115,12 +1121,13 @@ static inline void gen_vsib_avx(DisasContext *s, X86DecodedInsn *decode,
     fn(tcg_env, OP_PTR0, OP_PTR1, index, s->A0, scale, mask);
 
     /*
-     * There are two output operands, so zero OP1's high 128 bits
-     * in the VEX.128 case.
+     * There are two output operands, so zero OP1 past its length (to bit
+     * 511, as gen_writeback does OP0).
      */
-    if (!s->vex_l) {
-        int ymmh_ofs = vector_elem_offset(&decode->op[1], MO_128, 1);
-        tcg_gen_gvec_dup_imm(MO_64, ymmh_ofs, 16, 16, 0);
+    {
+        int n = s->vex_l ? 2 : 1;
+        int ofs = vector_elem_offset(&decode->op[1], MO_128, n);
+        tcg_gen_gvec_dup_imm(MO_64, ofs, 64 - 16 * n, 64 - 16 * n, 0);
     }
 }
 #define VSIB_AVX(uname, lname)                                                     \
@@ -2828,7 +2835,7 @@ static void gen_PCMPESTRM(DisasContext *s, X86DecodedInsn *decode)
     assume_cc_op(s, CC_OP_EFLAGS);
     if ((s->prefix & PREFIX_VEX) && !s->vex_l) {
         tcg_gen_gvec_dup_imm(MO_64, offsetof(CPUX86State, xmm_regs[0].ZMM_X(1)),
-                             16, 16, 0);
+                             48, 48, 0);
     }
 }
 
@@ -2846,7 +2853,7 @@ static void gen_PCMPISTRM(DisasContext *s, X86DecodedInsn *decode)
     assume_cc_op(s, CC_OP_EFLAGS);
     if ((s->prefix & PREFIX_VEX) && !s->vex_l) {
         tcg_gen_gvec_dup_imm(MO_64, offsetof(CPUX86State, xmm_regs[0].ZMM_X(1)),
-                             16, 16, 0);
+                             48, 48, 0);
     }
 }
 
@@ -4673,7 +4680,7 @@ static void gen_VZEROUPPER(DisasContext *s, X86DecodedInsn *decode)
 
     for (i = 0; i < CPU_NB_REGS; i++) {
         int offset = offsetof(CPUX86State, xmm_regs[i].ZMM_X(1));
-        tcg_gen_gvec_dup_imm(MO_64, offset, 16, 16, 0);
+        tcg_gen_gvec_dup_imm(MO_64, offset, 48, 48, 0);
     }
 }
 

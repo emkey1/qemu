@@ -2677,6 +2677,44 @@ static void do_xsave_ymmh(X86Access *ac, target_ulong ptr)
     }
 }
 
+/*
+ * AVX-512's state (the AOK gadgets'): the opmask registers, bits 256-511 of
+ * zmm0-15, and zmm16-31, which outside 64-bit mode are not there (and XSAVE
+ * neither saves them nor XRSTOR loads them), as with SSE's eight.
+ */
+static void do_xsave_opmask(X86Access *ac, target_ulong ptr)
+{
+    for (int i = 0; i < NB_OPMASK_REGS; i++) {
+        access_stq(ac, ptr + 8 * i, ac->env->opmask_regs[i]);
+    }
+}
+
+static void do_xsave_zmm_hi256(X86Access *ac, target_ulong ptr)
+{
+    CPUX86State *env = ac->env;
+    int n = env->hflags & HF_CS64_MASK ? 16 : 8;
+
+    for (int i = 0; i < n; i++, ptr += 32) {
+        for (int q = 0; q < 4; q++) {
+            access_stq(ac, ptr + 8 * q, env->xmm_regs[i].ZMM_Q(4 + q));
+        }
+    }
+}
+
+static void do_xsave_hi16_zmm(X86Access *ac, target_ulong ptr)
+{
+    CPUX86State *env = ac->env;
+
+    if (!(env->hflags & HF_CS64_MASK)) {
+        return;
+    }
+    for (int i = 16; i < 32; i++, ptr += 64) {
+        for (int q = 0; q < 8; q++) {
+            access_stq(ac, ptr + 8 * q, env->xmm_regs[i].ZMM_Q(q));
+        }
+    }
+}
+
 static void do_xsave_bndregs(X86Access *ac, target_ulong ptr)
 {
     CPUX86State *env = ac->env;
@@ -2769,6 +2807,15 @@ static void do_xsave_access(X86Access *ac, target_ulong ptr, uint64_t rfbm,
     }
     if (opt & XSTATE_BNDREGS_MASK) {
         do_xsave_bndregs(ac, ptr + XO(bndreg_state));
+    }
+    if (opt & XSTATE_OPMASK_MASK) {
+        do_xsave_opmask(ac, ptr + XO(opmask_state));
+    }
+    if (opt & XSTATE_ZMM_Hi256_MASK) {
+        do_xsave_zmm_hi256(ac, ptr + XO(zmm_hi256_state));
+    }
+    if (opt & XSTATE_Hi16_ZMM_MASK) {
+        do_xsave_hi16_zmm(ac, ptr + XO(hi16_zmm_state));
     }
     if (opt & XSTATE_BNDCSR_MASK) {
         do_xsave_bndcsr(ac, ptr + XO(bndcsr_state));
@@ -2925,6 +2972,40 @@ static void do_clear_ymmh(CPUX86State *env)
     }
 }
 
+static void do_xrstor_opmask(X86Access *ac, target_ulong ptr, bool load)
+{
+    for (int i = 0; i < NB_OPMASK_REGS; i++) {
+        ac->env->opmask_regs[i] = load ? access_ldq(ac, ptr + 8 * i) : 0;
+    }
+}
+
+static void do_xrstor_zmm_hi256(X86Access *ac, target_ulong ptr, bool load)
+{
+    CPUX86State *env = ac->env;
+    int n = env->hflags & HF_CS64_MASK ? 16 : 8;
+
+    for (int i = 0; i < n; i++, ptr += 32) {
+        for (int q = 0; q < 4; q++) {
+            env->xmm_regs[i].ZMM_Q(4 + q) =
+                load ? access_ldq(ac, ptr + 8 * q) : 0;
+        }
+    }
+}
+
+static void do_xrstor_hi16_zmm(X86Access *ac, target_ulong ptr, bool load)
+{
+    CPUX86State *env = ac->env;
+
+    if (!(env->hflags & HF_CS64_MASK)) {
+        return;
+    }
+    for (int i = 16; i < 32; i++, ptr += 64) {
+        for (int q = 0; q < 8; q++) {
+            env->xmm_regs[i].ZMM_Q(q) = load ? access_ldq(ac, ptr + 8 * q) : 0;
+        }
+    }
+}
+
 static void do_xrstor_bndregs(X86Access *ac, target_ulong ptr)
 {
     CPUX86State *env = ac->env;
@@ -3060,6 +3141,18 @@ static void do_xrstor(X86Access *ac, target_ulong ptr,
             memset(&env->bndcs_regs, 0, sizeof(env->bndcs_regs));
         }
         cpu_sync_bndcs_hflags(env);
+    }
+    if (rfbm & XSTATE_OPMASK_MASK) {
+        do_xrstor_opmask(ac, ptr + XO(opmask_state),
+                         xstate_bv & XSTATE_OPMASK_MASK);
+    }
+    if (rfbm & XSTATE_ZMM_Hi256_MASK) {
+        do_xrstor_zmm_hi256(ac, ptr + XO(zmm_hi256_state),
+                            xstate_bv & XSTATE_ZMM_Hi256_MASK);
+    }
+    if (rfbm & XSTATE_Hi16_ZMM_MASK) {
+        do_xrstor_hi16_zmm(ac, ptr + XO(hi16_zmm_state),
+                           xstate_bv & XSTATE_Hi16_ZMM_MASK);
     }
     if (rfbm & XSTATE_PKRU_MASK) {
         uint64_t old_pkru = env->pkru;
@@ -3243,6 +3336,20 @@ void helper_xsetbv(CPUX86State *env, uint32_t ecx, uint64_t mask)
     ena = ((uint64_t)ena_hi << 32) | ena_lo;
     if (mask & ~ena) {
         goto do_gpf;
+    }
+
+    /*
+     * AVX-512's three components go together, and with AVX's (SDM vol. 1
+     * 13.3: XSETBV #GP).
+     */
+    if (mask & (XSTATE_OPMASK_MASK | XSTATE_ZMM_Hi256_MASK |
+                XSTATE_Hi16_ZMM_MASK)) {
+        uint64_t all = XSTATE_OPMASK_MASK | XSTATE_ZMM_Hi256_MASK |
+                       XSTATE_Hi16_ZMM_MASK;
+
+        if ((mask & all) != all || !(mask & XSTATE_YMM_MASK)) {
+            goto do_gpf;
+        }
     }
 
     /* Disallow enabling only half of MPX.  */

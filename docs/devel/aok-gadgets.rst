@@ -478,10 +478,19 @@ with the gadgets.
 * **In C**, one call each: ``mul`` and ``div`` with one operand, the double
   shifts, rotates whose flags are wanted, the string instructions (a ``rep``
   goes page by page on the host's memory where the pages are RAM, and comes
-  back to the main loop if it is long), ``cmpxchg``, ``cmpxchg8b``, ``xadd``
-  and ``xchg`` with memory, ``pushf`` and ``popf``, ``lahf`` and ``sahf``,
-  ``clc``, ``stc`` and ``cmc``, ``rdtsc``, ``pause``, and ``in`` and ``out``
-  where the CPL may use any port.
+  back to the main loop if it is long), ``cmpxchg``, ``cmpxchg8b``,
+  ``cmpxchg16b``, ``xadd`` and ``xchg`` with memory, ``pushf`` and ``popf``,
+  ``lahf`` and ``sahf``, ``clc``, ``stc`` and ``cmc``, ``rdtsc``, ``rdtscp``,
+  ``cpuid``, ``pause``, ``verr`` and ``verw``, ``rdfsbase`` and its kind, and
+  ``in`` and ``out`` where the CPL may use any port.
+* **The kernel's** fast paths, each a call of the helper TCG's code for the
+  instruction calls, and where TCG ends its TB the main loop after it:
+  ``iret``, ``syscall`` and ``sysret``, ``mov`` to and from ``cr0``, ``cr2``,
+  ``cr3`` and ``cr4``, ``invlpg``, ``clac`` and ``stac``, ``xsave``,
+  ``xsaveopt`` and ``xrstor``; ``swapgs`` is a gadget. The instruction after
+  ``sti`` may be a ``jmp``, which looks for an interrupt waiting where it
+  goes. A bit string addressed by a register (``bt`` and its kind on memory)
+  is its operand's address moved by the bit number first.
 * **Other CPUs.** Under multi-threaded TCG a guest's stores must stay in
   order and its loads before what follows them. Every memory gadget exists
   a second time with the barriers that give that, used in a ``CF_PARALLEL``
@@ -544,9 +553,9 @@ with the gadgets.
   VEX write of TCG's zeroes the register to bit 511 as the hardware's does.
   A memory operand is staged before the frame and stored after it (a store
   that follows a frame that changes MXCSR is probed first); with an opmask,
-  or VEX's VMASKMOV's mask register, only the enabled elements are touched, so that a masked-off one may be on
-  a page that is not there, and a gather or scatter goes element by
-  element, restartable as x86's. iSH-AOK's test programs, with answers
+  or VEX's VMASKMOV's mask register, only the enabled elements are
+  touched, so that a masked-off one may be on a page that is not there,
+  and a gather or scatter goes element by element, restartable as x86's. iSH-AOK's test programs, with answers
   from an AMD Ryzen and Intel SDE, run in the gate image
   (``aok/x64/vec-image.sh`` in AOK VM).
 * **A TB stays in its page.** One whose first instruction runs into the next
@@ -554,14 +563,13 @@ with the gadgets.
 * Left to TCG: everything outside those two kinds of code, MMX, the x87's
   environment (``fldenv``, ``fnstenv``, ``frstor``, ``fnsave``, ``fxsave``,
   ``fxrstor``, ``fninit``),
-  single-precision arithmetic on the host (it is softfloat's, called from
-  the stream), the system calls, interrupts and the returns from them, the
-  control and debug registers, loads of ``ss`` and ``cs``, string I/O,
-  ``cmpxchg16b``, the rotates through carry, 16-bit ``adc``/``sbb`` and stack
-  operations, 16-bit addressing, a bit string addressed by a register,
-  SSE4.2's string compares and CRC32, SHA, SSE4.1's PEXTR*, EXTRACTPS and
-  MOVNTDQA, VEX's gathers and string compares, and 32-bit code's VEX. Not yet anywhere: EVEX in 32-bit code, and a memory
-  operand of an EVEX instruction with a 0x67 prefix (both raise #UD).
+  ``int`` and ``sysenter``/``sysexit``, the debug registers, ``cr8``, loads
+  of segment registers, string I/O, the rotates through carry, 16-bit stack
+  operations, 16-bit addressing, SSE4.2's string compares and CRC32, SHA,
+  SSE4.1's PEXTR*, EXTRACTPS and MOVNTDQA, VEX's gathers and string
+  compares, and 32-bit code's VEX. Not yet anywhere: EVEX in 32-bit code, and
+  a memory operand of an EVEX instruction with a 0x67 prefix (both raise
+  #UD).
 
 A TB is translated only with no single-step flag pending, outside the shadow
 of a ``mov`` to ``ss``, system management mode and SVM guests, with MPX off,

@@ -2981,6 +2981,12 @@ void helper_fxrstor(CPUX86State *env, target_ulong ptr)
 
     access_prepare(&ac, env, ptr, sizeof(X86LegacyXSaveArea),
                    MMU_DATA_LOAD, ra);
+    /* MXCSR's reserved bits set: #GP, with nothing loaded */
+    if ((env->cr[4] & CR4_OSFXSR_MASK) &&
+        (access_ldl(&ac, ptr + offsetof(X86LegacyXSaveArea, mxcsr)) &
+         ~MXCSR_MASK)) {
+        raise_exception_ra(env, EXCP0D_GPF, ra);
+    }
     do_fxrstor(&ac, ptr);
 }
 
@@ -3088,6 +3094,12 @@ void helper_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
     }
 
     rfbm &= env->xcr0;
+    /* MXCSR, which SSE's and AVX's components load, with reserved bits set */
+    if ((rfbm & (XSTATE_SSE_MASK | XSTATE_YMM_MASK)) &&
+        (access_ldl(&ac, ptr + offsetof(X86LegacyXSaveArea, mxcsr)) &
+         ~MXCSR_MASK)) {
+        raise_exception_ra(env, EXCP0D_GPF, ra);
+    }
     size_ext = xsave_area_size(rfbm & xstate_bv, false);
     if (size < size_ext) {
         /* TODO: See if existing page probe has covered extra size. */
@@ -3301,6 +3313,10 @@ void helper_update_mxcsr(CPUX86State *env)
 
 void helper_ldmxcsr(CPUX86State *env, uint32_t val)
 {
+    /* MXCSR's reserved bits set: #GP */
+    if (val & ~MXCSR_MASK) {
+        raise_exception_ra(env, EXCP0D_GPF, GETPC());
+    }
     cpu_set_mxcsr(env, val);
 }
 

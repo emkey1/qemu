@@ -24,10 +24,13 @@
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "migration/qemu-file-types.h"
+#include "monitor/hmp.h"
 #include "monitor/monitor.h"
 #include "qemu/error-report.h"
 #include "qemu/queue.h"
 #include "hw/core/qdev-properties.h"
+#include "qobject/qdict.h"
+#include "system/runstate.h"
 #include "trace.h"
 #include "hw/virtio/virtio-serial.h"
 #include "hw/virtio/virtio-access.h"
@@ -260,6 +263,101 @@ static size_t send_control_event(VirtIOSerial *vser, uint32_t port_id,
     return send_control_msg(vser, &cpkt, sizeof(cpkt));
 }
 
+/*
+ * tctiSH: tells the guest a console port's size, if it has one and the guest
+ * took VIRTIO_CONSOLE_F_SIZE. Linux makes it the window size of the port's
+ * hvc tty, which signals the tty's foreground process group with SIGWINCH,
+ * and gives it to the tty again every time the tty is opened.
+ *
+ * The size goes cols first, then rows, which is the order Linux reads it in
+ * (handle_control_message() in drivers/char/virtio_console.c). A message the
+ * guest is not ready for is dropped, as every control message is; the size is
+ * kept, and sent again when the guest sets the port up.
+ */
+static void send_console_size(VirtIOSerialPort *port)
+{
+    VirtIOSerial *vser = port->vser;
+    VirtIODevice *vdev = VIRTIO_DEVICE(vser);
+    struct {
+        struct virtio_console_control cpkt;
+        uint16_t cols;
+        uint16_t rows;
+    } QEMU_PACKED msg;
+
+    if (!VIRTIO_SERIAL_PORT_GET_CLASS(port)->is_console ||
+        !port->cols || !port->rows || !use_multiport(vser) ||
+        !virtio_vdev_has_feature(vdev, VIRTIO_CONSOLE_F_SIZE)) {
+        return;
+    }
+
+    virtio_stl_p(vdev, &msg.cpkt.id, port->id);
+    virtio_stw_p(vdev, &msg.cpkt.event, VIRTIO_CONSOLE_RESIZE);
+    virtio_stw_p(vdev, &msg.cpkt.value, 0);
+    virtio_stw_p(vdev, &msg.cols, port->cols);
+    virtio_stw_p(vdev, &msg.rows, port->rows);
+
+    trace_virtio_serial_send_control_event(port->id, VIRTIO_CONSOLE_RESIZE, 0);
+    send_control_msg(vser, &msg, sizeof(msg));
+}
+
+/*
+ * tctiSH: sends every console port's size, once the VM is running again. A
+ * snapshot load brings back the guest's idea of each size from when the
+ * snapshot was taken, and a size set while the VM was stopped was only kept.
+ */
+static void console_size_bh(void *opaque)
+{
+    VirtIOSerial *vser = opaque;
+    VirtIOSerialPort *port;
+
+    QTAILQ_FOREACH(port, &vser->ports, next) {
+        send_console_size(port);
+    }
+}
+
+static void virtio_serial_vmstate_change(void *opaque, bool running,
+                                         RunState state)
+{
+    VirtIOSerial *vser = opaque;
+
+    /* Not from here: the virtio core may not have started the device yet. */
+    if (running) {
+        qemu_bh_schedule(vser->console_size_bh);
+    }
+}
+
+/*
+ * tctiSH: sets the size of the virtconsole with qdev ID *id*, for a terminal
+ * on the host that shows it. Sent at once while the VM runs, and otherwise
+ * kept until it runs again; never touches guest memory while it is stopped.
+ */
+void hmp_console_resize(Monitor *mon, const QDict *qdict)
+{
+    const char *id = qdict_get_str(qdict, "id");
+    int64_t cols = qdict_get_int(qdict, "cols");
+    int64_t rows = qdict_get_int(qdict, "rows");
+    Object *obj = object_resolve_path_type(id, TYPE_VIRTIO_SERIAL_PORT, NULL);
+    VirtIOSerialPort *port = obj ? VIRTIO_SERIAL_PORT(obj) : NULL;
+    Error *err = NULL;
+
+    if (!port || !VIRTIO_SERIAL_PORT_GET_CLASS(port)->is_console) {
+        error_setg(&err, "there is no virtconsole '%s'", id);
+    } else if (!port->vser->serial.console_size) {
+        error_setg(&err, "'%s' is on a bus without console-size=on", id);
+    } else if (cols < 1 || cols > UINT16_MAX || rows < 1 || rows > UINT16_MAX) {
+        error_setg(&err, "%" PRId64 "x%" PRId64 " is not a console size",
+                   cols, rows);
+    } else {
+        port->cols = cols;
+        port->rows = rows;
+        if (runstate_is_running()) {
+            send_console_size(port);
+        }
+    }
+
+    hmp_handle_error(mon, err);
+}
+
 /* Functions for use inside qemu to open and read from/write to ports */
 int virtio_serial_open(VirtIOSerialPort *port)
 {
@@ -425,6 +523,12 @@ static void handle_control_message(VirtIOSerial *vser,
         }
 
         /*
+         * tctiSH: after the console port message, which is what makes Linux
+         * set up the port's tty: a size for a port without one is ignored.
+         */
+        send_console_size(port);
+
+        /*
          * When the guest has asked us for this information it means
          * the guest is all setup and has its virtqueues
          * initialised. If some app is interested in knowing about
@@ -540,6 +644,14 @@ static uint64_t get_features(VirtIODevice *vdev, uint64_t features,
     features |= BIT_ULL(VIRTIO_CONSOLE_F_EMERG_WRITE);
     if (vser->bus.max_nr_ports > 1) {
         virtio_add_feature(&features, VIRTIO_CONSOLE_F_MULTIPORT);
+    }
+    /*
+     * tctiSH: sizes go per port, in control messages, which needs multiport.
+     * Without it Linux would read the size from config space instead, which
+     * get_config leaves at zero.
+     */
+    if (vser->serial.console_size && vser->bus.max_nr_ports > 1) {
+        virtio_add_feature(&features, VIRTIO_CONSOLE_F_SIZE);
     }
     return features;
 }
@@ -1065,6 +1177,13 @@ static void virtio_serial_device_realize(DeviceState *dev, Error **errp)
 
     vser->post_load = NULL;
 
+    if (vser->serial.console_size) {
+        vser->console_size_bh = virtio_bh_new_guarded(dev, console_size_bh,
+                                                      vser);
+        vser->vmstate_change = qemu_add_vm_change_state_handler(
+            virtio_serial_vmstate_change, vser);
+    }
+
     QLIST_INSERT_HEAD(&vserdevices.devices, vser, next);
 }
 
@@ -1095,6 +1214,15 @@ static void virtio_serial_device_unrealize(DeviceState *dev)
     int i;
 
     QLIST_REMOVE(vser, next);
+
+    if (vser->vmstate_change) {
+        qemu_del_vm_change_state_handler(vser->vmstate_change);
+        vser->vmstate_change = NULL;
+    }
+    if (vser->console_size_bh) {
+        qemu_bh_delete(vser->console_size_bh);
+        vser->console_size_bh = NULL;
+    }
 
     virtio_delete_queue(vser->c_ivq);
     virtio_delete_queue(vser->c_ovq);
@@ -1131,6 +1259,7 @@ static const VMStateDescription vmstate_virtio_console = {
 static const Property virtio_serial_properties[] = {
     DEFINE_PROP_UINT32("max_ports", VirtIOSerial, serial.max_virtserial_ports,
                                                   31),
+    DEFINE_PROP_BOOL("console-size", VirtIOSerial, serial.console_size, false),
 };
 
 static void virtio_serial_class_init(ObjectClass *klass, const void *data)

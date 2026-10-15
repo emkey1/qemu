@@ -973,7 +973,14 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 
         while (!cpu_handle_interrupt(cpu, &last_tb)) {
             TranslationBlock *tb;
-            TCGTBCPUState s = tb_cpu_state(cpu);
+            TCGTBCPUState s;
+
+#ifndef CONFIG_USER_ONLY
+            if (unlikely(tlb_notdirty_redo_n)) {
+                tlb_notdirty_redo(cpu);
+            }
+#endif
+            s = tb_cpu_state(cpu);
             s.cflags = cpu->cflags_next_tb;
 
             /*
@@ -1068,6 +1075,12 @@ int cpu_exec(CPUState *cpu)
 
     ret = cpu_exec_setjmp(cpu, &sc);
 
+#ifndef CONFIG_USER_ONLY
+    /* This CPU may sleep now, and the others not. */
+    if (unlikely(tlb_notdirty_redo_n)) {
+        tlb_notdirty_redo(cpu);
+    }
+#endif
     cpu_exec_exit(cpu);
     return ret;
 }

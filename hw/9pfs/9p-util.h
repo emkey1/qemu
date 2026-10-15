@@ -121,10 +121,10 @@ static inline int errno_to_dotl(int err) {
  * container -- and the container is most of what is reachable anyway.
  *
  * The real fix is the one the mount code was originally written for: a 9p
- * device per mounted folder, added live over the monitor, which is what
- * scan_for_new_virtfs_channels() in tctictl is still rescanning PCI for. That
- * needs the fsdev_add monitor command this fork used to carry, and it would let
- * this come back out.
+ * device per mounted folder, added live over the monitor. That needs the
+ * fsdev_add monitor command this fork used to carry, and tctictl to mount each
+ * device rather than bind a folder under the shared one, and it would let this
+ * come back out.
  *
  * Contained to hw/9pfs: nothing outside it includes this header.
  */

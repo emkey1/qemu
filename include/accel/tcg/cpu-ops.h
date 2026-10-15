@@ -63,6 +63,27 @@ struct TCGCPUOps {
      * This function must be provided by the target, which should create
      * the target-specific DisasContext, and then invoke translator_loop.
      */
+#ifdef CONFIG_AOK_GADGETS
+    /**
+     * @aok_translate_code: Translate guest instructions to an AOK gadget
+     * stream, bypassing TCGOps.
+     *
+     * Optional. Called before @translate_code with the same arguments.
+     * Returns the size of the stream in bytes when it has translated at
+     * least one instruction (tb->size and tb->icount are then set), 0 to
+     * leave this TB to @translate_code, or -1 if the code buffer is full.
+     */
+    int (*aok_translate_code)(CPUState *cpu, TranslationBlock *tb,
+                              int *max_insns, vaddr pc, void *host_pc);
+    /* Offset of the guest program counter from CPUArchState. */
+    size_t aok_pc_offset;
+    /*
+     * @aok_fold_fpsr: Add the host FP exception flags in @fpsr (AArch64
+     * FPSR bits), raised by FP gadgets, to the guest's FP status. Needed
+     * only by a front end whose gadgets compute on the host's FP unit.
+     */
+    void (*aok_fold_fpsr)(CPUState *cpu, uint32_t fpsr);
+#endif
     void (*translate_code)(CPUState *cpu, TranslationBlock *tb,
                            int *max_insns, vaddr pc, void *host_pc);
     /**

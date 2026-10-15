@@ -75,6 +75,7 @@ static inline TCGTBCPUState tb_cpu_state(CPUState *cpu)
 #if !defined(CONFIG_USER_ONLY)
 #include "accel/tcg/iommu.h"
 #endif
+#include "accel/tcg/aok.h"
 
 /* -icount align implementation. */
 
@@ -423,7 +424,8 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
     }
 
     tb = tb_lookup(cpu, s);
-    if (tb == NULL) {
+    if (tb == NULL || tb->aok) {
+        /* A gadget stream is not entered from TCG's code: see aok.h. */
         return tcg_code_gen_epilogue;
     }
 
@@ -466,7 +468,45 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     }
 
     qemu_thread_jit_execute();
-    ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
+#ifdef CONFIG_AOK_GADGETS
+    if (itb->aok) {
+        CPUArchState *env = cpu_env(cpu);
+        const AokCPU aok = {
+            .exit_request = &cpu->neg.icount_decr.u32,
+            .pc = (void *)env + cpu->cc->tcg_ops->aok_pc_offset,
+            .tb_jmp_cache = cpu->tb_jmp_cache,
+            .breakpoints = &cpu->breakpoints,
+            .host_fpsr = &cpu->aok_host_fpsr,
+        };
+
+        if (unlikely(aok_stats_enabled)) {
+            aok_stats.enter_aok++;
+        }
+        ret = aok_tb_exec(env, tb_ptr, &aok);
+        aok_fold_fpsr(cpu);
+        if (unlikely(aok_stats_enabled)) {
+            /* With a TB to link from, or with none (and what asked). */
+            if (ret & ~(uintptr_t)TB_EXIT_MASK) {
+                aok_stats.ret_slot++;
+            } else if ((int32_t)qatomic_read(&cpu->neg.icount_decr.u32) < 0) {
+                aok_stats.ret_request++;
+            } else {
+                aok_stats.ret_none++;
+            }
+        }
+    } else
+#endif
+    {
+#ifdef CONFIG_AOK_GADGETS
+        if (unlikely(aok_stats_enabled)) {
+            aok_stats.enter_tcg++;
+            aok_stats_tcg_entry(cpu);
+        }
+        /* Flags from a stream that an exception left by longjmp. */
+        aok_fold_fpsr(cpu);
+#endif
+        ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
+    }
     cpu->neg.can_do_io = true;
     qemu_plugin_disable_mem_helpers(cpu);
     /*
@@ -641,9 +681,110 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
     uintptr_t jmp_rx = (uintptr_t)tb->tc.ptr + offset;
     uintptr_t jmp_rw = jmp_rx - tcg_splitwx_diff;
 
+    if (tb->aok) {
+        /* An AOK stream's jump is this word, read by aok_gadget_goto. */
+        qatomic_set(&tb->jmp_target_addr[n], addr);
+        return;
+    }
     tb->jmp_target_addr[n] = addr;
     tb_target_set_jmp_target(c_tb, n, jmp_rx, jmp_rw);
 }
+
+#ifdef CONFIG_AOK_GADGETS
+/*
+ * A stream's direct jump to a TB that may not be linked to (one of two
+ * pages, whose second may be mapped elsewhere tomorrow): rather than come
+ * back here each time, the jump goes to the stream's own stub that looks
+ * the TB up, which aok_gen_finish() put after the stubs of its slots.
+ */
+static void aok_slot_to_lookup(TranslationBlock *tb, int n)
+{
+    uint16_t r0 = tb->jmp_reset_offset[0], r1 = tb->jmp_reset_offset[1];
+    uint16_t last = r0 == TB_JMP_OFFSET_INVALID ? r1 :
+                    r1 == TB_JMP_OFFSET_INVALID ? r0 : MAX(r0, r1);
+
+    if (n > 1 || tb->jmp_reset_offset[n] == TB_JMP_OFFSET_INVALID ||
+        qatomic_read(&tb->jmp_dest[n])) {
+        return;
+    }
+    tb_set_jmp_target(tb, n, (uintptr_t)tb->tc.ptr + last +
+                             2 * sizeof(uint64_t));
+}
+
+/*
+ * A front end's lookup gadget does tb_lookup()'s first step itself: it
+ * hashes the pc as tb_jmp_cache_hash_func does, reads both ways of
+ * cpu->tb_jmp_cache, and compares the TB's cs_base, flags and cflags with
+ * its own TB's. It is written against this layout.
+ */
+QEMU_BUILD_BUG_ON(TB_JMP_CACHE_BITS != 14);
+QEMU_BUILD_BUG_ON(offsetof(CPUJumpCache, array) != 16);
+QEMU_BUILD_BUG_ON(sizeof(((CPUJumpCache *)0)->array[0]) != 16);
+QEMU_BUILD_BUG_ON(offsetof(CPUJumpCache, array[0].tb) != 16);
+QEMU_BUILD_BUG_ON(offsetof(CPUJumpCache, array[0].pc) != 24);
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, cs_base) != 8);
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, flags) != 16);
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, cflags) != 20);
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, aok) != 28);
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, tc.ptr) != 32);
+QEMU_BUILD_BUG_ON(offsetof(CPUState, breakpoints.tqh_first)
+                  != offsetof(CPUState, breakpoints));
+
+/*
+ * helper_lookup_tb_ptr for a gadget stream: the stream to continue in, or
+ * NULL to return to the main loop. Only another stream will do.
+ */
+const void *aok_lookup_tb_ptr(CPUArchState *env)
+{
+    CPUState *cpu = env_cpu(env);
+    TranslationBlock *tb;
+
+    cpu->neg.can_do_io = true;
+
+    TCGTBCPUState s = tb_cpu_state(cpu);
+    s.cflags = curr_cflags(cpu);
+
+    if (check_for_breakpoints(cpu, s.pc, &s.cflags)) {
+        cpu_loop_exit(cpu);
+    }
+
+    if (unlikely(aok_stats_enabled)) {
+        /* Why did the lookup gadget not find it: was it there to find? */
+        uint32_t h = tb_jmp_cache_hash_func(s.pc);
+
+        for (int way = 0; way < 2; way++) {
+            TranslationBlock *t = cpu->tb_jmp_cache->array[h ^ way].tb;
+
+            if (t && cpu->tb_jmp_cache->array[h ^ way].pc == s.pc) {
+                aok_stats.lookup_cached++;
+                if (t->flags != s.flags || t->cs_base != s.cs_base) {
+                    aok_stats.lookup_cached_flags++;
+                    for (int b = 0; b < 32; b++) {
+                        if ((t->flags ^ s.flags) >> b & 1) {
+                            aok_stats.lookup_flag_bit[b]++;
+                        }
+                    }
+                } else if (tb_cflags(t) != s.cflags) {
+                    aok_stats.lookup_cached_cflags++;
+                }
+                break;
+            }
+        }
+    }
+    tb = tb_lookup(cpu, s);
+    if (unlikely(aok_stats_enabled)) {
+        *(tb == NULL ? &aok_stats.lookup_none :
+          tb->aok ? &aok_stats.lookup_aok : &aok_stats.lookup_tcg) += 1;
+    }
+    if (tb == NULL || !tb->aok) {
+        return NULL;
+    }
+    if (qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
+        log_cpu_exec(s.pc, cpu, tb);
+    }
+    return tb->tc.ptr;
+}
+#endif
 
 static inline void tb_add_jump(TranslationBlock *tb, int n,
                                TranslationBlock *tb_next)
@@ -1022,11 +1163,20 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * for the second page can change.
              */
             if (tb_page_addr1(tb) != -1) {
+#ifdef CONFIG_AOK_GADGETS
+                if (last_tb && last_tb->aok && tb->aok) {
+                    aok_slot_to_lookup(last_tb, tb_exit);
+                    aok_stats.two_page++;
+                }
+#endif
                 last_tb = NULL;
             }
 #endif
-            /* See if we can patch the calling TB. */
-            if (last_tb) {
+            /*
+             * See if we can patch the calling TB. A TCG TB and an AOK
+             * gadget stream cannot jump into each other.
+             */
+            if (last_tb && last_tb->aok == tb->aok) {
                 tb_add_jump(last_tb, tb_exit, tb);
             }
 

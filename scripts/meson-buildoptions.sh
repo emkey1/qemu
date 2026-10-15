@@ -56,6 +56,8 @@ meson_options_help() {
   printf "%s\n" '                           in, using the one given, or either (runtime)'
   printf "%s\n" '                           [disabled] (choices: disabled/jit/runtime/tcti)'
   printf "%s\n" '  --enable-tcg-interpreter TCG with bytecode interpreter (slow)'
+  printf "%s\n" '  --enable-aok-gadgets     AOK gadget streams for the guests that have them'
+  printf "%s\n" '                           (AArch64 hosts, system emulation)'
   printf "%s\n" '  --enable-tcg-threaded-interpreter'
   printf "%s\n" '                           TCG with threaded-dispatch interpreter, for'
   printf "%s\n" '                           AArch64 hosts that cannot JIT'
@@ -527,6 +529,8 @@ _meson_option_parse() {
     --enable-tcg-hybrid=*) quote_sh "-Dtcg_hybrid=$2" ;;
     --enable-tcg-interpreter) printf "%s" -Dtcg_interpreter=true ;;
     --disable-tcg-interpreter) printf "%s" -Dtcg_interpreter=false ;;
+    --enable-aok-gadgets) printf "%s" -Daok_gadgets=true ;;
+    --disable-aok-gadgets) printf "%s" -Daok_gadgets=false ;;
     --enable-tcg-threaded-interpreter) printf "%s" -Dtcg_threaded_interpreter=true ;;
     --disable-tcg-threaded-interpreter) printf "%s" -Dtcg_threaded_interpreter=false ;;
     --tls-priority=*) quote_sh "-Dtls_priority=$2" ;;

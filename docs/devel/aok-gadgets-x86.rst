@@ -180,35 +180,36 @@ Host CPU cycles a guest program takes under TCTI (``QEMU_AOK=0``, the same
 binary) and under the gadgets, with ``-M q35``, one guest CPU and Alpine 3.24
 (its 6.18 kernel and userland; *Testing* says why ``+rdrand``): what the QEMU
 process spends between a program's first line of output and its last, the
-median of two runs. On an Apple M5 Max (macOS); the last column is the same
-ratio on an iPad Pro with an M4, in an iOS app, where nothing may be
-generated at run time and TCTI is what the gadgets replace.
+median of two runs. On an Apple M5 Max (macOS); the last two columns are the
+same ratio in an iOS app, where nothing may be generated at run time and TCTI
+is what the gadgets replace, on an iPad Pro with an M4 (two runs) and on a
+2017 iPad Pro with an A10X (four runs, all of them on its performance cores).
 
 The 64-bit guest, ``-cpu qemu64,+rdrand``:
 
-==================== ========= ============ =========== =======
-Workload             TCTI      AOK gadgets  TCTI / AOK  M4
-==================== ========= ============ =========== =======
-CoreMark              11.7 G     4.9 G      2.36        2.30
-n-body (doubles)       9.5 G     5.7 G      1.66        1.49
-Python                31.2 G     9.9 G      3.17        3.15
-xz -3                  9.7 G     4.7 G      2.04        2.44
-sha256sum              4.2 G     2.5 G      1.69        1.77
-awk                   33.6 G    14.0 G      2.41        2.35
-==================== ========= ============ =========== =======
+==================== ========= ============ =========== ======= =======
+Workload             TCTI      AOK gadgets  TCTI / AOK  M4      A10X
+==================== ========= ============ =========== ======= =======
+CoreMark              11.7 G     4.9 G      2.36        2.30    2.10
+n-body (doubles)       9.5 G     5.7 G      1.66        1.49    2.95
+Python                31.2 G     9.9 G      3.17        3.15    2.86
+xz -3                  9.7 G     4.7 G      2.04        2.44    2.62
+sha256sum              4.2 G     2.5 G      1.69        1.77    1.43
+awk                   33.6 G    14.0 G      2.41        2.35    2.77
+==================== ========= ============ =========== ======= =======
 
 The 32-bit guest (Alpine's x86), ``-cpu qemu32,+rdrand``:
 
-==================== ========= ============ =========== =======
-Workload             TCTI      AOK gadgets  TCTI / AOK  M4
-==================== ========= ============ =========== =======
-CoreMark              13.8 G     5.2 G      2.66        2.52
-n-body (doubles)      11.2 G     5.9 G      1.90        1.67
-Python                51.1 G    14.0 G      3.65        3.41
-xz -3                 18.4 G     7.8 G      2.35        2.58
-sha256sum              7.9 G     3.3 G      2.37        2.34
-awk                   17.0 G     5.5 G      3.09        3.30
-==================== ========= ============ =========== =======
+==================== ========= ============ =========== ======= =======
+Workload             TCTI      AOK gadgets  TCTI / AOK  M4      A10X
+==================== ========= ============ =========== ======= =======
+CoreMark              13.8 G     5.2 G      2.66        2.52    2.31
+n-body (doubles)      11.2 G     5.9 G      1.90        1.67    3.59
+Python                51.1 G    14.0 G      3.65        3.41    3.60
+xz -3                 18.4 G     7.8 G      2.35        2.58    2.42
+sha256sum              7.9 G     3.3 G      2.37        2.34    2.24
+awk                   17.0 G     5.5 G      3.09        3.30    4.02
+==================== ========= ============ =========== ======= =======
 
 Testing
 =======

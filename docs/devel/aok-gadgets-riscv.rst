@@ -71,20 +71,21 @@ Host CPU cycles a guest program takes under TCTI (``QEMU_AOK=0``, the same
 binary) and under the gadgets, with ``-M virt -cpu rv64``, one guest CPU and
 Alpine 3.24 (its 6.18 kernel and userland): what the QEMU process spends
 between a program's first line of output and its last, the median of two runs.
-On an Apple M5 Max (macOS); the last column is the same ratio on an iPad Pro
-with an M4, in an iOS app, where nothing may be generated at run time and TCTI
-is what the gadgets replace.
+On an Apple M5 Max (macOS); the last two columns are the same ratio in an iOS
+app, where nothing may be generated at run time and TCTI is what the gadgets
+replace, on an iPad Pro with an M4 (two runs) and on a 2017 iPad Pro with an
+A10X (four runs, all of them on its performance cores).
 
-==================== ========= ============ =========== =======
-Workload             TCTI      AOK gadgets  TCTI / AOK  M4
-==================== ========= ============ =========== =======
-CoreMark              11.7 G     6.1 G      1.91        1.90
-n-body (doubles)      10.1 G     3.2 G      3.13        2.77
-Python                32.5 G    10.3 G      3.16        3.18
-xz -3                  8.5 G     5.1 G      1.66        1.70
-sha256sum              5.1 G     2.9 G      1.72        1.75
-awk                   11.5 G     4.5 G      2.56        2.58
-==================== ========= ============ =========== =======
+==================== ========= ============ =========== ======= =======
+Workload             TCTI      AOK gadgets  TCTI / AOK  M4      A10X
+==================== ========= ============ =========== ======= =======
+CoreMark              11.7 G     6.1 G      1.91        1.90    1.62
+n-body (doubles)      10.1 G     3.2 G      3.13        2.77    2.17
+Python                32.5 G    10.3 G      3.16        3.18    2.53
+xz -3                  8.5 G     5.1 G      1.66        1.70    1.64
+sha256sum              5.1 G     2.9 G      1.72        1.75    1.52
+awk                   11.5 G     4.5 G      2.56        2.58    2.52
+==================== ========= ============ =========== ======= =======
 
 Run-time switches
 =================

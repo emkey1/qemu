@@ -2765,10 +2765,14 @@ static bool sse_vex_op(unsigned map, unsigned op, int pfx)
 {
     switch (map) {
     case 1:
+        /* (and SSE2's integer ops the SSE path above has not) */
         return op == 0x51 || op == 0x52 || op == 0x53 || (op >= 0x58 && op <= 0x5f) ||
                op == 0xc2 || op == 0x2a || op == 0x2c || op == 0x2d || op == 0x2e ||
                op == 0x2f || op == 0xd0 || op == 0x7c || op == 0x7d || op == 0xe6 ||
-               (op == 0x12 && pfx >= 2) || (op == 0x16 && pfx == 2);
+               (op == 0x12 && pfx >= 2) || (op == 0x16 && pfx == 2) ||
+               (pfx == 1 && (op == 0x63 || op == 0x67 || op == 0x6b ||
+                             (op >= 0xd1 && op <= 0xd3) || op == 0xe1 || op == 0xe2 ||
+                             op == 0xe4 || op == 0xe5 || (op >= 0xf1 && op <= 0xf6)));
     case 2:
         return pfx == 1 && (op <= 0x0b || op == 0x10 || op == 0x14 || op == 0x15 ||
                             op == 0x17 || (op >= 0x1c && op <= 0x1e) ||
@@ -2842,7 +2846,7 @@ static int sse_vex(Ctx *c, const Insn *d, unsigned map, unsigned op, int pfx,
     }
     switch (e->kind) {
     case VXK_L3: case VXK_SCAL: case VXK_TBL2: case VXK_INTIN: case VXK_INSPS:
-    case VXK_BLENDV:
+    case VXK_BLENDV: case VXK_SHX:
         v.vvvv = v.reg;             /* s1: the destination */
         break;
     case VXK_L2: case VXK_TBL1: case VXK_FLAGS: case VXK_TEST: case VXK_WIDEN:

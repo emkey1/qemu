@@ -71,6 +71,7 @@ typedef struct IRQSource {
     int last_cpu;
     int output;     /* IRQ level, e.g. OPENPIC_OUTPUT_INT */
     int pending;    /* TRUE if IRQ is pending */
+    bool asserted;  /* the input line's level, whatever the sense */
     IRQType type;
     bool level:1;   /* level-triggered */
     bool nomask:1;  /* critical interrupts ignore mask on some FSL MPICs */

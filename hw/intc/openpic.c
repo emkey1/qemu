@@ -398,6 +398,7 @@ static void openpic_set_irq(void *opaque, int n_IRQ, int level)
     src = &opp->src[n_IRQ];
     DPRINTF("openpic: set irq %d = %d ivpr=0x%08x",
             n_IRQ, level, src->ivpr);
+    src->asserted = level;
     if (src->level) {
         /* level-sensitive irq */
         src->pending = level;
@@ -503,6 +504,7 @@ static inline void write_IRQreg_ilr(OpenPICState *opp, int n_IRQ, uint32_t val)
 static inline void write_IRQreg_ivpr(OpenPICState *opp, int n_IRQ, uint32_t val)
 {
     uint32_t mask;
+    bool was_level = opp->src[n_IRQ].level;
 
     /*
      * NOTE when implementing newer FSL MPIC models: starting with v4.0,
@@ -523,6 +525,19 @@ static inline void write_IRQreg_ivpr(OpenPICState *opp, int n_IRQ, uint32_t val)
     switch (opp->src[n_IRQ].type) {
     case IRQ_TYPE_NORMAL:
         opp->src[n_IRQ].level = !!(opp->src[n_IRQ].ivpr & IVPR_SENSE_MASK);
+        /*
+         * A level-sensitive source is pending while its input is asserted,
+         * and an edge latched while it was edge-sensitive is not that.
+         * Linux's mpic_init leaves every source edge-sensitive, and
+         * request_irq then makes the PowerMac's PMU interrupt (macio GPIO1)
+         * level-low: a PMU tick latched in between stayed pending while
+         * GPIO1 was deasserted, and gpio1_interrupt saw ~100,000 interrupts
+         * a second that were not its own until the next tick, enough for
+         * "irq 47: nobody cared" to disable it on a fast host.
+         */
+        if (opp->src[n_IRQ].level && !was_level) {
+            opp->src[n_IRQ].pending = opp->src[n_IRQ].asserted;
+        }
         break;
 
     case IRQ_TYPE_FSLINT:
@@ -1414,6 +1429,24 @@ static const VMStateDescription vmstate_openpic_irqdest = {
     }
 };
 
+static bool openpic_irqsource_asserted_needed(void *opaque)
+{
+    IRQSource *src = opaque;
+
+    return src->asserted;
+}
+
+static const VMStateDescription vmstate_openpic_irqsource_asserted = {
+    .name = "openpic_irqsource/asserted",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = openpic_irqsource_asserted_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(asserted, IRQSource),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_openpic_irqsource = {
     .name = "openpic_irqsource",
     .version_id = 0,
@@ -1425,6 +1458,10 @@ static const VMStateDescription vmstate_openpic_irqsource = {
         VMSTATE_INT32(last_cpu, IRQSource),
         VMSTATE_INT32(pending, IRQSource),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_openpic_irqsource_asserted,
+        NULL
     }
 };
 
@@ -1456,6 +1493,10 @@ static int openpic_post_load(void *opaque, int version_id)
 
     /* Update internal ivpr and idr variables */
     for (i = 0; i < opp->max_irq; i++) {
+        /* The stream's pending is current: no change of sense to resample */
+        if (opp->src[i].type == IRQ_TYPE_NORMAL) {
+            opp->src[i].level = !!(opp->src[i].ivpr & IVPR_SENSE_MASK);
+        }
         write_IRQreg_idr(opp, i, opp->src[i].idr);
         write_IRQreg_ivpr(opp, i, opp->src[i].ivpr);
     }

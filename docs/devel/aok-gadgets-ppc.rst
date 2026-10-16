@@ -11,7 +11,8 @@ translator to TCG only in that binary; ``qemu-system-ppc64`` runs as it did.
 Translated: integer arithmetic and logic (without OE), compares, rotates and
 shifts, the record forms, XER's CA, the CR's own insns (the logical ops,
 ``mcrf``, ``mfcr``, ``mtcrf``, ``mcrxr``), ``mfspr`` and ``mtspr`` of LR, CTR
-and XER, the time base (``mftb``), the integer loads and stores of every
+and XER and of any SPR whose callback is the generic one (VRSAVE; in
+supervisor mode the SPRGs, SRR0, SRR1 and others), the time base (``mftb``), the integer loads and stores of every
 size, update and indexed form and the byte-reversed ones, ``lmw`` and
 ``stmw``, ``lwarx`` and ``stwcx.``, ``dcbz``, ``b``, ``bc`` on a CR bit, on
 CTR or on both, ``blr`` (also on a CR bit), ``bctr`` and their linking forms,
@@ -65,6 +66,23 @@ Where rA is 0, ``(rA|0)`` reads ``aok_zero``, a word of ``CPUPPCState`` that
 is always 0, so that one gadget serves both forms; Mac OS reaches its
 low-memory globals that way.
 
+Fused pairs
+===========
+
+Two families, with the core's ``aok_gen_pair`` (the general page): an op and
+its record form's CR0 (``add.``, ``and.``, ``andi.``, ``rlwinm.``, ``mr.``
+and the like, 22 ops), and a compare (``cmp``, ``cmpi``, ``cmpl``,
+``cmpli``) and a branch on a CR bit after it. Each has a forwarding form,
+which takes the register the first wrote (the result, or the CR field's
+value) from the first's host register. The integer gadgets are one body per
+op (``op_add`` ...) for the op's own gadget and the pairs it is in; a
+translated insn's gadgets are offered to the pair table one by one
+(``pair_steps``). ``QEMU_AOK_NO_PAIRS`` and ``QEMU_AOK_NO_FWD`` turn them
+off. Host cycles, five interleaved runs each, medians, without pairs over
+with: CoreMark 1.064, n-body 1.017, xz 1.018, sha256 1.003, awk 0.997. The
+list is a first one, by hand; one measured from what programs execute is
+to follow, as RISC-V's was.
+
 Floating point
 ==============
 
@@ -116,11 +134,11 @@ runs of each, medians:
 ==================== ============ ========== =======
 Workload             TCTI         Gadgets    Ratio
 ==================== ============ ========== =======
-CoreMark             13.63 G      5.00 G     2.72
-n-body (doubles)     100.63 G     17.52 G    5.74
-xz -3                19.25 G      9.61 G     2.00
-sha256sum            6.44 G       3.56 G     1.81
-awk                  10.80 G      4.29 G     2.52
+CoreMark             13.55 G      4.65 G     2.91
+n-body (doubles)     98.54 G      17.33 G    5.69
+xz -3                16.95 G      7.79 G     2.18
+sha256sum            6.50 G       3.43 G     1.90
+awk                  10.55 G      4.00 G     2.64
 ==================== ============ ========== =======
 
 n-body was 0.83 while floating point was TCG's (its loops went from a
@@ -132,7 +150,8 @@ Tests
 
 The kit's ``check``, ``fptest`` and ``memtest`` transcripts (see the
 general page) are identical with ``QEMU_AOK=0`` and with the gadgets, 143
-lines, the guest's clock at boot aside.
+lines, the guest's clock at boot aside; with pairs, without forwarding and
+without pairs.
 
 ``fpstress`` (aok-vm's ``aok/bench-pm/stress``) runs two million FP ops on
 operands chosen to sit where the gadgets draw their lines: exponents near

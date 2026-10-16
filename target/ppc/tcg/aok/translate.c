@@ -15,6 +15,7 @@
 #include "qemu/osdep.h"
 #include "cpu.h"
 #include "internal.h"
+#include "spr_common.h"
 #include "exec/helper-proto.h"
 #include "exec/target_page.h"
 #include "exec/translation-block.h"
@@ -57,6 +58,46 @@ DECL(fmadd) DECL(fmsub) DECL(fnmadd) DECL(fnmsub)
 DECL(frsp) DECL(fctiw) DECL(fctiwz) DECL(fcmp) DECL(mffs)
 
 typedef void (*Gadget)(void);
+
+/*
+ * Fused pairs (include/accel/tcg/aok.h): an op and its record form's CR0,
+ * and a compare and the branch on the field it set. Operand 0 of the second
+ * names the register the first wrote when the two belong together, and the
+ * f2n_ form then takes it from the first's host register.
+ */
+#define RC_PAIRS(X) \
+    X(add, 4) X(subf, 4) X(and, 4) X(andc, 4) X(or, 4) X(orc, 4) X(xor, 4) \
+    X(nand, 4) X(nor, 4) X(eqv, 4) X(mullw, 4) X(slw, 4) X(srw, 4) \
+    X(andi, 4) X(addic, 4) X(rlwinm, 4) X(srawi, 4) \
+    X(neg, 3) X(extsb, 3) X(extsh, 3) X(cntlzw, 3) X(mov, 3)
+#define CMP_PAIRS(X) \
+    X(cmp, bc_t) X(cmpi, bc_t) X(cmpl, bc_t) X(cmpli, bc_t) \
+    X(cmp, bc_f) X(cmpi, bc_f) X(cmpl, bc_f) X(cmpli, bc_f)
+#define DECL_RC(a, w) void G(f2_##a##__cr0)(void); void G(f2n_##a##__cr0)(void);
+#define DECL_CMP(a, b) void G(f2_##a##__##b)(void); void G(f2n_##a##__##b)(void);
+RC_PAIRS(DECL_RC)
+CMP_PAIRS(DECL_CMP)
+
+static const AokPair ppc_pair_list[] = {
+#define PAIR_RC(a, w) \
+    { G(a), G(cr0), G(f2_##a##__cr0), { G(f2n_##a##__cr0) }, w, \
+      { { 0, AOK_PAIR_OP_SLOT } } },
+#define PAIR_CMP(a, b) \
+    { G(a), G(b), G(f2_##a##__##b), { G(f2n_##a##__##b) }, 4, \
+      { { 0, AOK_PAIR_OP_SLOT } } },
+    RC_PAIRS(PAIR_RC)
+    CMP_PAIRS(PAIR_CMP)
+};
+
+static AokPairSet ppc_pairs = { ppc_pair_list, ARRAY_SIZE(ppc_pair_list) };
+static bool ppc_pairs_on;
+
+static void __attribute__((constructor)) ppc_pairs_init(void)
+{
+    ppc_pairs_on = !getenv("QEMU_AOK_NO_PAIRS");
+    ppc_pairs.forward = !getenv("QEMU_AOK_NO_FWD");
+    aok_pair_set_init(&ppc_pairs);
+}
 
 /* What gadgets.S knows of CPUPPCState (aok-ppc-asm.h). */
 QEMU_BUILD_BUG_ON(TARGET_LONG_BITS != 32);
@@ -373,11 +414,40 @@ typedef struct Ctx {
     uint32_t insn;
     bool pr;                /* user mode (MSR[PR]) */
     bool fp;                /* the FPU on (MSR[FP]); else FP insns are TCG's to trap */
+    CPUPPCState *env;
+    /* Where each gadget of the current insn began: the steps aok_gen_pair takes. */
+    uint64_t *gs[8];
+    int ngs;
     bool no_goto_ptr;
 } Ctx;
 
 /* What translating one insn came to. */
 enum { UNKNOWN, NEXT, END };
+
+static inline void emitg(Ctx *c, Gadget gadget)
+{
+    if (c->ngs < ARRAY_SIZE(c->gs)) {
+        c->gs[c->ngs++] = c->g.p;
+    }
+    aok_emit_gadget(&c->g, gadget);
+}
+
+/* The insn's gadgets, in order, offered to the pair table */
+static void pair_steps(Ctx *c)
+{
+    for (int i = 0; ppc_pairs_on && i < c->ngs; i++) {
+        uint64_t *end = c->g.p;
+
+        aok_gen_pair(&c->g, c->gs[i], &ppc_pairs);
+        if (c->g.p != end) {
+            /* fused: the gadget's word is gone, and what followed moved up */
+            for (int j = i + 1; j < c->ngs; j++) {
+                c->gs[j]--;
+            }
+        }
+    }
+    c->ngs = 0;
+}
 
 static inline uint64_t gpr(unsigned r)
 {
@@ -397,7 +467,7 @@ static inline uint64_t crf(unsigned n)
 
 static void emit2(Ctx *c, Gadget gadget, uint64_t a, uint64_t b)
 {
-    aok_emit_gadget(&c->g, gadget);
+    emitg(c, gadget);
     aok_emit(&c->g, a);
     aok_emit(&c->g, b);
 }
@@ -412,7 +482,7 @@ static void emit3(Ctx *c, Gadget gadget, uint64_t a, uint64_t b, uint64_t d)
 static int rc(Ctx *c, unsigned r)
 {
     if (c->insn & 1) {
-        aok_emit_gadget(&c->g, G(cr0));
+        emitg(c, G(cr0));
         aok_emit(&c->g, gpr(r));
     }
     return NEXT;
@@ -468,7 +538,7 @@ static inline uint64_t mem_word(Ctx *c)
 
 static int ldst(Ctx *c, Gadget gadget, unsigned rt, unsigned ra, uint64_t third)
 {
-    aok_emit_gadget(&c->g, gadget);
+    emitg(c, gadget);
     aok_emit(&c->g, gpr(rt));
     aok_emit(&c->g, base(ra));
     aok_emit(&c->g, third);
@@ -509,7 +579,7 @@ static int xform(Ctx *c, Gadget gadget, bool update, bool store, unsigned rt,
 /* A call to C: [function][pc delta][insn] */
 static int call(Ctx *c, void (*fn)(CPUPPCState *, uint64_t, uint64_t))
 {
-    aok_emit_gadget(&c->g, G(call));
+    emitg(c, G(call));
     aok_emit(&c->g, (uintptr_t)fn);
     aok_emit(&c->g, c->off);
     aok_emit(&c->g, c->insn);
@@ -525,7 +595,7 @@ static inline uint64_t fpr(unsigned r)
 static int rc1(Ctx *c)
 {
     if (c->insn & 1) {
-        aok_emit_gadget(&c->g, G(cr1));
+        emitg(c, G(cr1));
     }
     return NEXT;
 }
@@ -537,7 +607,7 @@ static int fldst(Ctx *c, Gadget gadget, bool update, unsigned ft, unsigned ra,
     if (!c->fp || (update && ra == 0)) {
         return UNKNOWN;
     }
-    aok_emit_gadget(&c->g, gadget);
+    emitg(c, gadget);
     aok_emit(&c->g, fpr(ft));
     aok_emit(&c->g, base(ra));
     aok_emit(&c->g, third);
@@ -560,7 +630,7 @@ static int fp_op(Ctx *c, unsigned op)
     if (op == 63 && xo5 < 16) {
         switch (xo) {
         case 0: case 32:    /* fcmpu, fcmpo */
-            aok_emit_gadget(&c->g, G(fcmp));
+            emitg(c, G(fcmp));
             aok_emit(&c->g, crf(t >> 2));
             aok_emit(&c->g, fpr(a));
             aok_emit(&c->g, fpr(b));
@@ -574,7 +644,7 @@ static int fp_op(Ctx *c, unsigned op)
         case 136: emit2(c, G(fnabs), fpr(t), fpr(b)); return rc1(c);
         case 264: emit2(c, G(fabs), fpr(t), fpr(b)); return rc1(c);
         case 583:   /* mffs (bits 20..11 are ignored before ISA 3.0) */
-            aok_emit_gadget(&c->g, G(mffs));
+            emitg(c, G(mffs));
             aok_emit(&c->g, fpr(t));
             return rc1(c);
         case 711:   /* mtfsf; W is ISA 2.05's, illegal on a G4 */
@@ -662,10 +732,10 @@ static int branch(Ctx *c)
     uint32_t dest = (c->insn & 2) ? li : cia(c) + li;
 
     if (c->insn & 1) {
-        aok_emit_gadget(&c->g, G(bl));
+        emitg(c, G(bl));
         aok_emit(&c->g, (uint32_t)(cia(c) + 4 - c->pc));
     } else {
-        aok_emit_gadget(&c->g, G(b));
+        emitg(c, G(b));
     }
     way(c, 0, dest);
     return END;
@@ -682,10 +752,10 @@ static int bc(Ctx *c)
     if ((bo & 0x14) == 0x14) {
         /* always: a b, or a bl (bcl 20,31: the PIC idiom) */
         if (c->insn & 1) {
-            aok_emit_gadget(&c->g, G(bl));
+            emitg(c, G(bl));
             aok_emit(&c->g, (uint32_t)(cia(c) + 4 - c->pc));
         } else {
-            aok_emit_gadget(&c->g, G(b));
+            emitg(c, G(b));
         }
         way(c, 0, dest);
         return END;
@@ -700,10 +770,10 @@ static int bc(Ctx *c)
         gadget = (bo & 0x08) ? G(bdnzt) : G(bdnzf);
     }
     if (c->insn & 1) {
-        aok_emit_gadget(&c->g, G(set_lr));
+        emitg(c, G(set_lr));
         aok_emit(&c->g, (uint32_t)(cia(c) + 4 - c->pc));
     }
-    aok_emit_gadget(&c->g, gadget);
+    emitg(c, gadget);
     if (!(bo & 0x10)) {
         aok_emit(&c->g, crf(bi >> 2));
         aok_emit(&c->g, 8 >> (bi & 3));
@@ -729,7 +799,7 @@ static int indirect(Ctx *c, bool ctr)
         /* beqlr and the like: on a CR bit alone */
         unsigned bi = (c->insn >> 16) & 31;
 
-        aok_emit_gadget(&c->g, (bo & 0x08) ? G(bclr_t) : G(bclr_f));
+        emitg(c, (bo & 0x08) ? G(bclr_t) : G(bclr_f));
         aok_emit(&c->g, crf(bi >> 2));
         aok_emit(&c->g, 8 >> (bi & 3));
         way(c, 1, cia(c) + 4);
@@ -739,12 +809,12 @@ static int indirect(Ctx *c, bool ctr)
     if ((bo & 0x14) != 0x14) {
         return UNKNOWN;
     }
-    aok_emit_gadget(&c->g, (c->no_goto_ptr ? exit : look)[ctr][lk]);
+    emitg(c, (c->no_goto_ptr ? exit : look)[ctr][lk]);
     if (lk) {
         aok_emit(&c->g, (uint32_t)(cia(c) + 4 - c->pc));
     }
     if (c->no_goto_ptr) {
-        aok_emit_gadget(&c->g, aok_gadget_exit_tb);
+        emitg(c, aok_gadget_exit_tb);
         aok_emit(&c->g, 0);
     } else {
         aok_emit_lookup_operands(&c->g);
@@ -787,7 +857,7 @@ static int op19(Ctx *c)
     if (insn & 1) {
         return UNKNOWN;
     }
-    aok_emit_gadget(&c->g, gadget);
+    emitg(c, gadget);
     aok_emit(&c->g, crf(d >> 2));
     aok_emit(&c->g, crf(a >> 2));
     aok_emit(&c->g, crf(b >> 2));
@@ -801,6 +871,22 @@ static inline unsigned spr(uint32_t insn)
     unsigned f = (insn >> 11) & 0x3ff;
 
     return ((f >> 5) & 0x1f) | ((f & 0x1f) << 5);
+}
+
+/*
+ * An SPR whose callback for this privilege is the generic one (VRSAVE, and
+ * in supervisor mode the SPRGs, SRR0, SRR1 ...): a load or store of
+ * env->spr[], as spr_read_generic and spr_write_generic generate.
+ */
+static bool spr_generic(Ctx *c, unsigned sprn, bool write)
+{
+    ppc_spr_t *cb = &c->env->spr_cb[sprn];
+
+    /* (on a G4 ctx->hv is always set: supervisor mode uses the hea_ callbacks) */
+    if (write) {
+        return (c->pr ? cb->uea_write : cb->hea_write) == spr_write_generic;
+    }
+    return (c->pr ? cb->uea_read : cb->hea_read) == spr_read_generic;
 }
 
 /* opcode 31: the X and XO forms */
@@ -881,7 +967,7 @@ static int op31(Ctx *c)
         if (insn & 0x00100801) {
             return UNKNOWN;
         }
-        aok_emit_gadget(&c->g, G(mfcr));
+        emitg(c, G(mfcr));
         aok_emit(&c->g, gpr(d));
         return NEXT;
     case 144:   /* mtcrf; mtocrf likewise */
@@ -894,7 +980,7 @@ static int op31(Ctx *c)
         if (insn & 0x007ff801) {
             return UNKNOWN;
         }
-        aok_emit_gadget(&c->g, G(mcrxr));
+        emitg(c, G(mcrxr));
         aok_emit(&c->g, crf(d >> 2));
         return NEXT;
     case 339:   /* mfspr */
@@ -905,7 +991,7 @@ static int op31(Ctx *c)
         case 268: case 269:
             return call(c, aok_ppc_mftb);
         case 1:
-            aok_emit_gadget(&c->g, G(mfxer));
+            emitg(c, G(mfxer));
             aok_emit(&c->g, gpr(d));
             return NEXT;
         case 8:
@@ -915,11 +1001,15 @@ static int op31(Ctx *c)
             emit2(c, G(mov), gpr(d), offsetof(CPUPPCState, ctr));
             return NEXT;
         }
+        if (spr_generic(c, spr(insn), false)) {
+            emit2(c, G(mov), gpr(d), offsetof(CPUPPCState, spr[spr(insn)]));
+            return NEXT;
+        }
         return UNKNOWN;
     case 467:   /* mtspr (Rc is ignored) */
         switch (spr(insn)) {
         case 1:
-            aok_emit_gadget(&c->g, G(mtxer));
+            emitg(c, G(mtxer));
             aok_emit(&c->g, gpr(d));
             return NEXT;
         case 8:
@@ -927,6 +1017,10 @@ static int op31(Ctx *c)
             return NEXT;
         case 9:
             emit2(c, G(mov), offsetof(CPUPPCState, ctr), gpr(d));
+            return NEXT;
+        }
+        if (spr_generic(c, spr(insn), true)) {
+            emit2(c, G(mov), offsetof(CPUPPCState, spr[spr(insn)]), gpr(d));
             return NEXT;
         }
         return UNKNOWN;
@@ -958,10 +1052,10 @@ static int op31(Ctx *c)
         if (!c->pr) {
             return UNKNOWN;
         }
-        aok_emit_gadget(&c->g, G(sync));
+        emitg(c, G(sync));
         return NEXT;
     case 854:
-        aok_emit_gadget(&c->g, G(sync));
+        emitg(c, G(sync));
         return NEXT;
     /* dcbt, dcbtst: nothing (Rc is illegal) */
     case 278: case 246:
@@ -1017,7 +1111,7 @@ static int insn32(Ctx *c)
         return ri(c, G(addic), d, a, simm);
     case 13:    /* addic. */
         ri(c, G(addic), d, a, simm);
-        aok_emit_gadget(&c->g, G(cr0));
+        emitg(c, G(cr0));
         aok_emit(&c->g, gpr(d));
         return NEXT;
     case 14:
@@ -1050,7 +1144,7 @@ static int insn32(Ctx *c)
     case 27: return ri(c, G(xori), a, d, uimm << 16);
     case 28: case 29:   /* andi., andis.: always CR0 */
         ri(c, G(andi), a, d, op == 28 ? uimm : uimm << 16);
-        aok_emit_gadget(&c->g, G(cr0));
+        emitg(c, G(cr0));
         aok_emit(&c->g, gpr(a));
         return NEXT;
     case 31: return op31(c);
@@ -1097,6 +1191,7 @@ int ppc_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     c.page_off = pc & ~TARGET_PAGE_MASK;
     c.pr = flags & (1 << HFLAGS_PR);
     c.fp = flags & (1 << HFLAGS_FP);
+    c.env = cpu_env(cs);
     c.no_goto_ptr = cflags & CF_NO_GOTO_PTR;
     aok_gen_begin(&c.g, cs, tb, *max_insns, (flags >> HFLAGS_DMMU_IDX) & 7);
     c.g.lookup = G(lookup);
@@ -1106,11 +1201,13 @@ int ppc_aok_translate_code(CPUState *cs, TranslationBlock *tb,
         uint64_t *start = c.g.p;
 
         c.insn = ldl_be_p(code + c.off);
+        c.ngs = 0;
         r = insn32(&c);
         if (r == UNKNOWN) {
             c.g.p = start;
             break;
         }
+        pair_steps(&c);
         aok_gen_insn_end(&c.g, cia(&c), c.insn);
         c.off += 4;
         if (r == END) {
@@ -1124,8 +1221,10 @@ int ppc_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     }
     if (r != END) {
         /* Not an insn, but a gadget like another to the insn before it. */
-        aok_emit_gadget(&c.g, G(b));
+        c.ngs = 0;
+        emitg(&c, G(b));
         way(&c, 0, cia(&c));
+        pair_steps(&c);
     }
     return aok_gen_finish(&c.g, c.off);
 }

@@ -65,47 +65,143 @@
     str w12, [_cpu, #AOK_PPC_ENV_CA]
 .endm
 
+/*
+ * What each op does to w10 (rA's or rS's value) and w11 (rB's, or the
+ * immediate), the result in w10: one body for the op's own gadget and for
+ * the fused ones it is part of. An op may use w12-w14.
+ */
+.macro op_add
+    add w10, w10, w11
+.endm
+.macro op_subf
+    sub w10, w11, w10
+.endm
+.macro op_and
+    and w10, w10, w11
+.endm
+.macro op_andc
+    bic w10, w10, w11
+.endm
+.macro op_or
+    orr w10, w10, w11
+.endm
+.macro op_orc
+    orn w10, w10, w11
+.endm
+.macro op_xor
+    eor w10, w10, w11
+.endm
+.macro op_nand
+    and w10, w10, w11
+    mvn w10, w10
+.endm
+.macro op_nor
+    orr w10, w10, w11
+    mvn w10, w10
+.endm
+.macro op_eqv
+    eon w10, w10, w11
+.endm
+.macro op_mullw
+    mul w10, w10, w11
+.endm
+/* slw, srw: a shift of 32 or more (rB bit 5) gives 0 */
+.macro op_slw
+    lsl w12, w10, w11
+    tst w11, #0x20
+    csel w10, wzr, w12, ne
+.endm
+.macro op_srw
+    lsr w12, w10, w11
+    tst w11, #0x20
+    csel w10, wzr, w12, ne
+.endm
+.macro op_addic
+    adds w10, w10, w11
+    ca_out
+.endm
+/* rlwinm: w11 = the right rotation | the mask << 32 */
+.macro op_rlwinm
+    ror w10, w10, w11
+    lsr x12, x11, #32
+    and w10, w10, w12
+.endm
+/* srawi: w11 = sh; CA = rS negative and a 1 shifted out (CA32 untouched) */
+.macro op_srawi
+    mov w14, #1
+    lsl w14, w14, w11
+    sub w14, w14, #1
+    tst w10, w14
+    cset w12, ne
+    asr w13, w10, w11
+    cmp w10, #0
+    csel w12, w12, wzr, lt
+    str w12, [_cpu, #AOK_PPC_ENV_CA]
+    mov w10, w13
+.endm
+.macro op_neg
+    neg w10, w10
+.endm
+.macro op_extsb
+    sxtb w10, w10
+.endm
+.macro op_extsh
+    sxth w10, w10
+.endm
+.macro op_cntlzw
+    clz w10, w10
+.endm
+.macro op_mov
+.endm
+
+/* An op's gadget: [rD][rA][rB] (rr), [rD][rA][imm] (ri), [rD][rA] (r1) */
+.macro g_rr name, op=
+.gadget ppc_\name
+    rr
+    .ifb \op
+    op_\name
+    .else
+    op_\op
+    .endif
+    put
+.endm
+.macro g_ri name, op=
+.gadget ppc_\name
+    ri
+    .ifb \op
+    op_\name
+    .else
+    op_\op
+    .endif
+    put
+.endm
+.macro g_r1 name
+.gadget ppc_\name
+    r1
+    op_\name
+    put1
+.endm
+
 /* [rD][imm]: li, lis */
 .gadget ppc_li
     ldp x9, x10, [_ip]
     str w10, [_cpu, x9]
     gret 2
 
-/* [dst][src]: mr, and the moves of LR, CTR and a CR field (mcrf) */
-.gadget ppc_mov
-    ldp x9, x10, [_ip]
-    ldr w10, [_cpu, x10]
-    str w10, [_cpu, x9]
-    gret 2
+/* [dst][src]: mr, and the moves of LR, CTR, a CR field (mcrf) or an SPR */
+    g_r1 mov
 
-.gadget ppc_add
-    rr
-    add w10, w10, w11
-    put
-.gadget ppc_addi
-    ri
-    add w10, w10, w11
-    put
-/* subf: rD = rB - rA */
-.gadget ppc_subf
-    rr
-    sub w10, w11, w10
-    put
-.gadget ppc_neg
-    r1
-    neg w10, w10
-    put1
+    g_rr add
+    g_ri addi, add
+    g_rr subf               /* rD = rB - rA */
+    g_r1 neg
 
 .gadget ppc_addc
     rr
     adds w10, w10, w11
     ca_out
     put
-.gadget ppc_addic
-    ri
-    adds w10, w10, w11
-    ca_out
-    put
+    g_ri addic
 .gadget ppc_adde
     rr
     ca_in
@@ -156,14 +252,8 @@
     ca_out
     put1
 
-.gadget ppc_mullw
-    rr
-    mul w10, w10, w11
-    put
-.gadget ppc_mulli
-    ri
-    mul w10, w10, w11
-    put
+    g_rr mullw
+    g_ri mulli, mullw
 .gadget ppc_mulhw
     rr
     smull x10, w10, w11
@@ -191,78 +281,22 @@
     csel w10, w10, w12, eq
     put
 
-.gadget ppc_and
-    rr
-    and w10, w10, w11
-    put
-.gadget ppc_andi
-    ri
-    and w10, w10, w11
-    put
-.gadget ppc_andc
-    rr
-    bic w10, w10, w11
-    put
-.gadget ppc_or
-    rr
-    orr w10, w10, w11
-    put
-.gadget ppc_ori
-    ri
-    orr w10, w10, w11
-    put
-.gadget ppc_orc
-    rr
-    orn w10, w10, w11
-    put
-.gadget ppc_xor
-    rr
-    eor w10, w10, w11
-    put
-.gadget ppc_xori
-    ri
-    eor w10, w10, w11
-    put
-.gadget ppc_nand
-    rr
-    and w10, w10, w11
-    mvn w10, w10
-    put
-.gadget ppc_nor
-    rr
-    orr w10, w10, w11
-    mvn w10, w10
-    put
-.gadget ppc_eqv
-    rr
-    eon w10, w10, w11
-    put
-.gadget ppc_extsb
-    r1
-    sxtb w10, w10
-    put1
-.gadget ppc_extsh
-    r1
-    sxth w10, w10
-    put1
-.gadget ppc_cntlzw
-    r1
-    clz w10, w10
-    put1
-
-/* slw, srw: a shift of 32 or more (rB bit 5) gives 0 */
-.gadget ppc_slw
-    rr
-    lsl w12, w10, w11
-    tst w11, #0x20
-    csel w10, wzr, w12, ne
-    put
-.gadget ppc_srw
-    rr
-    lsr w12, w10, w11
-    tst w11, #0x20
-    csel w10, wzr, w12, ne
-    put
+    g_rr and
+    g_ri andi, and
+    g_rr andc
+    g_rr or
+    g_ri ori, or
+    g_rr orc
+    g_rr xor
+    g_ri xori, xor
+    g_rr nand
+    g_rr nor
+    g_rr eqv
+    g_r1 extsb
+    g_r1 extsh
+    g_r1 cntlzw
+    g_rr slw
+    g_rr srw
 /*
  * sraw: rA = rS >> n (arithmetic), n = rB & 31 or, with rB bit 5, all of rS's
  * bits; CA = rS negative and a 1 shifted out. QEMU's helper writes CA32 the
@@ -288,30 +322,13 @@
     mov w10, w11
     put
 /* srawi: [rA][rS][sh] */
-.gadget ppc_srawi
-    ri
-    mov w14, #1
-    lsl w14, w14, w11
-    sub w14, w14, #1
-    tst w10, w14
-    cset w12, ne
-    asr w13, w10, w11
-    cmp w10, #0
-    csel w12, w12, wzr, lt
-    str w12, [_cpu, #AOK_PPC_ENV_CA]
-    mov w10, w13
-    put
+    g_ri srawi
 
 /*
  * The rotates. [rA][rS][rotation | mask << 32] for rlwinm and rlwimi, the
  * rotation a right one (32 - SH, mod 32); [rA][rS][rB][mask] for rlwnm.
  */
-.gadget ppc_rlwinm
-    ri
-    ror w10, w10, w11
-    lsr x12, x11, #32
-    and w10, w10, w12
-    put
+    g_ri rlwinm
 .gadget ppc_rlwimi
     ri
     ldr w13, [_cpu, x9]
@@ -355,8 +372,13 @@
     cr0_of w10
     gret 1
 
-/* compares: [crf offset][rA][rB] or [crf offset][rA][imm] */
-.macro cmp_tail lt, gt
+/*
+ * compares: [crf offset][rA][rB] or [crf offset][rA][imm]. The field's value
+ * stays in w12 for a branch fused after.
+ */
+.macro cmp_body kind, lt, gt
+    \kind
+    cmp w10, w11
     mov w12, #AOK_PPC_CR_EQ
     mov w13, #AOK_PPC_CR_GT
     csel w12, w13, w12, \gt
@@ -365,24 +387,16 @@
     ldr w13, [_cpu, #AOK_PPC_ENV_SO]
     orr w12, w12, w13
     str w12, [_cpu, x9]
+.endm
+.macro g_cmp name, kind, lt, gt
+.gadget ppc_\name
+    cmp_body \kind, \lt, \gt
     gret 3
 .endm
-.gadget ppc_cmp
-    rr
-    cmp w10, w11
-    cmp_tail lt, gt
-.gadget ppc_cmpi
-    ri
-    cmp w10, w11
-    cmp_tail lt, gt
-.gadget ppc_cmpl
-    rr
-    cmp w10, w11
-    cmp_tail lo, hi
-.gadget ppc_cmpli
-    ri
-    cmp w10, w11
-    cmp_tail lo, hi
+    g_cmp cmp, rr, lt, gt
+    g_cmp cmpi, ri, lt, gt
+    g_cmp cmpl, rr, lo, hi
+    g_cmp cmpli, ri, lo, hi
 
 /*
  * The CR logical ops: [crbD's field][crbA's field][crbB's field]
@@ -1401,3 +1415,87 @@ SYM(aok_ppc_lookup_pc):
     add w1, w19, w1
     blr x9
     gret 3
+
+/* ---- Fused pairs -----------------------------------------------------------
+ *
+ * Two gadgets that follow one another as one: [f2_A__B][A's operands]
+ * [B's operands], one dispatch (aok_gen_pair). In an f2n_ pair B's register
+ * operand is the one A has just written, and B takes the value from A's host
+ * register. The pairs are translate.c's ppc_pair_list.
+ */
+
+/* An op and its record form's CR0 */
+.macro f2_rc kind, words, next, name, op=
+.gadget ppc_f2_\name\()__cr0
+    \kind
+    .ifb \op
+    op_\name
+    .else
+    op_\op
+    .endif
+    str w10, [_cpu, x9]
+    ldr x9, [_ip, #(\words * 8)]
+    ldr w10, [_cpu, x9]
+    cr0_of w10
+    gret \next
+.gadget ppc_f2n_\name\()__cr0
+    \kind
+    .ifb \op
+    op_\name
+    .else
+    op_\op
+    .endif
+    str w10, [_cpu, x9]
+    cr0_of w10
+    gret \next
+.endm
+.irp name, add, subf, and, andc, or, orc, xor, nand, nor, eqv, mullw, slw, srw
+    f2_rc rr, 3, 4, \name
+.endr
+    f2_rc ri, 3, 4, andi, and
+    f2_rc ri, 3, 4, addic
+    f2_rc ri, 3, 4, rlwinm
+    f2_rc ri, 3, 4, srawi
+.irp name, neg, extsb, extsh, cntlzw, mov
+    f2_rc r1, 2, 3, \name
+.endr
+
+/* A compare and a branch on a CR bit: [crf][rA][rB or imm][crf][bit][taken way][fall-through way] */
+.macro f2_cmpbc cmpname, kind, lt, gt, bcname, set
+.gadget ppc_f2_\cmpname\()__\bcname
+    cmp_body \kind, \lt, \gt
+    ldp x9, x10, [_ip, #24]
+    ldr w9, [_cpu, x9]
+    tst w9, w10
+    .if \set
+    b.eq 1f
+    .else
+    b.ne 1f
+    .endif
+    leave 40
+1:  leave 56
+.gadget ppc_f2n_\cmpname\()__\bcname
+    cmp_body \kind, \lt, \gt
+    ldr x10, [_ip, #32]
+    tst w12, w10
+    .if \set
+    b.eq 1f
+    .else
+    b.ne 1f
+    .endif
+    leave 40
+1:  leave 56
+.endm
+.irp bc, bc_t, bc_f
+    .ifc \bc, bc_t
+    f2_cmpbc cmp, rr, lt, gt, \bc, 1
+    f2_cmpbc cmpi, ri, lt, gt, \bc, 1
+    f2_cmpbc cmpl, rr, lo, hi, \bc, 1
+    f2_cmpbc cmpli, ri, lo, hi, \bc, 1
+    .else
+    f2_cmpbc cmp, rr, lt, gt, \bc, 0
+    f2_cmpbc cmpi, ri, lt, gt, \bc, 0
+    f2_cmpbc cmpl, rr, lo, hi, \bc, 0
+    f2_cmpbc cmpli, ri, lo, hi, \bc, 0
+    .endif
+.endr

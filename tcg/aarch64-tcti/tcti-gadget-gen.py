@@ -495,15 +495,22 @@ def create_tlb_fastpath(is_aligned, is_write, miss_label="0", size=8):
         ])
     else:
         fast_path.extend([
-            # If we're not aligned, add in our alignment value to ensure we don't
-            # don't straddle the end of a page.
+            # An access not known to be aligned may cross into the next page:
+            # the page of its last byte must be the entry's, as in TCG's own
+            # backends...
             f"add x24, Xn, #{size - 1}",
-
-            # Store the page mask part of the address into X24.
             "and x24, x24, #0xfffffffffffff000",
-
-            # Compare the masked address with the TLB value.
             "cmp x26, x24",
+
+            # ... and so must its first byte's. The TLB index is folded
+            # (CPU_TLB_INDEX_FOLD), so the slot that the first byte's page
+            # indexes can hold the next page's entry: the last page of every
+            # 32 MiB shares one with the page after it in a TLB of 64 entries,
+            # of every 2 GiB in any up to 4096. The last byte alone takes that
+            # entry for a hit, and the access goes to the next page's host
+            # memory, before its start. CCMP leaves NE if the first was.
+            "and x24, Xn, #0xfffffffffffff000",
+            "ccmp x26, x24, #0, eq",
 
             # If we're not equal, this isn't a TLB hit. Jump to our miss handler.
             f"b.ne {miss_label}f",
@@ -531,7 +538,7 @@ def granule_check(size):
     ]
 
 
-def ld_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None, is_aligned=False, force_slowpath=False, ordered=None):
+def ld_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None, is_aligned=False, force_slowpath=False, ordered=None, size=8):
     """ Creates a thunk into our C runtime for a QEMU LD operation.
 
     ordered, if given, is the access size in bytes: the fast path is then
@@ -557,7 +564,7 @@ def ld_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None, 
                 fastpath_ops = [
                     # Create a fastpath that jumps to miss_lable on a TLB miss,
                     # or sets x27 to the TLB addend on a TLB hit.
-                    *create_tlb_fastpath(is_aligned=is_aligned, is_write=False),
+                    *create_tlb_fastpath(is_aligned=is_aligned, is_write=False, size=size),
                     # LDAPR is FEAT_LRCPC (ARMv8.3), past what we may be built for.
                     *(granule_check(ordered) + ["add x27, x27, Xn", ".arch_extension rcpc"] if ordered else []),
 
@@ -615,7 +622,7 @@ def ld_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None, 
             )
 
 
-def st_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None, is_aligned=False, force_slowpath=False, ordered=None):
+def st_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None, is_aligned=False, force_slowpath=False, ordered=None, size=8):
     """ Creates a thunk into our C runtime for a QEMU ST operation.
 
     ordered is as for ld_thunk, with STLR; the slow path orders the helper's
@@ -639,7 +646,7 @@ def st_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None, 
 
                     # Create a fastpath that jumps to miss_lable on a TLB miss,
                     # or sets x27 to the TLB addend on a TLB hit.
-                    *create_tlb_fastpath(is_aligned=is_aligned, is_write=True),
+                    *create_tlb_fastpath(is_aligned=is_aligned, is_write=True, size=size),
                     *(granule_check(ordered) + ["add x27, x27, Xn"] if ordered else []),
 
                     # On a hit, we can just perform an appropriate load...
@@ -1284,7 +1291,7 @@ for ordered in (False, True):
                 ld_thunk(f"qemu_ld_{op}_{variant}", is_aligned=is_aligned, slowpath_helper=helper,
                     fastpath_32b=ord32 if ordered else plain32,
                     fastpath_64b=ord64 if ordered else plain64,
-                    force_slowpath=is_slowpath, ordered=size if ordered else None,
+                    force_slowpath=is_slowpath, ordered=size if ordered else None, size=size,
                 )
 
 
@@ -1308,7 +1315,7 @@ for ordered in (False, True):
             st_thunk(f"qemu_st_{op}_{variant}", is_aligned=is_aligned, slowpath_helper=helper,
                 fastpath_32b=[ord32] if ordered else [plain],
                 fastpath_64b=[ord64] if ordered else [plain],
-                force_slowpath=is_slowpath, ordered=size if ordered else None,
+                force_slowpath=is_slowpath, ordered=size if ordered else None, size=size,
             )
 
 

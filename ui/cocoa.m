@@ -1495,6 +1495,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
                                        "raw",
                                        true, false,
                                        false, 0,
+                                       false, 0,
                                        &err);
         });
         handleAnyDeviceErrors(err);

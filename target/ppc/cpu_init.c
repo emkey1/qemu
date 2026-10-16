@@ -7482,12 +7482,22 @@ static const struct SysemuCPUOps ppc_sysemu_ops = {
 
 #ifdef CONFIG_TCG
 #include "accel/tcg/cpu-ops.h"
+#if defined(CONFIG_AOK_GADGETS) && !defined(CONFIG_USER_ONLY)
+#include "tcg/aok/aok-ppc.h"
+#endif
 
 static const TCGCPUOps ppc_tcg_ops = {
   .mttcg_supported = TARGET_LONG_BITS == 64,
   .guest_default_memory_order = 0,
   .initialize = ppc_translate_init,
   .translate_code = ppc_translate_code,
+#if defined(CONFIG_AOK_GADGETS) && !defined(CONFIG_USER_ONLY) && \
+    !defined(TARGET_PPC64)
+  /* The 32-bit PowerPCs (qemu-system-ppc): the Power Macintoshes. */
+  .aok_translate_code = ppc_aok_translate_code,
+  .aok_pc_offset = offsetof(CPUPPCState, nip),
+  .aok_pc32 = true,
+#endif
   .get_tb_cpu_state = ppc_get_tb_cpu_state,
   .restore_state_to_opc = ppc_restore_state_to_opc,
   .mmu_index = ppc_cpu_mmu_index,

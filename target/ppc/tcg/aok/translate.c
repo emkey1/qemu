@@ -48,6 +48,13 @@ DECL(lookup) DECL(call)
 LDST(lbz) LDST(lhz) LDST(lha) LDST(lwz) LDST(lbzu) LDST(lhzu) LDST(lhau)
 LDST(lwzu) LDST(stb) LDST(sth) LDST(stw) LDST(stbu) LDST(sthu) LDST(stwu)
 DECL(lhbrx) DECL(lwbrx) DECL(sthbrx) DECL(stwbrx)
+DECL(bdnzt) DECL(bdnzf) DECL(bdzt) DECL(bdzf) DECL(bclr_t) DECL(bclr_f)
+LDST(lfs) LDST(lfsu) LDST(lfd) LDST(lfdu) LDST(stfs) LDST(stfsu)
+LDST(stfd) LDST(stfdu) DECL(stfiwx)
+DECL(fmr) DECL(fneg) DECL(fabs) DECL(fnabs) DECL(fsel) DECL(cr1)
+DECL(fadd) DECL(fsub) DECL(fmul) DECL(fdiv) DECL(fsqrt)
+DECL(fmadd) DECL(fmsub) DECL(fnmadd) DECL(fnmsub)
+DECL(frsp) DECL(fctiw) DECL(fctiwz) DECL(fcmp) DECL(mffs)
 
 typedef void (*Gadget)(void);
 
@@ -67,6 +74,11 @@ QEMU_BUILD_BUG_ON(offsetof(CPUPPCState, ov32) != AOK_PPC_ENV_OV32);
 QEMU_BUILD_BUG_ON(offsetof(CPUPPCState, ca32) != AOK_PPC_ENV_CA32);
 QEMU_BUILD_BUG_ON(CRF_LT != AOK_PPC_CR_LT || CRF_GT != AOK_PPC_CR_GT ||
                   CRF_EQ != AOK_PPC_CR_EQ || CRF_SO != AOK_PPC_CR_SO);
+QEMU_BUILD_BUG_ON(offsetof(CPUPPCState, fpscr) != AOK_PPC_ENV_FPSCR);
+QEMU_BUILD_BUG_ON(FP_FX != AOK_PPC_FPSCR_FX || FP_XX != AOK_PPC_FPSCR_XX ||
+                  FP_FI != AOK_PPC_FPSCR_FI || FP_FPRF != AOK_PPC_FPSCR_FPRF ||
+                  FP_FPCC != AOK_PPC_FPSCR_FPCC);
+QEMU_BUILD_BUG_ON((FP_RN | FP_NI | FP_XE | FP_UE | FP_OE) != AOK_PPC_FPSCR_SLOW);
 
 /*
  * The softmmu slow paths of the load and store gadgets, and the insns done
@@ -75,11 +87,16 @@ QEMU_BUILD_BUG_ON(CRF_LT != AOK_PPC_CR_LT || CRF_GT != AOK_PPC_CR_GT ||
  * stored first, and access_type, which TCG's code stores at the first
  * memory insn of each TB and the MMU reads on a fault.
  */
-static inline void aok_ppc_sync(CPUPPCState *env, uint64_t pc)
+static inline void aok_ppc_sync_as(CPUPPCState *env, uint64_t pc, int type)
 {
     aok_no_retaddr();
     env->nip = pc;
-    env->access_type = ACCESS_INT;
+    env->access_type = type;
+}
+
+static inline void aok_ppc_sync(CPUPPCState *env, uint64_t pc)
+{
+    aok_ppc_sync_as(env, pc, ACCESS_INT);
 }
 
 #define OI(env, mop) make_memop_idx(mop, ppc_env_mmu_index(env, false))
@@ -115,6 +132,220 @@ STORE_HELPER(store32, cpu_stl_mmu, MO_BEUL)
 STORE_HELPER(store16_le, cpu_stw_mmu, MO_LEUW)
 STORE_HELPER(store32_le, cpu_stl_mmu, MO_LEUL)
 
+/* The FP loads' and stores' (lfs's value is the single's bits, made a double after) */
+#define FLOAD_HELPER(name, fn, mop)                                         \
+uint64_t aok_ppc_helper_##name(CPUPPCState *env, uint64_t addr,            \
+                               uint64_t pc, uint64_t insn);                 \
+uint64_t aok_ppc_helper_##name(CPUPPCState *env, uint64_t addr,            \
+                               uint64_t pc, uint64_t insn)                  \
+{                                                                           \
+    aok_ppc_sync_as(env, pc, ACCESS_FLOAT);                                 \
+    return fn(env, addr, OI(env, mop), 0);                                  \
+}
+FLOAD_HELPER(fload32, cpu_ldl_mmu, MO_BEUL)
+FLOAD_HELPER(fload64, cpu_ldq_mmu, MO_BEUQ)
+
+#define FSTORE_HELPER(name, fn, mop)                                        \
+void aok_ppc_helper_##name(CPUPPCState *env, uint64_t addr, uint64_t val,  \
+                           uint64_t pc, uint64_t insn);                     \
+void aok_ppc_helper_##name(CPUPPCState *env, uint64_t addr, uint64_t val,  \
+                           uint64_t pc, uint64_t insn)                      \
+{                                                                           \
+    aok_ppc_sync_as(env, pc, ACCESS_FLOAT);                                 \
+    fn(env, addr, val, OI(env, mop), 0);                                    \
+}
+FSTORE_HELPER(fstore32, cpu_stl_mmu, MO_BEUL)
+FSTORE_HELPER(fstore64, cpu_stq_mmu, MO_BEUQ)
+
+/*
+ * An FP arithmetic, compare or convert insn, as TCG's code does it
+ * (translate/fp-impl.c.inc): softfloat's flags reset, the op's helper, the
+ * FPR written, FPRF set from the result where the insn sets it, the flags
+ * checked, which may trap. The FP gadgets' slow path, and all of the
+ * single-precision ops and the estimates. A record form's CR1 is the gadget
+ * after this one.
+ */
+void aok_ppc_helper_fp(CPUPPCState *env, uint64_t pc, uint64_t insn);
+void aok_ppc_helper_fp(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    unsigned op = insn >> 26, xo = (insn >> 1) & 0x3ff, xo5 = xo & 31;
+    unsigned t = (insn >> 21) & 31;
+    uint64_t fa = *cpu_fpr_ptr(env, (insn >> 16) & 31);
+    uint64_t fb = *cpu_fpr_ptr(env, (insn >> 11) & 31);
+    uint64_t fc = *cpu_fpr_ptr(env, (insn >> 6) & 31);
+    bool s = op == 59, fprf = true;
+    uint64_t r;
+
+    aok_no_retaddr();
+    env->nip = pc;
+    helper_reset_fpstatus(env);
+    if (op == 63 && xo5 < 16) {
+        switch (xo) {
+        case 0:
+            helper_FCMPU(env, fa, fb, t >> 2);
+            helper_float_check_status(env);
+            return;
+        case 32:
+            helper_FCMPO(env, fa, fb, t >> 2);
+            helper_float_check_status(env);
+            return;
+        case 12:
+            r = helper_FRSP(env, fb);
+            break;
+        case 14:
+            r = helper_FCTIW(env, fb);
+            fprf = false;
+            break;
+        case 15:
+            r = helper_FCTIWZ(env, fb);
+            fprf = false;
+            break;
+        default:
+            g_assert_not_reached();
+        }
+    } else {
+        switch (xo5) {
+        case 18: r = s ? helper_FDIVS(env, fa, fb) : helper_FDIV(env, fa, fb); break;
+        case 20: r = s ? helper_FSUBS(env, fa, fb) : helper_FSUB(env, fa, fb); break;
+        case 21: r = s ? helper_FADDS(env, fa, fb) : helper_FADD(env, fa, fb); break;
+        case 22: r = s ? helper_FSQRTS(env, fb) : helper_FSQRT(env, fb); break;
+        case 24: r = helper_FRES(env, fb); break;
+        case 25: r = s ? helper_FMULS(env, fa, fc) : helper_FMUL(env, fa, fc); break;
+        case 26: r = helper_FRSQRTE(env, fb); break;
+        case 28:
+            r = s ? helper_FMSUBS(env, fa, fc, fb) : helper_FMSUB(env, fa, fc, fb);
+            break;
+        case 29:
+            r = s ? helper_FMADDS(env, fa, fc, fb) : helper_FMADD(env, fa, fc, fb);
+            break;
+        case 30:
+            r = s ? helper_FNMSUBS(env, fa, fc, fb)
+                  : helper_FNMSUB(env, fa, fc, fb);
+            break;
+        case 31:
+            r = s ? helper_FNMADDS(env, fa, fc, fb)
+                  : helper_FNMADD(env, fa, fc, fb);
+            break;
+        default:
+            g_assert_not_reached();
+        }
+    }
+    *cpu_fpr_ptr(env, t) = r;
+    if (fprf) {
+        helper_compute_fprf_float64(env, r);
+    }
+    helper_float_check_status(env);
+}
+
+/*
+ * mtfsf, mtfsfi, mtfsb0, mtfsb1, as gen_mtfsf and the rest: FPSCR through
+ * QEMU's store (which sets softfloat's rounding mode from it), the record
+ * form's CR1, and the check for a deferred trap, in that order.
+ */
+static void aok_ppc_mtfs(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    unsigned xo = (insn >> 1) & 0x3ff, crb = 31 - ((insn >> 21) & 31);
+    bool check = true;
+
+    aok_no_retaddr();
+    env->nip = pc;
+    switch (xo) {
+    case 711:   /* mtfsf: FLM, or every field with L */
+        helper_store_fpscr(env, *cpu_fpr_ptr(env, (insn >> 11) & 31),
+                           (insn & (1 << 25)) ? 0xff : (insn >> 17) & 0xff);
+        break;
+    case 134: { /* mtfsfi */
+        unsigned sh = 7 - ((insn >> 23) & 7);
+
+        helper_store_fpscr(env, (uint64_t)((insn >> 12) & 0xf) << (4 * sh),
+                           1 << sh);
+        break;
+    }
+    case 70:    /* mtfsb0: no check */
+        helper_reset_fpstatus(env);
+        if (crb != FPSCR_FEX && crb != FPSCR_VX) {
+            helper_fpscr_clrbit(env, crb);
+        }
+        check = false;
+        break;
+    case 38:    /* mtfsb1 */
+        if (crb != FPSCR_FEX && crb != FPSCR_VX && crb != FPSCR_NI) {
+            helper_fpscr_setbit(env, crb);
+        }
+        break;
+    }
+    if (insn & 1) {
+        env->crf[1] = (uint32_t)env->fpscr >> FPSCR_OX;
+    }
+    if (check) {
+        helper_fpscr_check_status(env);
+    }
+}
+
+/* mftb, and mfspr of TBL or TBU: the time base, as TCG's helpers read it */
+static void aok_ppc_mftb(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    unsigned f = (insn >> 11) & 0x3ff, tbr = ((f >> 5) & 0x1f) | ((f & 0x1f) << 5);
+
+    env->gpr[(insn >> 21) & 31] = tbr == 268 ? helper_load_tbl(env)
+                                             : helper_load_tbu(env);
+}
+
+/* (rA|0) + rB */
+static inline target_ulong ea_x(CPUPPCState *env, uint64_t insn)
+{
+    unsigned ra = (insn >> 16) & 31;
+
+    return (ra ? env->gpr[ra] : 0) + env->gpr[(insn >> 11) & 31];
+}
+
+/* dcbz: QEMU's helper, its 32-byte line */
+static void aok_ppc_dcbz(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    target_ulong ea = ea_x(env, insn);
+
+    aok_ppc_sync_as(env, pc, ACCESS_CACHE);
+    helper_dcbz(env, ea, ppc_env_mmu_index(env, false));
+}
+
+/*
+ * lwarx and stwcx., as TCG generates them where it runs one CPU at a time
+ * (gen_load_locked, gen_conditional_store): an aligned load that sets the
+ * reservation, and a store conditional on its address that loads and then
+ * always stores, the new value if memory still holds the reserved one and
+ * the old otherwise.
+ */
+static void aok_ppc_lwarx(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    target_ulong ea = ea_x(env, insn);
+    uint32_t v;
+
+    aok_ppc_sync_as(env, pc, ACCESS_RES);
+    v = cpu_ldl_mmu(env, ea, OI(env, MO_BEUL | MO_ALIGN), 0);
+    env->gpr[(insn >> 21) & 31] = v;
+    env->reserve_addr = ea;
+    env->reserve_length = 4;
+    env->reserve_val = v;
+}
+
+static void aok_ppc_stwcx(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    target_ulong ea = ea_x(env, insn);
+    uint32_t cr0 = env->so;
+
+    aok_ppc_sync_as(env, pc, ACCESS_RES);
+    if (ea == env->reserve_addr && env->reserve_length == 4) {
+        MemOpIdx oi = OI(env, MO_BEUL | MO_ALIGN);
+        uint32_t old = cpu_ldl_mmu(env, ea, oi, 0);
+        bool ok = old == env->reserve_val;
+
+        cpu_stl_mmu(env, ea, ok ? env->gpr[(insn >> 21) & 31] : old, oi, 0);
+        cr0 |= ok ? CRF_EQ : 0;
+    }
+    env->crf[0] = cr0;
+    env->reserve_addr = -1;
+}
+
 /* lmw, stmw: QEMU's own helpers, at (rA|0) + d (TCG checks no form of them). */
 static void aok_ppc_lmw(CPUPPCState *env, uint64_t pc, uint64_t insn)
 {
@@ -141,6 +372,7 @@ typedef struct Ctx {
     unsigned off;           /* of the current insn from the TB's first */
     uint32_t insn;
     bool pr;                /* user mode (MSR[PR]) */
+    bool fp;                /* the FPU on (MSR[FP]); else FP insns are TCG's to trap */
     bool no_goto_ptr;
 } Ctx;
 
@@ -284,6 +516,125 @@ static int call(Ctx *c, void (*fn)(CPUPPCState *, uint64_t, uint64_t))
     return NEXT;
 }
 
+static inline uint64_t fpr(unsigned r)
+{
+    return fpr_offset(r);
+}
+
+/* A record form's CR1, from FPSCR */
+static int rc1(Ctx *c)
+{
+    if (c->insn & 1) {
+        aok_emit_gadget(&c->g, G(cr1));
+    }
+    return NEXT;
+}
+
+/* FP loads and stores: the integer ones' streams, on an FPR. An update form's rA of 0 is illegal. */
+static int fldst(Ctx *c, Gadget gadget, bool update, unsigned ft, unsigned ra,
+                 uint64_t third)
+{
+    if (!c->fp || (update && ra == 0)) {
+        return UNKNOWN;
+    }
+    aok_emit_gadget(&c->g, gadget);
+    aok_emit(&c->g, fpr(ft));
+    aok_emit(&c->g, base(ra));
+    aok_emit(&c->g, third);
+    aok_emit(&c->g, mem_word(c));
+    return NEXT;
+}
+
+/* The FP insns of opcodes 59 and 63 */
+static int fp_op(Ctx *c, unsigned op)
+{
+    uint32_t insn = c->insn;
+    unsigned xo = (insn >> 1) & 0x3ff, xo5 = xo & 31;
+    unsigned t = (insn >> 21) & 31, a = (insn >> 16) & 31;
+    unsigned b = (insn >> 11) & 31, cc = (insn >> 6) & 31;
+    Gadget gadget = NULL;
+
+    if (!c->fp) {
+        return UNKNOWN;
+    }
+    if (op == 63 && xo5 < 16) {
+        switch (xo) {
+        case 0: case 32:    /* fcmpu, fcmpo */
+            aok_emit_gadget(&c->g, G(fcmp));
+            aok_emit(&c->g, crf(t >> 2));
+            aok_emit(&c->g, fpr(a));
+            aok_emit(&c->g, fpr(b));
+            aok_emit(&c->g, mem_word(c));
+            return NEXT;
+        case 12: gadget = G(frsp); break;
+        case 14: gadget = G(fctiw); break;
+        case 15: gadget = G(fctiwz); break;
+        case 40: emit2(c, G(fneg), fpr(t), fpr(b)); return rc1(c);
+        case 72: emit2(c, G(fmr), fpr(t), fpr(b)); return rc1(c);
+        case 136: emit2(c, G(fnabs), fpr(t), fpr(b)); return rc1(c);
+        case 264: emit2(c, G(fabs), fpr(t), fpr(b)); return rc1(c);
+        case 583:   /* mffs (bits 20..11 are ignored before ISA 3.0) */
+            aok_emit_gadget(&c->g, G(mffs));
+            aok_emit(&c->g, fpr(t));
+            return rc1(c);
+        case 711:   /* mtfsf; W is ISA 2.05's, illegal on a G4 */
+            return (insn & (1 << 16)) ? UNKNOWN : call(c, aok_ppc_mtfs);
+        case 134:   /* mtfsfi */
+            return (insn & 0x006f0800) ? UNKNOWN : call(c, aok_ppc_mtfs);
+        case 70: case 38:   /* mtfsb0, mtfsb1 */
+            return (insn & 0x001ff800) ? UNKNOWN : call(c, aok_ppc_mtfs);
+        default:
+            return UNKNOWN;     /* mcrfs */
+        }
+        emit2(c, gadget, fpr(t), fpr(b));
+        aok_emit(&c->g, mem_word(c));
+        return rc1(c);
+    }
+    if (op == 59) {
+        /* single precision, and fres: QEMU's helpers (aok_ppc_helper_fp) */
+        switch (xo5) {
+        case 18: case 20: case 21: case 22: case 24: case 25:
+        case 28: case 29: case 30: case 31:
+            call(c, aok_ppc_helper_fp);
+            return rc1(c);
+        }
+        return UNKNOWN;
+    }
+    switch (xo5) {
+    case 18: gadget = G(fdiv); break;
+    case 20: gadget = G(fsub); break;
+    case 21: gadget = G(fadd); break;
+    case 25:
+        emit3(c, G(fmul), fpr(t), fpr(a), fpr(cc));
+        aok_emit(&c->g, mem_word(c));
+        return rc1(c);
+    case 22:
+        emit2(c, G(fsqrt), fpr(t), fpr(b));
+        aok_emit(&c->g, mem_word(c));
+        return rc1(c);
+    case 23:
+        emit3(c, G(fsel), fpr(t), fpr(a), fpr(cc));
+        aok_emit(&c->g, fpr(b));
+        return rc1(c);
+    case 26:
+        call(c, aok_ppc_helper_fp);     /* frsqrte */
+        return rc1(c);
+    case 28: case 29: case 30: case 31: {
+        static const Gadget m[4] = { G(fmsub), G(fmadd), G(fnmsub), G(fnmadd) };
+
+        emit3(c, m[xo5 - 28], fpr(t), fpr(a), fpr(cc));
+        aok_emit(&c->g, fpr(b));
+        aok_emit(&c->g, mem_word(c));
+        return rc1(c);
+    }
+    default:
+        return UNKNOWN;
+    }
+    emit3(c, gadget, fpr(t), fpr(a), fpr(b));
+    aok_emit(&c->g, mem_word(c));
+    return rc1(c);
+}
+
 /*
  * The [pc delta][slot] of a jump to @dest. As with goto_tb, only a
  * destination in the TB's own page may be linked; any other is looked up
@@ -343,15 +694,17 @@ static int bc(Ctx *c)
         gadget = (bo & 0x08) ? G(bc_t) : G(bc_f);     /* on a CR bit */
     } else if (bo & 0x10) {
         gadget = (bo & 0x02) ? G(bdz) : G(bdnz);      /* on CTR, decremented first */
+    } else if (bo & 0x02) {
+        gadget = (bo & 0x08) ? G(bdzt) : G(bdzf);     /* on both */
     } else {
-        return UNKNOWN;
+        gadget = (bo & 0x08) ? G(bdnzt) : G(bdnzf);
     }
     if (c->insn & 1) {
         aok_emit_gadget(&c->g, G(set_lr));
         aok_emit(&c->g, (uint32_t)(cia(c) + 4 - c->pc));
     }
     aok_emit_gadget(&c->g, gadget);
-    if (bo & 0x04) {
+    if (!(bo & 0x10)) {
         aok_emit(&c->g, crf(bi >> 2));
         aok_emit(&c->g, 8 >> (bi & 3));
     }
@@ -372,6 +725,17 @@ static int indirect(Ctx *c, bool ctr)
         { G(blr_exit), G(blrl_exit) }, { G(bctr_exit), G(bctrl_exit) },
     };
 
+    if ((bo & 0x14) == 0x04 && !ctr && !lk && !c->no_goto_ptr) {
+        /* beqlr and the like: on a CR bit alone */
+        unsigned bi = (c->insn >> 16) & 31;
+
+        aok_emit_gadget(&c->g, (bo & 0x08) ? G(bclr_t) : G(bclr_f));
+        aok_emit(&c->g, crf(bi >> 2));
+        aok_emit(&c->g, 8 >> (bi & 3));
+        way(c, 1, cia(c) + 4);
+        aok_emit_lookup_operands(&c->g);
+        return END;
+    }
     if ((bo & 0x14) != 0x14) {
         return UNKNOWN;
     }
@@ -538,6 +902,8 @@ static int op31(Ctx *c)
             return UNKNOWN;
         }
         switch (spr(insn)) {
+        case 268: case 269:
+            return call(c, aok_ppc_mftb);
         case 1:
             aok_emit_gadget(&c->g, G(mfxer));
             aok_emit(&c->g, gpr(d));
@@ -600,6 +966,30 @@ static int op31(Ctx *c)
     /* dcbt, dcbtst: nothing (Rc is illegal) */
     case 278: case 246:
         return insn & 1 ? UNKNOWN : NEXT;
+    case 371:   /* mftb, of TBL or TBU (any other number reads that SPR) */
+        if ((insn & 1) || (spr(insn) != 268 && spr(insn) != 269)) {
+            return UNKNOWN;
+        }
+        return call(c, aok_ppc_mftb);
+    case 4:     /* tw: with TO 0, nothing */
+        return d ? UNKNOWN : NEXT;
+    case 1014:  /* dcbz (bit 21, dcbzl's, is ignored on a G4) */
+        return (insn & 0x03c00001) ? UNKNOWN : call(c, aok_ppc_dcbz);
+    case 20:    /* lwarx (EH ignored) */
+        return call(c, aok_ppc_lwarx);
+    case 150:   /* stwcx. (with Rc 0 too) */
+        return call(c, aok_ppc_stwcx);
+
+    /* FP X-form loads and stores */
+    case 535: return fldst(c, G(lfs_x), false, d, a, gpr(b));
+    case 567: return fldst(c, G(lfsu_x), true, d, a, gpr(b));
+    case 599: return fldst(c, G(lfd_x), false, d, a, gpr(b));
+    case 631: return fldst(c, G(lfdu_x), true, d, a, gpr(b));
+    case 663: return fldst(c, G(stfs_x), false, d, a, gpr(b));
+    case 695: return fldst(c, G(stfsu_x), true, d, a, gpr(b));
+    case 727: return fldst(c, G(stfd_x), false, d, a, gpr(b));
+    case 759: return fldst(c, G(stfdu_x), true, d, a, gpr(b));
+    case 983: return fldst(c, G(stfiwx), false, d, a, gpr(b));
     }
     return UNKNOWN;
 }
@@ -613,6 +1003,8 @@ static int insn32(Ctx *c)
     uint32_t uimm = insn & 0xffff;
 
     switch (op) {
+    case 3:     /* twi: with TO 0, nothing */
+        return d ? UNKNOWN : NEXT;
     case 7: return ri(c, G(mulli), d, a, simm);
     case 8: return ri(c, G(subfic), d, a, simm);
     case 10:
@@ -666,6 +1058,16 @@ static int insn32(Ctx *c)
         return dform(c, op, d, a, simm);
     case 46: return call(c, aok_ppc_lmw);
     case 47: return call(c, aok_ppc_stmw);
+    case 48: return fldst(c, G(lfs_d), false, d, a, (int64_t)simm);
+    case 49: return fldst(c, G(lfsu_d), true, d, a, (int64_t)simm);
+    case 50: return fldst(c, G(lfd_d), false, d, a, (int64_t)simm);
+    case 51: return fldst(c, G(lfdu_d), true, d, a, (int64_t)simm);
+    case 52: return fldst(c, G(stfs_d), false, d, a, (int64_t)simm);
+    case 53: return fldst(c, G(stfsu_d), true, d, a, (int64_t)simm);
+    case 54: return fldst(c, G(stfd_d), false, d, a, (int64_t)simm);
+    case 55: return fldst(c, G(stfdu_d), true, d, a, (int64_t)simm);
+    case 59: case 63:
+        return fp_op(c, op);
     }
     return UNKNOWN;
 }
@@ -694,6 +1096,7 @@ int ppc_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     c.pc = pc;
     c.page_off = pc & ~TARGET_PAGE_MASK;
     c.pr = flags & (1 << HFLAGS_PR);
+    c.fp = flags & (1 << HFLAGS_FP);
     c.no_goto_ptr = cflags & CF_NO_GOTO_PTR;
     aok_gen_begin(&c.g, cs, tb, *max_insns, (flags >> HFLAGS_DMMU_IDX) & 7);
     c.g.lookup = G(lookup);

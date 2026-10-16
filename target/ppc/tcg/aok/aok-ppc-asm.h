@@ -30,4 +30,18 @@
 #define AOK_PPC_ENV_OV32     316
 #define AOK_PPC_ENV_CA32     320
 
+/*
+ * FPSCR (a target_ulong) and the bits of it a gadget reads or writes. It is
+ * too far into the state for a load's immediate: a gadget adds the high part
+ * first (fpscr_at).
+ */
+#define AOK_PPC_ENV_FPSCR    71388
+#define AOK_PPC_FPSCR_FX     0x80000000
+#define AOK_PPC_FPSCR_XX     0x02000000
+#define AOK_PPC_FPSCR_FI     0x00020000
+#define AOK_PPC_FPSCR_FPRF   0x0001f000     /* C FL FG FE FU; FPCC is FL..FU */
+#define AOK_PPC_FPSCR_FPCC   0x0000f000
+/* RN, NI and the enables of the exceptions a clean result can raise (XE, UE, OE) */
+#define AOK_PPC_FPSCR_SLOW   0x0000006f
+
 #endif

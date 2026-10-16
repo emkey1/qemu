@@ -11,12 +11,22 @@ translator to TCG only in that binary; ``qemu-system-ppc64`` runs as it did.
 Translated: integer arithmetic and logic (without OE), compares, rotates and
 shifts, the record forms, XER's CA, the CR's own insns (the logical ops,
 ``mcrf``, ``mfcr``, ``mtcrf``, ``mcrxr``), ``mfspr`` and ``mtspr`` of LR, CTR
-and XER, the integer loads and stores of every size, update and indexed form
-and the byte-reversed ones, ``lmw`` and ``stmw``, ``b``, ``bc`` on a CR bit
-or on CTR, ``blr``, ``bctr`` and their linking forms, ``sync`` in user mode,
-``eieio``, ``dcbt`` and ``dcbtst``.
+and XER, the time base (``mftb``), the integer loads and stores of every
+size, update and indexed form and the byte-reversed ones, ``lmw`` and
+``stmw``, ``lwarx`` and ``stwcx.``, ``dcbz``, ``b``, ``bc`` on a CR bit, on
+CTR or on both, ``blr`` (also on a CR bit), ``bctr`` and their linking forms,
+``sync`` in user mode, ``eieio``, ``dcbt`` and ``dcbtst``, traps with TO 0
+(which do nothing); and floating point: the loads and stores, ``fmr``,
+``fneg``, ``fabs``, ``fnabs``, ``fsel``, the double-precision arithmetic, the
+fused multiply-adds, ``fsqrt``, ``frsp``, ``fctiw``, ``fctiwz``, ``fcmpu``,
+``fcmpo``, ``mffs``, and as calls to C the single-precision arithmetic, the
+estimates and the FPSCR's other insns.
 
-* ``lmw`` and ``stmw`` are one call to C, QEMU's own helpers.
+* ``lmw``, ``stmw``, ``dcbz`` and ``mftb`` are one call to C, QEMU's own
+  helpers. ``lwarx`` and ``stwcx.`` are one call each, what TCG generates
+  for them where it runs one CPU at a time (as qemu-system-ppc always does):
+  the aligned load that reserves, and the conditional store that loads and
+  then always stores.
 * A record form is the insn's gadget and then one that sets CR0 from the
   register it wrote, as ``gen_set_Rc0`` does. The carry is the host's: its
   ``adds``/``adcs`` set C as PowerPC sets CA, and ``subs``/``sbcs`` compute
@@ -25,13 +35,12 @@ or on CTR, ``blr``, ``bctr`` and their linking forms, ``sync`` in user mode,
   ``divw`` and ``divwu`` by zero, and ``0x80000000 / -1``, leave rA in rD;
   ``sraw`` writes CA32 as QEMU's helper does, ``srawi`` does not.
 * Left to TCG, where its TB ends or an exception is due: the OE forms,
-  floating point, AltiVec, ``lwarx`` and ``stwcx.``, ``mftb``, ``sc``,
-  ``rfi``, ``isync``, ``mtmsr`` and ``mfmsr``, ``sync`` in supervisor mode,
-  the cache-block insns that touch memory (``dcbz``, ``dcbf``, ``dcbst``,
-  ``icbi``), traps, the forms QEMU takes for illegal (an update load whose
-  rA is 0 or rD, an update store whose rA is 0, ``lwbrx.``), ``mfocrf`` and
-  ``mtocrf``, ``bc`` on a CR bit and CTR at once, and the conditional
-  ``bclr`` and ``bcctr``.
+  AltiVec, ``sc``, ``rfi``, ``isync``, ``mtmsr`` and ``mfmsr``, ``sync`` in
+  supervisor mode, ``dcbf``, ``dcbst`` and ``icbi``, traps that test
+  something, the forms QEMU takes for illegal (an update load whose rA is 0
+  or rD, an update store whose rA is 0, ``lwbrx.``), ``mfocrf`` and
+  ``mtocrf``, ``mcrfs``, a conditional ``bcctr``, and every FP insn while
+  MSR[FP] is clear.
 
 A TB is translated only for a big-endian guest (MSR[LE] clear) that is not
 single-stepping or tracing branches (MSR[SE], MSR[BE]), which TCG turns into
@@ -56,6 +65,38 @@ Where rA is 0, ``(rA|0)`` reads ``aok_zero``, a word of ``CPUPPCState`` that
 is always 0, so that one gadget serves both forms; Mac OS reaches its
 low-memory globals that way.
 
+Floating point
+==============
+
+The FPRs are doublewords of ``vsr[]``. ``lfs`` and ``stfs`` convert between a
+single and a double as QEMU's ``helper_todouble`` and ``helper_tosingle`` do,
+bit for bit and without rounding, in the gadgets.
+
+An arithmetic insn in TCG resets softfloat's flags, calls its helper, writes
+the FPR, sets FPRF from the result and checks the flags
+(``do_float_check_status``), which may set FPSCR's exception bits and trap.
+For a clean result that is all: FPRF, FI set to whether it was inexact, and
+XX and FX if it was; and with RN to nearest, NI off and the XE, UE and OE
+enables clear it cannot trap. The gadgets compute on the host's FP unit
+where that is so, and otherwise do the insn again in C by QEMU's helpers in
+TCG's order (``aok_ppc_helper_fp``).
+
+They cannot ask the host's FPSR which results are clean: on an Apple M5 Max an
+``fmadd`` that clears it first and reads it after costs 13.5 ns against 1.0,
+writing FPSR stalling the FP unit. So each finds whether its result was
+exact by an error-free transformation (TwoSum for an add, an FMA for the
+error of a product, the remainder of a quotient or a square root, and for
+the fused ops the exact product against the exact difference of the result
+and the addend, each as a pair of doubles), in the exponent range where
+that is exact, and reads the rest from the values: a NaN (an invalid op, or
+one propagated, which PowerPC does its own way), an infinity (an overflow or
+a zero divide), an inexact zero (an underflow), a denormal or a result small
+enough that tininess before rounding (QEMU's for PowerPC) and after it (the
+host's) could disagree, and operands outside that range, all go to C.
+``fnmadd`` and ``fnmsub`` negate the rounded result, as QEMU's
+``float_muladd_negate_result`` does, so that the sign of a zero is theirs.
+``fctiw`` returns the word sign-extended, as QEMU's helper does.
+
 For iSH-AOK
 ===========
 
@@ -75,16 +116,16 @@ runs of each, medians:
 ==================== ============ ========== =======
 Workload             TCTI         Gadgets    Ratio
 ==================== ============ ========== =======
-CoreMark             13.50 G      5.03 G     2.69
-n-body (doubles)     98.80 G      118.41 G   0.83
-xz -3                16.98 G      8.72 G     1.95
-sha256sum            6.32 G       3.88 G     1.63
-awk                  10.56 G      6.42 G     1.64
+CoreMark             13.63 G      5.00 G     2.72
+n-body (doubles)     100.63 G     17.52 G    5.74
+xz -3                19.25 G      9.61 G     2.00
+sha256sum            6.44 G       3.56 G     1.81
+awk                  10.80 G      4.29 G     2.52
 ==================== ============ ========== =======
 
-n-body is floating point, which TCG still translates: its loops go from a
-stream to a TCG TB and back through the main loop at every FP insn, since
-the two cannot jump into each other. That is what FP gadgets are for.
+n-body was 0.83 while floating point was TCG's (its loops went from a
+stream to a TCG TB and back through the main loop at each FP insn), and 1.59
+with FP gadgets that read the host's FPSR.
 
 Tests
 =====
@@ -92,3 +133,11 @@ Tests
 The kit's ``check``, ``fptest`` and ``memtest`` transcripts (see the
 general page) are identical with ``QEMU_AOK=0`` and with the gadgets, 143
 lines, the guest's clock at boot aside.
+
+``fpstress`` (aok-vm's ``aok/bench-pm/stress``) runs two million FP ops on
+operands chosen to sit where the gadgets draw their lines: exponents near
+the bottom and top of the range, zeros, denormals, infinities, NaNs, values
+with few mantissa bits so that many results are exact, in random rounding
+modes and with random sticky bits in FPSCR, and hashes the result and
+FPSCR after each. Its ten hashes are identical; with XX left unset on an
+inexact result, all ten differ.

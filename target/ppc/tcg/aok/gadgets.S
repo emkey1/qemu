@@ -693,6 +693,520 @@ _addr   .req x7
     store sthbrx, 16, strh, , x, 0, _le
     store stwbrx, 32, str, , x, 0, _le
 
+/* ---- Floating point --------------------------------------------------------
+ *
+ * The FPRs are doublewords of vsr[] (fpr_offset()); an operand is the
+ * offset of one. FPSCR is at AOK_PPC_ENV_FPSCR.
+ */
+#define FPSCR_HI (AOK_PPC_ENV_FPSCR & ~0xfff)
+#define FPSCR_LO (AOK_PPC_ENV_FPSCR & 0xfff)
+.macro fpscr_at reg
+    add \reg, _cpu, #(FPSCR_HI >> 12), lsl #12
+.endm
+
+/* w10, a single's bits, to x10, the double's: DOUBLE(), helper_todouble */
+.macro todouble
+    ubfx w12, w10, #23, #8
+    and w13, w10, #0x7fffff
+    lsr w11, w10, #31
+    lsl x11, x11, #63
+    cbz w12, 2f
+    cmp w12, #0xff
+    mov w14, #0x7ff
+    add w15, w12, #896
+    csel w12, w14, w15, eq
+    orr x10, x11, x12, lsl #52
+    orr x10, x10, x13, lsl #29
+    b 3f
+2:  mov x10, x11                /* zero, or a denormal to normalize */
+    cbz w13, 3f
+    clz w14, w13
+    sub w14, w14, #8            /* shift */
+    mov w15, #896
+    sub w15, w15, w14
+    orr x10, x10, x15, lsl #52
+    add w14, w14, #29
+    lsl x13, x13, x14
+    add x10, x10, x13
+3:
+.endm
+
+/* x10, a double's bits, to w10, the single's: SINGLE(), helper_tosingle */
+.macro tosingle
+    ubfx x12, x10, #52, #11
+    cmp x12, #896
+    b.ls 2f
+    lsr x13, x10, #62
+    ubfx x14, x10, #29, #30
+    orr w10, w14, w13, lsl #30
+    b 3f
+2:  lsr x13, x10, #63
+    lsl w13, w13, #31
+    cmp x12, #874
+    b.lo 4f
+    ubfx x14, x10, #0, #52
+    orr x14, x14, #(1 << 52)
+    mov x15, #926
+    sub x15, x15, x12
+    lsr x14, x14, x15
+    orr w13, w13, w14
+4:  mov w10, w13
+3:
+.endm
+
+/*
+ * The FP loads and stores: the integer ones' streams, on an FPR. lfs reads a
+ * single and makes it a double, stfs the reverse, both without rounding;
+ * stfiwx stores the FPR's low word. Their slow paths are the fload/fstore
+ * helpers, which store access_type as FP accesses do.
+ */
+.macro fload name, size, form, upd=0
+.gadget ppc_\name
+    ea_\form
+    .if \upd
+    mov w8, w7
+    .endif
+    tlb_probe \size, TLBE_READ, 8f
+    .if \size == 64
+    ldr x10, [_addr]
+    rev x10, x10
+    .else
+    ldr w10, [_addr]
+    rev w10, w10
+    .endif
+1:
+    .if \size == 32
+    todouble
+    .endif
+    ldr x9, [_ip]
+    str x10, [_cpu, x9]
+    .if \upd
+    ldr x11, [_ip, #8]
+    str w8, [_cpu, x11]
+    .endif
+    gret 4
+8:  aok_fp_end
+    slow_args 2, 3
+    str x8, [sp, #-16]!
+    bl SYM(aok_ppc_helper_fload\size)
+    ldr x8, [sp], #16
+    mov x10, x0
+    b 1b
+.endm
+
+.macro fstore name, size, form, upd=0, iw=0
+.gadget ppc_\name
+    ldr x9, [_ip]
+    ldr x6, [_cpu, x9]
+    .if \size == 32 && \iw == 0
+    mov x10, x6
+    tosingle
+    mov w6, w10
+    .endif
+    ea_\form
+    .if \upd
+    mov w8, w7
+    .endif
+    tlb_probe \size, TLBE_WRITE, 8f
+    .if \size == 64
+    rev x10, x6
+    str x10, [_addr]
+    .else
+    rev w10, w6
+    str w10, [_addr]
+    .endif
+1:
+    .if \upd
+    ldr x9, [_ip, #8]
+    str w8, [_cpu, x9]
+    .endif
+    gret 4
+8:  aok_fp_end
+    slow_args 3, 4
+    mov x2, x6
+    str x8, [sp, #-16]!
+    bl SYM(aok_ppc_helper_fstore\size)
+    ldr x8, [sp], #16
+    b 1b
+.endm
+
+.irp form, d, x
+    fload lfs_\form, 32, \form
+    fload lfsu_\form, 32, \form, 1
+    fload lfd_\form, 64, \form
+    fload lfdu_\form, 64, \form, 1
+    fstore stfs_\form, 32, \form
+    fstore stfsu_\form, 32, \form, 1
+    fstore stfd_\form, 64, \form
+    fstore stfdu_\form, 64, \form, 1
+.endr
+    fstore stfiwx, 32, x, 0, 1
+
+/* fmr, fneg, fabs, fnabs: [frD][frB], FPSCR untouched */
+.macro fmove name, op
+.gadget ppc_\name
+    ldp x9, x10, [_ip]
+    ldr x10, [_cpu, x10]
+    .ifnb \op
+    \op x10, x10, #0x8000000000000000
+    .endif
+    str x10, [_cpu, x9]
+    gret 2
+.endm
+    fmove fmr
+    fmove fneg, eor
+    fmove fnabs, orr
+.gadget ppc_fabs
+    ldp x9, x10, [_ip]
+    ldr x10, [_cpu, x10]
+    and x10, x10, #0x7fffffffffffffff
+    str x10, [_cpu, x9]
+    gret 2
+
+/* A record form's CR1: FPSCR's top four bits (FX FEX VX OX) */
+.gadget ppc_cr1
+    fpscr_at x15
+    ldr w10, [x15, #FPSCR_LO]
+    lsr w10, w10, #28
+    str w10, [_cpu, #(AOK_PPC_ENV_CRF + 4)]
+    gret
+
+/* mffs: [frD] -- FPSCR, zero-extended (QEMU's resets softfloat's flags too: see fp_check) */
+.gadget ppc_mffs
+    ldr x9, [_ip]
+    fpscr_at x15
+    ldr w10, [x15, #FPSCR_LO]
+    str x10, [_cpu, x9]
+    gret 1
+
+/* fsel: [frD][frA][frC][frB] -- frC if frA >= 0 (-0 too) and not a NaN, else frB */
+.gadget ppc_fsel
+    ldp x9, x10, [_ip]
+    ldp x11, x12, [_ip, #16]
+    ldr d0, [_cpu, x10]
+    fcmp d0, #0.0
+    csel x13, x11, x12, ge
+    ldr x13, [_cpu, x13]
+    str x13, [_cpu, x9]
+    gret 4
+
+/*
+ * Arithmetic on the host's FP unit, where it gives what QEMU's helpers do.
+ *
+ * TCG's code for an FP op resets softfloat's flags, calls the op's helper,
+ * writes the FPR, sets FPRF from the result and checks the flags
+ * (do_float_check_status): an invalid op, a zero divide, an overflow or an
+ * underflow sets bits of FPSCR and may trap; an inexact result sets XX and
+ * FX, and FI is set to whether it was. A clean result does no more than
+ * that, and with RN to nearest, NI off and the XE, UE and OE enables clear it
+ * cannot trap.
+ *
+ * The host's FPSR could say which results are clean, but writing it stalls
+ * the FP unit (some ten times an fmadd on an M5) and reading it waits for it.
+ * So the gadgets do without: each finds whether its result was exact by an
+ * error-free transformation (TwoSum for an add, an FMA for the error of a
+ * product, the remainder of a quotient or a square root, and for the fused
+ * ops the exact product against the exact difference of the result and the
+ * addend, each a pair of doubles), in the exponent range where that is
+ * exact; and the rest is in the values: a NaN (invalid, or one propagated,
+ * which PowerPC does its own way), an infinity (an overflow or a zero
+ * divide), a zero that was inexact or a result so small that tininess
+ * before rounding (QEMU's for PowerPC) and after it (the host's) could
+ * disagree, or operands outside that range, and the insn is done again in C
+ * by QEMU's helpers in TCG's order (aok_ppc_helper_fp). FPCR stays what
+ * QEMU's own code runs under (zero: RN, no flush to zero, no default NaN).
+ * d8-d15 are the C caller's and are not touched.
+ */
+.macro fp_check slow
+    fpscr_at x15
+    ldr w12, [x15, #FPSCR_LO]
+    mov w13, #AOK_PPC_FPSCR_SLOW
+    tst w12, w13
+    b.ne \slow
+.endm
+
+/* to \slow unless \reg's exponent field is in [\lo, \hi] (so: finite, and not tiny) */
+.macro exp_in reg, lo, hi, slow
+    fmov x13, \reg
+    ubfx x13, x13, #52, #11
+    sub x13, x13, #\lo
+    cmp x13, #(\hi - \lo)
+    b.hi \slow
+.endm
+
+/*
+ * x10 = d0's bits and w16 its class for FPRF, or \slow: an infinity, a NaN,
+ * a denormal, or an inexact zero (an underflow). w11 is whether it is inexact.
+ */
+.macro fp_class slow
+    fmov x10, d0
+    ubfx x14, x10, #52, #11
+    mov w16, #0x04              /* + normal */
+    cbz x14, 3f
+    cmp x14, #0x7ff
+    b.eq \slow
+    b 4f
+3:  lsl x17, x10, #1
+    cbnz x17, \slow
+    cbnz w11, \slow
+    mov w16, #0x02              /* + zero */
+4:  tbz x10, #63, 5f
+    add w17, w16, #4            /* - normal 8 ... */
+    cmp w16, #0x02
+    mov w16, #0x12              /* ... - zero 0x12 */
+    csel w16, w16, w17, eq
+5:
+.endm
+
+/* The FPR at the first operand, FPRF from w16, FI and (if inexact) XX and FX from w11 */
+.macro fp_store
+    ldr x9, [_ip]
+    str x10, [_cpu, x9]
+    bic w12, w12, #(AOK_PPC_FPSCR_FPRF | AOK_PPC_FPSCR_FI)
+    orr w12, w12, w16, lsl #12
+    cbz w11, 6f
+    movz w17, #((AOK_PPC_FPSCR_FX | AOK_PPC_FPSCR_XX | AOK_PPC_FPSCR_FI) >> 16), lsl #16
+    orr w12, w12, w17
+6:  str w12, [x15, #FPSCR_LO]
+.endm
+
+/* The slow path: [... word] at \off, the insn and its distance from the TB's first */
+.macro fp_slow off
+    ldr x9, [_ip, #\off]
+    mov x0, _cpu
+    lsr x1, x9, #32
+    add w1, w19, w1
+    and x2, x9, #0xffffffff
+    bl SYM(aok_ppc_helper_fp)
+.endm
+
+/*
+ * fadd, fsub: [frD][frA][frB][word]. A sum is exact when it is tiny, so only
+ * a denormal one is the slow path's; TwoSum is exact wherever the sum is
+ * finite.
+ */
+.macro fp_addsub name, sub
+.gadget ppc_\name
+    fp_check 8f
+    ldp x9, x10, [_ip, #8]
+    ldr d1, [_cpu, x9]
+    ldr d2, [_cpu, x10]
+    .if \sub
+    fneg d2, d2
+    .endif
+    fadd d0, d1, d2
+    fsub d4, d0, d1             /* TwoSum's error */
+    fsub d5, d0, d4
+    fsub d6, d1, d5
+    fsub d7, d2, d4
+    fadd d6, d6, d7
+    fcmp d6, #0.0
+    cset w11, ne
+    fp_class 8f
+    fp_store
+    gret 4
+8:  fp_slow 24
+    gret 4
+.endm
+    fp_addsub fadd, 0
+    fp_addsub fsub, 1
+
+/* fmul: [frD][frA][frC][word]; the error of a product is a*c - r, exact for r >= 2^-969 */
+.gadget ppc_fmul
+    fp_check 8f
+    ldp x9, x10, [_ip, #8]
+    ldr d1, [_cpu, x9]
+    ldr d2, [_cpu, x10]
+    fmul d0, d1, d2
+    exp_in d0, 54, 2046, 8f
+    fnmsub d4, d1, d2, d0
+    fcmp d4, #0.0
+    cset w11, ne
+    fp_class 8f
+    fp_store
+    gret 4
+8:  fp_slow 24
+    gret 4
+
+/* fdiv: [frD][frA][frB][word]; a quotient is exact if its remainder a - q*b is 0 */
+.gadget ppc_fdiv
+    fp_check 8f
+    ldp x9, x10, [_ip, #8]
+    ldr d1, [_cpu, x9]
+    ldr d2, [_cpu, x10]
+    fdiv d0, d1, d2
+    exp_in d0, 54, 2046, 8f
+    exp_in d1, 110, 2046, 8f
+    exp_in d2, 54, 2046, 8f
+    fmsub d4, d0, d2, d1
+    fcmp d4, #0.0
+    cset w11, ne
+    fp_class 8f
+    fp_store
+    gret 4
+8:  fp_slow 24
+    gret 4
+
+/* fsqrt: [frD][frB][word]; a square root is exact if x - s*s is 0 */
+.gadget ppc_fsqrt
+    fp_check 8f
+    ldr x9, [_ip, #8]
+    ldr d1, [_cpu, x9]
+    fsqrt d0, d1
+    exp_in d1, 110, 2046, 8f
+    exp_in d0, 54, 2046, 8f
+    fmsub d4, d0, d0, d1
+    fcmp d4, #0.0
+    cset w11, ne
+    fp_class 8f
+    fp_store
+    gret 3
+8:  fp_slow 16
+    gret 3
+
+/*
+ * [frD][frA][frC][frB][word]: A*C + B, and the rest, fused as PowerPC's are:
+ * r = fma(A, C, B'), B' being B or -B. It is exact if A*C = r - B' exactly,
+ * and both are pairs of doubles normalized the same way (rounding to nearest
+ * is a function of the exact value): A*C = ph + pl (ph = A*C rounded,
+ * pl = fma(A, C, -ph)), r - B' = d + ed (TwoSum). fnmadd and fnmsub negate
+ * the rounded result, as QEMU's float_muladd_negate_result does: so the sign
+ * of a zero is theirs.
+ */
+.macro fp_fma name, sub, neg
+.gadget ppc_\name
+    fp_check 8f
+    ldp x9, x10, [_ip, #8]
+    ldr x11, [_ip, #24]
+    ldr d1, [_cpu, x9]
+    ldr d2, [_cpu, x10]
+    ldr d3, [_cpu, x11]
+    .if \sub
+    fneg d3, d3
+    .endif
+    fmadd d0, d1, d2, d3
+    exp_in d0, 54, 2046, 8f
+    fmul d4, d1, d2             /* ph */
+    exp_in d4, 54, 2045, 8f
+    fnmsub d5, d1, d2, d4       /* pl */
+    fsub d6, d0, d3             /* d = r - B' */
+    fsub d7, d6, d0
+    fsub d16, d6, d7
+    fsub d17, d0, d16
+    fadd d18, d3, d7
+    fsub d17, d17, d18          /* ed */
+    fcmp d4, d6
+    fccmp d5, d17, #0, eq
+    cset w11, ne
+    .if \neg
+    fneg d0, d0
+    .endif
+    fp_class 8f
+    fp_store
+    gret 5
+8:  fp_slow 32
+    gret 5
+.endm
+    fp_fma fmadd, 0, 0
+    fp_fma fmsub, 1, 0
+    fp_fma fnmadd, 0, 1
+    fp_fma fnmsub, 1, 1
+
+/*
+ * frsp: [frD][frB][word] -- to a single and back, which is exact; inexact if
+ * that is not the operand. A single result in the denormal range, or an
+ * inexact zero, is the slow path's.
+ */
+.gadget ppc_frsp
+    fp_check 8f
+    ldr x9, [_ip, #8]
+    ldr d1, [_cpu, x9]
+    fcmp d1, d1
+    b.vs 8f
+    fcvt s0, d1
+    fmov w11, s0
+    and w11, w11, #0x7fffffff
+    sub w11, w11, #1
+    mov w16, #0x00ffffff
+    cmp w11, w16
+    b.lo 8f
+    fcvt d0, s0
+    fcmp d0, d1
+    cset w11, ne
+    fp_class 8f
+    fp_store
+    gret 3
+8:  fp_slow 16
+    gret 3
+
+/*
+ * fctiw, fctiwz: [frD][frB][word] -- to a word, which QEMU's helper returns
+ * sign-extended to the FPR's 64 bits; inexact if the word converted back is
+ * not the operand. FPRF is not touched. A NaN, and a result at either end of
+ * the range (where the host saturates what PowerPC calls invalid), are the
+ * slow path's.
+ */
+.macro fcti name, op
+.gadget ppc_\name
+    fp_check 8f
+    ldr x9, [_ip, #8]
+    ldr d1, [_cpu, x9]
+    fcmp d1, d1
+    b.vs 8f
+    \op w10, d1
+    mov w13, #0x7fffffff
+    cmp w10, w13
+    b.eq 8f
+    mov w13, #0x80000000
+    cmp w10, w13
+    b.eq 8f
+    scvtf d4, w10
+    fcmp d4, d1
+    cset w11, ne
+    sxtw x10, w10
+    ldr x9, [_ip]
+    str x10, [_cpu, x9]
+    bic w12, w12, #AOK_PPC_FPSCR_FI
+    cbz w11, 6f
+    movz w17, #((AOK_PPC_FPSCR_FX | AOK_PPC_FPSCR_XX | AOK_PPC_FPSCR_FI) >> 16), lsl #16
+    orr w12, w12, w17
+6:  str w12, [x15, #FPSCR_LO]
+    gret 3
+8:  fp_slow 16
+    gret 3
+.endm
+    fcti fctiw, fcvtns
+    fcti fctiwz, fcvtzs
+
+/*
+ * fcmpu, fcmpo: [crf offset][frA][frB][word]. Two numbers compare as QEMU's
+ * helpers have it: the CR field and FPSCR's FPCC get LT, GT or EQ, and FI is
+ * cleared (no flag is raised). A NaN is the slow path's: unordered, VXSNAN
+ * and VXVC.
+ */
+.gadget ppc_fcmp
+    ldp x9, x10, [_ip]
+    ldr x11, [_ip, #16]
+    ldr d0, [_cpu, x10]
+    ldr d1, [_cpu, x11]
+    fcmp d0, d1
+    b.vs 8f
+    mov w12, #2
+    mov w13, #4
+    csel w12, w13, w12, gt
+    mov w13, #8
+    csel w12, w13, w12, mi
+    str w12, [_cpu, x9]
+    fpscr_at x15
+    ldr w13, [x15, #FPSCR_LO]
+    bic w13, w13, #AOK_PPC_FPSCR_FPCC
+    bic w13, w13, #AOK_PPC_FPSCR_FI
+    orr w13, w13, w12, lsl #12
+    str w13, [x15, #FPSCR_LO]
+    gret 4
+8:  fp_slow 24
+    gret 4
+
 /* ---- Leaving a TB ----------------------------------------------------------
  *
  * A way out is aok_gadget_goto32's two operands, [pc delta][slot], and a
@@ -771,6 +1285,36 @@ _addr   .req x7
     leave 0
 1:  leave 16
 
+/*
+ * bc on CTR and a CR bit at once (bdnzt, bdnzf, bdzt, bdzf): [crf offset][bit]
+ * [taken way][fall-through way]. CTR is decremented whatever the bit.
+ */
+.macro bdc name, ctrz, set
+.gadget ppc_\name
+    ldr w11, [_cpu, #AOK_PPC_ENV_CTR]
+    sub w11, w11, #1
+    str w11, [_cpu, #AOK_PPC_ENV_CTR]
+    ldp x9, x10, [_ip]
+    ldr w9, [_cpu, x9]
+    .if \ctrz
+    cbnz w11, 1f
+    .else
+    cbz w11, 1f
+    .endif
+    tst w9, w10
+    .if \set
+    b.eq 1f
+    .else
+    b.ne 1f
+    .endif
+    leave 16
+1:  leave 32
+.endm
+    bdc bdnzt, 0, 1
+    bdc bdnzf, 0, 0
+    bdc bdzt, 1, 1
+    bdc bdzf, 1, 0
+
 /* ---- Indirect branches ---------------------------------------------------
  *
  * blr, bctr and their linking forms: [link delta] for those, then
@@ -806,6 +1350,30 @@ _addr   .req x7
     indirect blrl, AOK_PPC_ENV_LR, 1
     indirect bctr, AOK_PPC_ENV_CTR, 0
     indirect bctrl, AOK_PPC_ENV_CTR, 1
+
+/*
+ * bclr on a CR bit, without LK (beqlr, bnelr ...): [crf offset][bit]
+ * [fall-through way][flags | cflags << 32][cs_base].
+ */
+.macro bclrc name, set
+.gadget ppc_\name
+    ldp x9, x10, [_ip]
+    ldr w9, [_cpu, x9]
+    tst w9, w10
+    .if \set
+    b.eq 1f
+    .else
+    b.ne 1f
+    .endif
+    ldr w10, [_cpu, #AOK_PPC_ENV_LR]
+    and w10, w10, #0xfffffffc
+    str w10, [_pcp]
+    add _ip, _ip, #32
+    b SYM(aok_ppc_lookup_pc)
+1:  leave 16
+.endm
+    bclrc bclr_t, 1
+    bclrc bclr_f, 0
 
 /*
  * [flags | cflags << 32][cs_base] -- aok_gadget_lookup with tb_lookup()'s

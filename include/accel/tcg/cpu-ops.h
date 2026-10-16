@@ -78,6 +78,12 @@ struct TCGCPUOps {
     /* Offset of the guest program counter from CPUArchState. */
     size_t aok_pc_offset;
     /*
+     * Whether that program counter is 32 bits wide (a 32-bit target_ulong):
+     * streams then enter by aok_gadget_enter32, and the front end's jumps
+     * write it as a word (aok_gadget_goto32).
+     */
+    bool aok_pc32;
+    /*
      * @aok_fold_fpsr: Add the host FP exception flags in @fpsr (AArch64
      * FPSR bits), raised by FP gadgets, to the guest's FP status. Needed
      * only by a front end whose gadgets compute on the host's FP unit.

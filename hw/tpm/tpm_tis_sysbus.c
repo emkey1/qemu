@@ -38,6 +38,8 @@ struct TPMStateSysBus {
 
     /*< public >*/
     TPMState state; /* not a QOM object */
+    uint64_t baseaddr;
+    uint64_t size;
 };
 
 OBJECT_DECLARE_SIMPLE_TYPE(TPMStateSysBus, TPM_TIS_SYSBUS)
@@ -95,6 +97,10 @@ static const Property tpm_tis_sysbus_properties[] = {
     DEFINE_PROP_UINT32("irq", TPMStateSysBus, state.irq_num, TPM_TIS_IRQ),
     DEFINE_PROP_TPMBE("tpmdev", TPMStateSysBus, state.be_driver),
     DEFINE_PROP_BOOL("ppi", TPMStateSysBus, state.ppi_enabled, true),
+    DEFINE_PROP_UINT64("x-baseaddr", TPMStateSysBus, baseaddr,
+                       TPM_TIS_ADDR_BASE),
+    DEFINE_PROP_UINT64("x-size", TPMStateSysBus, size,
+                       TPM_TIS_ADDR_SIZE),
 };
 
 static void tpm_tis_sysbus_initfn(Object *obj)

@@ -64,8 +64,9 @@ The parts
   dispatch, the TB lookup (``aok_lookup_jc``), the end of a stream's use of
   the FP unit (``aok_fp_end``).
 
-``accel/tcg/aok-system.c``
-  The machine's note of which engine runs it (`Which engine is running`_).
+``accel/tcg/aok-system.c``, ``accel/tcg/aok-fdt.c``
+  The machine's note of which engine runs it (`Which engine is running`_);
+  the second only in targets that have device trees.
 
 ``scripts/aok-host-gadgets.sh``
   For a front end that took gadgets and a table of pairs from iSH-AOK: which
@@ -164,7 +165,7 @@ Which engine is running
 
 A guest cannot tell which engine runs it, and neither can whoever sits at
 it, so a machine whose CPUs have a front end says so, as long as the gadgets
-are on (``accel/tcg/aok-system.c``):
+are on (``accel/tcg/aok-system.c``, ``aok-fdt.c``):
 
 * in its device tree, where the machine makes one and calls
   ``aok_fdt_announce()``: the property ``aok,engine`` of ``/chosen``, which a

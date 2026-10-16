@@ -252,7 +252,12 @@ typedef struct AokStats {
 } AokStats;
 extern AokStats aok_stats;
 extern bool aok_stats_enabled;
-/* A machine's device tree says which engine runs it (aok-system.c). */
+/*
+ * Which engine runs the machine, as one line ("AOK gadgets (ARCH)"), or NULL
+ * when it is not the gadgets (aok-system.c). A machine's device tree says it
+ * (aok_fdt_announce(), aok-fdt.c: only in targets that have device trees).
+ */
+char *aok_engine_line(void);
 void aok_fdt_announce(void *fdt);
 /* The main loop is about to enter one of TCG's TBs (QEMU_AOK_STATS=2). */
 void aok_stats_tcg_entry(CPUState *cpu);

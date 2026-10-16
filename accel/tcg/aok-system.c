@@ -8,7 +8,6 @@
 #include "qemu/notify.h"
 #include "hw/core/cpu.h"
 #include "hw/nvram/fw_cfg.h"
-#include "system/device_tree.h"
 #include "system/system.h"
 #include "system/tcg.h"
 #include "accel/tcg/cpu-ops.h"
@@ -24,7 +23,7 @@
  * module, and root). It is absent with QEMU_AOK=0 and for a guest
  * architecture the gadgets do not know.
  */
-static char *aok_engine_line(void)
+char *aok_engine_line(void)
 {
     if (!tcg_enabled() || !aok_enabled || !first_cpu ||
         !first_cpu->cc->tcg_ops->aok_translate_code) {
@@ -42,22 +41,6 @@ static void aok_machine_done(Notifier *notifier, void *data)
         char *file = g_strdup_printf("%s\n", line);
 
         fw_cfg_add_file(fw_cfg, "opt/aok/engine", file, strlen(file));
-    }
-}
-
-/*
- * The same in a device tree, for a machine that makes one: the property
- * "aok,engine" of /chosen, which a Linux guest has as
- * /proc/device-tree/chosen/aok,engine with no driver at all. Called by the
- * machine when its tree is otherwise complete.
- */
-void aok_fdt_announce(void *fdt)
-{
-    g_autofree char *line = aok_engine_line();
-
-    if (fdt && line) {
-        qemu_fdt_add_path(fdt, "/chosen");
-        qemu_fdt_setprop_string(fdt, "/chosen", "aok,engine", line);
     }
 }
 

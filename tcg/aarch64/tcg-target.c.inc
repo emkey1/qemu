@@ -2013,6 +2013,21 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         /* Perform the address comparison. */
         tcg_out_cmp(s, addr_type, TCG_COND_NE, TCG_REG_TMP0, TCG_REG_TMP2, 0);
 
+        /*
+         * An unaligned access's first byte must be on the entry's page too.
+         * The TLB index is folded (CPU_TLB_INDEX_FOLD), so the slot for the
+         * first byte's page can hold the next page's entry, which the last
+         * byte's page alone takes for a hit. CCMP: if the comparison above
+         * was equal, the flags of this one, otherwise NE.
+         */
+        if (addr_adj != addr_reg) {
+            tcg_out_logicali(s, Ilogic_imm_ANDI, addr_type, TCG_REG_TMP2,
+                             addr_reg, compare_mask);
+            tcg_out32(s, (addr_type == TCG_TYPE_I64 ? 0xfa400000 : 0x7a400000)
+                      | TCG_REG_TMP2 << 16 | COND_EQ << 12
+                      | TCG_REG_TMP0 << 5);
+        }
+
         /* If not equal, we jump to the slow path. */
         ldst->label_ptr[0] = s->code_ptr;
         tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);

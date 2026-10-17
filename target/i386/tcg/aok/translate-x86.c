@@ -275,7 +275,8 @@ typedef struct Ctx {
     unsigned len;           /* of this insn */
     unsigned op;            /* its opcode, for the statistics */
     bool c64;               /* 64-bit code; else 32-bit, flat */
-    bool mp;                /* other CPUs run: memory gadgets with barriers */
+    bool mp;                /* other CPUs run: LOCK is atomic, fences are barriers */
+    bool mb;                /* and the memory gadgets with barriers (x86_nomb) */
     bool no_goto_ptr;
     bool iopl_ok;           /* cli and sti are allowed here, and I/O */
     int cpl;
@@ -510,7 +511,7 @@ static void mem2(Ctx *c, const Insn *d, const MemTab tab, uint64_t own, int sz,
     if (ea && !again) {
         emit_ea(c, d);
     }
-    aok_emit_gadget(&c->g, tab[ea ? F_EA : c->c64 ? F_BD : F_B3][c->mp]);
+    aok_emit_gadget(&c->g, tab[ea ? F_EA : c->c64 ? F_BD : F_B3][c->mb]);
     aok_emit(&c->g, own);
     if (!ea) {
         aok_emit(&c->g, ro(m->base));
@@ -642,6 +643,12 @@ static void hf_restore(Ctx *c, bool nz_only)
  * conditions are computed in C all the same, and bit 8 for "restore none".
  */
 static unsigned x86_nohf;
+/*
+ * QEMU_AOK_X86_NOMB, a test's control only: with several CPUs, the memory
+ * gadgets without their barriers (LOCK stays atomic). aok-vm's tsotest then
+ * sees the orders x86 forbids, as it does natively on an ARM host.
+ */
+static bool x86_nomb;
 /* QEMU_AOK_X86_NOLIVE: every flag is computed (see "Liveness"). */
 static bool x86_nolive;
 /* QEMU_AOK_X86_NOFP: every floating-point insn is softfloat's. */
@@ -2520,7 +2527,7 @@ static int group5(Ctx *c, const Insn *d, int sz, bool ff)
             return UNKNOWN;
         }
         e = src_e(c, d, SW(c));
-        E3(calli_tab[c->c64][c->mp], e, c->off + c->len, word(c, SW(c)));
+        E3(calli_tab[c->c64][c->mb], e, c->off + c->len, word(c, SW(c)));
         aok_emit_lookup_operands(&c->g);
         return END;
     case 4:
@@ -2533,7 +2540,7 @@ static int group5(Ctx *c, const Insn *d, int sz, bool ff)
         return END;
     case 6:
         e = src_e(c, d, SW(c));
-        E2(push_tab[c->c64][c->mp], e, word(c, SW(c)));
+        E2(push_tab[c->c64][c->mb], e, word(c, SW(c)));
         c->hf = HF_NONE;
         return NEXT;
     default:            /* the far ones */
@@ -2548,7 +2555,7 @@ static int push_seg(Ctx *c, const Insn *d, int seg)
         return UNKNOWN;
     }
     E2(G(mov32), T0, SEGSEL(seg));
-    E2(push_tab[c->c64][c->mp], T0, word(c, SW(c)));
+    E2(push_tab[c->c64][c->mb], T0, word(c, SW(c)));
     c->hf = HF_NONE;
     return NEXT;
 }
@@ -2623,6 +2630,7 @@ static void __attribute__((constructor)) x86_aok_init(void)
         x86_nohf = strtoul(s, NULL, 16);
     }
     x86_nolive = getenv("QEMU_AOK_X86_NOLIVE");
+    x86_nomb = getenv("QEMU_AOK_X86_NOMB");
     x86_nofp = getenv("QEMU_AOK_X86_NOFP");
     x86_novec = getenv("QEMU_AOK_X86_NOVEC");
     x86_nox87 = getenv("QEMU_AOK_X86_NOX87");
@@ -3866,7 +3874,7 @@ static int x87(Ctx *c, Insn *d, const uint8_t *code, unsigned b)
             return UNKNOWN;
         }
         emit_ea(c, d);
-        E1(m->g[c->mp], word(c, m->sz));
+        E1(m->g[c->mb], word(c, m->sz));
         c->hf = HF_NONE;
         return NEXT;
     }
@@ -4026,7 +4034,7 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
         if (d->o16) {
             return UNKNOWN;
         }
-        E2(push_tab[c->c64][c->mp], R((b & 7) | d->rb), word(c, SW(c)));
+        E2(push_tab[c->c64][c->mb], R((b & 7) | d->rb), word(c, SW(c)));
         c->hf = HF_NONE;
         return NEXT;
 
@@ -4035,7 +4043,7 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
         if (d->o16) {
             return UNKNOWN;
         }
-        E2(pop_tab[c->c64][c->mp], R((b & 7) | d->rb), word(c, SW(c)));
+        E2(pop_tab[c->c64][c->mb], R((b & 7) | d->rb), word(c, SW(c)));
         c->hf = HF_NONE;
         return NEXT;
 
@@ -4059,7 +4067,7 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
         if (d->o16) {
             return UNKNOWN;
         }
-        E2(pushi_tab[c->c64][c->mp], imm, word(c, SW(c)));
+        E2(pushi_tab[c->c64][c->mb], imm, word(c, SW(c)));
         c->hf = HF_NONE;
         return NEXT;
 
@@ -4171,7 +4179,7 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
             return UNKNOWN;
         }
         if (d->mod == 3) {
-            E2(pop_tab[c->c64][c->mp], R(d->rm), word(c, SW(c)));
+            E2(pop_tab[c->c64][c->mb], R(d->rm), word(c, SW(c)));
         } else {
             /*
              * The store may fault, so the stack pointer moves after it; but
@@ -4261,7 +4269,7 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
         } else if (c->iopl_ok) {
             mask |= IF_MASK;
         }
-        E2(pop_tab[c->c64][c->mp], T0, word(c, SW(c)));
+        E2(pop_tab[c->c64][c->mb], T0, word(c, SW(c)));
         E4(G(call_c_exit), aok_x86_helper_popf, c->off + c->len, mask, 0);
         return END;
     }
@@ -4272,7 +4280,7 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
             return UNKNOWN;
         }
         E4(G(call_c), aok_x86_helper_pushf, c->off, 0, 0);
-        E2(push_tab[c->c64][c->mp], T0, word(c, SW(c)));
+        E2(push_tab[c->c64][c->mb], T0, word(c, SW(c)));
         set_flags(c, HF_NONE, CC_OP_EFLAGS);
         return NEXT;
 
@@ -4359,7 +4367,7 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
         if (d->o16 || c->no_goto_ptr) {
             return UNKNOWN;
         }
-        E2(ret_tab[c->c64][c->mp], imm, word(c, SW(c)));
+        E2(ret_tab[c->c64][c->mb], imm, word(c, SW(c)));
         aok_emit_lookup_operands(&c->g);
         return END;
 
@@ -4387,7 +4395,7 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
         if (d->o16) {
             return UNKNOWN;
         }
-        E1(leave_tab[c->c64][c->mp], word(c, SW(c)));
+        E1(leave_tab[c->c64][c->mb], word(c, SW(c)));
         c->hf = HF_NONE;
         return NEXT;
 
@@ -4397,7 +4405,7 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
         if (d->o16) {
             return UNKNOWN;
         }
-        E2(call_tab[c->c64][c->mp], c->off + c->len, word(c, SW(c)));
+        E2(call_tab[c->c64][c->mb], c->off + c->len, word(c, SW(c)));
         way(c, 0, (int64_t)c->off + c->len + imm);
         return END;
 
@@ -4718,6 +4726,7 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     c->page_off = pc & ~TARGET_PAGE_MASK;
     c->env = env;
     c->mp = cflags & CF_PARALLEL;
+    c->mb = c->mp && !x86_nomb;
     c->no_goto_ptr = cflags & CF_NO_GOTO_PTR;
     c->cpl = flags & HF_CPL_MASK;
     c->iopl_ok = c->cpl <= ((flags >> IOPL_SHIFT) & 3);

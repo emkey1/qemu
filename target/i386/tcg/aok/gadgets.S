@@ -901,6 +901,31 @@ g_adc sbb32_rr, w, sbcs, AOK_CC_OP_SBB, 32, 0
 g_adc sbb64_rr, x, sbcs, AOK_CC_OP_SBB, 64, 0
 g_adc sbb32_ri, w, sbcs, AOK_CC_OP_SBB, 32, 1
 g_adc sbb64_ri, x, sbcs, AOK_CC_OP_SBB, 64, 1
+
+/*
+ * adcx and adox (ADX), 32 and 64 bits: [destination][source]. The flags are
+ * CC_OP_EFLAGS (flush_cc first, once for a whole chain); the carry in and
+ * out is cc_src's CF (adcx) or OF (adox), and no other flag changes.
+ */
+.macro g_adx name, r, bit
+.gadget \name
+    ldp x8, x9, [_ip]
+    ldr x13, [_cpu, #AOK_X86_ENV_CC_SRC]
+    ldr \r\()10, [_cpu, x8]
+    ldr \r\()11, [_cpu, x9]
+    ubfx x14, x13, #\bit, #1
+    cmp x14, #1                 /* C = the carry in */
+    adcs \r\()12, \r\()10, \r\()11
+    cset x14, cs
+    bfi x13, x14, #\bit, #1
+    str x12, [_cpu, x8]
+    str x13, [_cpu, #AOK_X86_ENV_CC_SRC]
+    gret 2
+.endm
+g_adx adcx32, w, 0
+g_adx adcx64, x, 0
+g_adx adox32, w, 11
+g_adx adox64, x, 11
 /*
  * The same at 16 bits, the rest of the register staying: the lazy state
  * only (the host's flags of a 32-bit sum are not a 16-bit one's).

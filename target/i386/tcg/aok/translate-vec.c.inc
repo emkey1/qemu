@@ -2734,6 +2734,22 @@ static bool x86_aok_only(const uint8_t *p, const uint8_t *end, bool avx,
     }
 }
 
+/*
+ * For TCG's translator, at an insn of a TB that is TCG's (this translator
+ * declined its first insn), not that first one: whether it is one only these
+ * gadgets compute (x86_aok_only), which TCG would raise #UD for. TCG then
+ * ends its TB before it, and the TB that starts there is this translator's.
+ * OpenSSL's AVX-512 RSA has an 8-bit adc (TCG's here) a few insns before a
+ * kmovb.
+ */
+bool x86_aok_tcg_stop(uint32_t flags, const uint8_t *p, const uint8_t *end)
+{
+    return aok_enabled && (flags & HF_CS64_MASK) && !x86_no64 &&
+           x86_aok_only(p, end, !(flags & (HF_EM_MASK | HF_TS_MASK)) &&
+                        (flags & HF_OSFXSR_MASK) && (flags & HF_AVX_EN_MASK),
+                        flags & HF_AVX512_EN_MASK);
+}
+
 /* The end of such a TB: at the next insn, the main loop's. */
 void aok_x86_helper_eob(CPUX86State *env, uint64_t pc, uint64_t a, uint64_t b);
 void aok_x86_helper_eob(CPUX86State *env, uint64_t pc, uint64_t a, uint64_t b)
@@ -2893,10 +2909,21 @@ static int sse_3byte(Ctx *c, Insn *d, const uint8_t *code, unsigned esc)
     int pfx = d->repne ? 3 : d->rep ? 2 : d->o16 ? 1 : 0;
     int64_t imm = 0;
 
-    if (!c->sse || d->p >= d->end) {
+    if (d->p >= d->end) {
         return UNKNOWN;
     }
     op = *d->p;
+    /* 66 0f 38 f6 adcx, f3 0f 38 f6 adox: integer insns, SSE or not */
+    if (map == 2 && op == 0xf6 && !d->lock && !d->repne &&
+        d->o16 != d->rep) {
+        d->p++;
+        modrm(d);
+        FIN();
+        return adx(c, d, d->rep);
+    }
+    if (!c->sse) {
+        return UNKNOWN;
+    }
     if (sse_via_evex(map, op)) {
         return sse_evex(c, d, code, esc);
     }

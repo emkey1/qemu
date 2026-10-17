@@ -35,6 +35,11 @@
 #include "decode-new.h"
 
 #include "exec/log.h"
+#if defined(CONFIG_AOK_GADGETS) && defined(TARGET_X86_64) && \
+    !defined(CONFIG_USER_ONLY)
+#include "aok/aok-i386.h"
+#define X86_AOK
+#endif
 
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
@@ -3608,6 +3613,25 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 
     switch (sigsetjmp(dc->jmpbuf, 0)) {
     case 0:
+#ifdef X86_AOK
+        /*
+         * An insn only the AOK gadgets compute (AVX-512 ...), after the first
+         * of this TB, which the AOK translator declined: end the TB before
+         * it, as before one that crosses into the next page, and the TB that
+         * starts with it is the AOK translator's (aok-i386.h).
+         */
+        if (dc->base.num_insns > 1 && dc->base.host_addr[0] &&
+            !((dc->base.pc_next ^ dc->base.pc_first) & TARGET_PAGE_MASK)) {
+            const uint8_t *page = (const uint8_t *)dc->base.host_addr[0] -
+                                  (dc->base.pc_first & ~TARGET_PAGE_MASK);
+
+            if (x86_aok_tcg_stop(dc->base.tb->flags,
+                                 page + (dc->base.pc_next & ~TARGET_PAGE_MASK),
+                                 page + TARGET_PAGE_SIZE)) {
+                siglongjmp(dc->jmpbuf, 2);
+            }
+        }
+#endif
         disas_insn(dc, cpu);
         break;
     case 1:

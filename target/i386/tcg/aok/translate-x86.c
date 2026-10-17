@@ -150,6 +150,11 @@ static const Gadget adc_tab[2][3][2] = {
     { { G(sbb16_rr), G(sbb16_ri) }, { G(sbb32_rr), G(sbb32_ri) },
       { G(sbb64_rr), G(sbb64_ri) } },
 };
+DECL(adcx32) DECL(adcx64) DECL(adox32) DECL(adox64)
+/* [adox][32, 64 bits] */
+static const Gadget adx_tab[2][2] = {
+    { G(adcx32), G(adcx64) }, { G(adox32), G(adox64) },
+};
 DECL(popcnt32) DECL(popcnt64)
 #define CL(n) DECL(n##_cl)
 #define CLENTRY(n) G(n##_cl),
@@ -277,6 +282,7 @@ typedef struct Ctx {
     bool io_ok;             /* a port may be read and written with no check */
     bool abm, bmi1;         /* f3 before bsf and bsr makes tzcnt and lzcnt */
     bool bmi2;
+    bool adx;               /* adcx and adox exist here */
     bool avx;               /* VEX's vector insns are gadgets-vec.S's here */
     bool avx512;            /* and EVEX's (AVX-512), and the opmask ones */
     const CPUX86State *env; /* the features the CPU offers */
@@ -2201,6 +2207,30 @@ static int adc(Ctx *c, const Insn *d, int op, int sz, bool to_reg,
     if (rmw) {
         rmw_end(c, d, sz, true);
     }
+    return NEXT;
+}
+
+/*
+ * adcx (CF) and adox (OF, @ox): G += E + that flag, which is all the result
+ * sets. Bignum code (OpenSSL, libgcrypt) runs two chains of them at once,
+ * one on each flag; the lazy state is made CC_OP_EFLAGS once, before the
+ * first, and each gadget reads and writes its bit of cc_src.
+ */
+static int adx(Ctx *c, const Insn *d, bool ox)
+{
+    int sz = d->w ? 3 : 2;
+    uint64_t src;
+
+    if (!c->adx) {
+        return UNKNOWN;         /* TCG's #UD */
+    }
+    if (c->cc != CC_OP_EFLAGS) {
+        E0(G(flush_cc));
+        set_flags(c, HF_NONE, CC_OP_EFLAGS);
+    }
+    src = src_e(c, d, sz);
+    E2(adx_tab[ox][sz - 2], R(d->reg), src);
+    set_flags(c, HF_NONE, CC_OP_EFLAGS);
     return NEXT;
 }
 
@@ -4702,6 +4732,7 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     c->x87 = !(flags & (HF_EM_MASK | HF_TS_MASK)) && !x86_nox87;
     c->sse3 = env->features[FEAT_1_ECX] & CPUID_EXT_SSE3;
     c->bmi2 = env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_BMI2;
+    c->adx = env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_ADX;
     /*
      * VEX's vector insns (gadgets-vec.S): with AVX enabled (CR4 and XCR0, a
      * TB flag) and SSE's state usable, on a CPU with AVX2, FMA and F16C,

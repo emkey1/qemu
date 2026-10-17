@@ -30,7 +30,8 @@
  *
  *   x28  stream pointer: the next word to read
  *   x20  CPUArchState *
- *   x19  guest pc on entry to this TB (TBs are pc-relative under CF_PCREL)
+ *   x19  guest pc on entry to this TB (TBs are pc-relative under CF_PCREL);
+ *        zero-extended where it is 32 bits (TCGCPUOps.aok_pc32)
  *   x21  &cpu->neg.icount_decr.u32, the exit request the TB checks first
  *   x22  &env->pc
  *   x23  &cpu->neg.tlb.f[mmu_idx], the softmmu fast table of this TB
@@ -85,6 +86,9 @@ uintptr_t aok_tb_exec(CPUArchState *env, const void *stream,
 void aok_gadget_enter(void);    /* [tb][tlb fast offset]: every TB starts here */
 void aok_gadget_exit_tb(void);  /* [value]: return value to the main loop */
 void aok_gadget_goto(void);     /* [pc delta][slot]: set pc, continue at *slot */
+/* The two for a 32-bit pc (TCGCPUOps.aok_pc32): aok_gen_begin picks enter32. */
+void aok_gadget_enter32(void);
+void aok_gadget_goto32(void);
 /*
  * [flags | cflags << 32][cs_base], this TB's: env->pc is set, continue in
  * the TB there if it is a stream. This one asks aok_lookup_tb_ptr; a front

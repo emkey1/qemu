@@ -34,13 +34,15 @@ static struct AokProf {
 
 void aok_stats_tcg_entry(CPUState *cpu)
 {
+    void *pcp;
     uint64_t pc;
     unsigned h;
 
     if (!aok_prof_enabled || !cpu->cc->tcg_ops->aok_translate_code) {
         return;
     }
-    pc = *(uint64_t *)((void *)cpu_env(cpu) + cpu->cc->tcg_ops->aok_pc_offset);
+    pcp = (void *)cpu_env(cpu) + cpu->cc->tcg_ops->aok_pc_offset;
+    pc = cpu->cc->tcg_ops->aok_pc32 ? *(uint32_t *)pcp : *(uint64_t *)pcp;
     h = (pc >> 1) * 0x9e3779b97f4a7c15ull >> 40;
     for (int i = 0; i < 16; i++) {
         struct AokProf *e = &aok_prof[(h + i) % AOK_PROF_SIZE];
@@ -171,7 +173,8 @@ void aok_gen_begin(AokGen *g, CPUState *cpu, TranslationBlock *tb,
     g->insn_data = s->gen_insn_data;
     g->insn_end_off = s->gen_insn_end_off;
 
-    aok_emit_gadget(g, aok_gadget_enter);
+    aok_emit_gadget(g, cpu->cc->tcg_ops->aok_pc32 ? aok_gadget_enter32
+                                                  : aok_gadget_enter);
     aok_emit(g, (uintptr_t)tcg_splitwx_to_rx(tb));
     aok_emit(g, tlb_ofs);
 }

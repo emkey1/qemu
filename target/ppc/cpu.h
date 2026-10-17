@@ -1281,6 +1281,13 @@ struct CPUArchState {
     /* Most commonly used resources during translated code execution first */
     target_ulong gpr[32];  /* general purpose registers */
     target_ulong gprh[32]; /* storage for GPR MSB, used by the SPE extension */
+#ifdef CONFIG_AOK_GADGETS
+    /*
+     * For a gadget stream (target/ppc/tcg/aok): the 0 that (rA|0) reads
+     * where rA is 0, so that one gadget serves both forms of an address.
+     */
+    target_ulong aok_zero;
+#endif
     target_ulong lr;
     target_ulong ctr;
     uint32_t crf[8];       /* condition register */

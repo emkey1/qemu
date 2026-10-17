@@ -2061,7 +2061,7 @@ static void vmem_w(Ctx *c, const Insn *d, const MemTab tab, bool has_own,
     if (ea) {
         emit_ea(c, d);
     }
-    aok_emit_gadget(&c->g, tab[ea ? F_EA : c->c64 ? F_BD : F_B3][c->mp]);
+    aok_emit_gadget(&c->g, tab[ea ? F_EA : c->c64 ? F_BD : F_B3][c->mb]);
     if (has_own) {
         aok_emit(&c->g, own);
     }

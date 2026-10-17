@@ -53,13 +53,16 @@ ppc_system_ss.add(when: 'CONFIG_TCG', if_true: files(
 ))
 ppc_system_ss.add(when: 'CONFIG_KVM', if_true: files('kvm.c'))
 
-# The AOK gadgets' front end: the 32-bit PowerPCs (cpu_init.c offers it to
-# TCG only in qemu-system-ppc).
+# The AOK gadgets' front end: the 32-bit PowerPCs only (qemu-system-ppc;
+# cpu_init.c offers it to TCG there). Its offsets and its 32-bit pc are
+# qemu-system-ppc's, so qemu-system-ppc64 must not compile it.
 if get_option('aok_gadgets')
-  ppc_system_ss.add(when: 'CONFIG_TCG', if_true: files(
+  ppc_aok_ss = ss.source_set()
+  ppc_aok_ss.add(when: 'TARGET_PPC64', if_false: files(
     'tcg/aok/gadgets.S',
     'tcg/aok/translate.c',
   ))
+  ppc_system_ss.add_all(when: 'CONFIG_TCG', if_true: ppc_aok_ss)
 endif
 
 ppc_system_ss.add(when: 'TARGET_PPC64', if_true: files(

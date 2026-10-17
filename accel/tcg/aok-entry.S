@@ -68,6 +68,22 @@ SYM(aok_exit):
     orr x0, x0, #3              /* TB_EXIT_REQUESTED */
     b SYM(aok_exit)
 
+/*
+ * The same for a guest whose pc is 32 bits (TCGCPUOps.aok_pc32: PowerPC's
+ * qemu-system-ppc, where nip is a 32-bit target_ulong): _pc holds it
+ * zero-extended, and it is read and written as a word.
+ */
+.gadget enter32
+    ldr w9, [_exitreq]
+    tbnz w9, #31, 1f
+    ldr x10, [_ip, #8]
+    ldr w19, [_pcp]
+    add _tlb, _cpu, x10
+    gret 2
+1:  ldr x0, [_ip]
+    orr x0, x0, #3              /* TB_EXIT_REQUESTED */
+    b SYM(aok_exit)
+
 /* [value] */
 .gadget exit_tb
     ldr x0, [_ip]
@@ -91,6 +107,18 @@ SYM(aok_goto_tail):
     ldr w11, [_exitreq]
     ldr _ip, [x10]
     str _pc, [_pcp]
+    tbnz w11, #31, SYM(aok_exit_requested)
+    gret AOK_ENTER_WORDS
+
+/* [pc delta][slot], for a 32-bit pc: the sum wraps as the guest's does. */
+.gadget goto32
+    ldp x9, x10, [_ip]
+    .globl SYM(aok_goto32_tail)
+SYM(aok_goto32_tail):
+    add w19, w19, w9
+    ldr w11, [_exitreq]
+    ldr _ip, [x10]
+    str w19, [_pcp]
     tbnz w11, #31, SYM(aok_exit_requested)
     gret AOK_ENTER_WORDS
 

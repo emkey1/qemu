@@ -197,6 +197,12 @@ before any such helper.
 **TBs are pc-relative** where the target uses ``CF_PCREL``. The enter gadget
 takes the pc the TB was entered at, and everything is measured from it.
 
+**A 32-bit pc** is written as a word. Where the guest's pc is a 32-bit
+``target_ulong`` (``TCGCPUOps.aok_pc32``: PowerPC's ``qemu-system-ppc``), the
+core enters its streams by ``aok_gadget_enter32``, the front end leaves a TB
+by ``aok_gadget_goto32`` or a copy of it, and the pc in x19 is
+zero-extended and wraps as the guest's does.
+
 **A lookup must see breakpoints.** A direct jump to another page, and every
 indirect jump, looks its target up rather than being linked, and a lookup is
 where QEMU notices a breakpoint. A gadget that does ``tb_lookup``'s first

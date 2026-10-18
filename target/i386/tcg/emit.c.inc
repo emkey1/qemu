@@ -1408,6 +1408,23 @@ static void gen_BOUND(DisasContext *s, X86DecodedInsn *decode)
 }
 
 /* Non-standard convention - on entry T0 is zero-extended input, T1 is the output.  */
+/*
+ * At 32 bits, a zero source leaves all 64 bits of the destination, without
+ * the zero extension of a 32-bit write, as the hardware does.
+ */
+static void gen_bitscan_writeback(DisasContext *s, X86DecodedInsn *decode)
+{
+#ifdef TARGET_X86_64
+    if (decode->op[0].ot == MO_32) {
+        TCGv reg = cpu_regs[decode->op[0].n];
+
+        tcg_gen_movcond_tl(TCG_COND_EQ, reg, decode->cc_dst,
+                           tcg_constant_tl(0), reg, s->T0);
+        decode->op[0].unit = X86_OP_SKIP;
+    }
+#endif
+}
+
 static void gen_BSF(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[0].ot;
@@ -1424,6 +1441,7 @@ static void gen_BSF(DisasContext *s, X86DecodedInsn *decode)
      * by passing the output as the value to return upon zero.
      */
     tcg_gen_ctz_tl(s->T0, s->T0, s->T1);
+    gen_bitscan_writeback(s, decode);
 }
 
 /* Non-standard convention - on entry T0 is zero-extended input, T1 is the output.  */
@@ -1446,6 +1464,7 @@ static void gen_BSR(DisasContext *s, X86DecodedInsn *decode)
     tcg_gen_xori_tl(s->T1, s->T1, TARGET_LONG_BITS - 1);
     tcg_gen_clz_tl(s->T0, s->T0, s->T1);
     tcg_gen_xori_tl(s->T0, s->T0, TARGET_LONG_BITS - 1);
+    gen_bitscan_writeback(s, decode);
 }
 
 static void gen_BSWAP(DisasContext *s, X86DecodedInsn *decode)

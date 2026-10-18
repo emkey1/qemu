@@ -2459,7 +2459,11 @@ target_ulong helper_lar(CPUX86State *env, target_ulong selector1)
         }
     }
     CC_SRC |= CC_Z;
-    return e2 & 0x00f0ff00;
+    /*
+     * Bits 8-23 of the descriptor's second word: the SDM leaves the limit's
+     * bits 19:16 undefined, AMD's manual and its processors return them.
+     */
+    return e2 & 0x00ffff00;
 }
 
 void helper_verr(CPUX86State *env, target_ulong selector1)

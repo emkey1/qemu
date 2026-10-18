@@ -649,6 +649,20 @@ static inline unsigned int get_sp_mask(unsigned int e2)
     }
 }
 
+/*
+ * The stack's address size for a far CALL, RET or IRET: in 64-bit code it is
+ * 64 bits whatever the operand size, and SS's B bit counts only outside it.
+ */
+static inline target_ulong get_far_sp_mask(CPUX86State *env)
+{
+#ifdef TARGET_X86_64
+    if (env->hflags & HF_CS64_MASK) {
+        return -1;
+    }
+#endif
+    return get_sp_mask(env->segs[R_SS].flags);
+}
+
 static int exception_is_fault(int intno)
 {
     switch (intno) {
@@ -1726,7 +1740,7 @@ void helper_lcall_protected(CPUX86State *env, int new_cs, target_ulong new_eip,
 #endif
         {
             sa.sp = env->regs[R_ESP];
-            sa.sp_mask = get_sp_mask(env->segs[R_SS].flags);
+            sa.sp_mask = get_far_sp_mask(env);
             sa.ss_base = env->segs[R_SS].base;
             if (shift) {
                 pushl(&sa, env->segs[R_CS].selector);
@@ -2050,14 +2064,7 @@ static inline void helper_ret_protected(CPUX86State *env, int shift,
     sa.ra = retaddr;
     sa.mmu_index = x86_mmu_index_pl(env, cpl);
 
-#ifdef TARGET_X86_64
-    if (shift == 2) {
-        sa.sp_mask = -1;
-    } else
-#endif
-    {
-        sa.sp_mask = get_sp_mask(env->segs[R_SS].flags);
-    }
+    sa.sp_mask = get_far_sp_mask(env);
     sa.sp = env->regs[R_ESP];
     sa.ss_base = env->segs[R_SS].base;
     new_eflags = 0; /* avoid warning */

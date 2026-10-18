@@ -3452,6 +3452,9 @@ static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
     case 0x18 ... 0x19:
     case 0x1c ... 0x1f:
         modrm(d);
+        if (b == 0x0d && d->mod == 3) {
+            return UNKNOWN;     /* prefetch of a register: #UD (TCG's) */
+        }
         FIN();
         return NEXT;
 

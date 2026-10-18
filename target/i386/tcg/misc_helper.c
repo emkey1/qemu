@@ -24,6 +24,8 @@
 #include "exec/helper-proto.h"
 #include "exec/cputlb.h"
 #include "helper-tcg.h"
+#include "accel/tcg/probe.h"
+#include "accel/tcg/cpu-mmu-index.h"
 
 /*
  * NOTE: the translator must set DisasContext.cc_op to CC_OP_EFLAGS
@@ -60,6 +62,12 @@ void helper_cpuid(CPUX86State *env)
     env->regs[R_EBX] = ebx;
     env->regs[R_ECX] = ecx;
     env->regs[R_EDX] = edx;
+}
+
+void helper_clflush(CPUX86State *env, target_ulong addr)
+{
+    probe_access(env, addr, 1, MMU_DATA_LOAD, cpu_mmu_index(env_cpu(env), false),
+                 GETPC());
 }
 
 void helper_rdtsc(CPUX86State *env)

@@ -2498,6 +2498,16 @@ static void gen_LZCNT(DisasContext *s, X86DecodedInsn *decode)
     tcg_gen_subi_tl(s->T0, s->T0, TARGET_LONG_BITS - (8 << ot));
 }
 
+/*
+ * CLFLUSH, CLFLUSHOPT and CLWB: no cache to write back, but the address is
+ * checked as a byte's read would check it (AMD's manual; Intel's #PF), and
+ * nothing is read, which a device's register would see.
+ */
+static void gen_CLFLUSH(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_helper_clflush(tcg_env, s->A0);
+}
+
 static void gen_MFENCE(DisasContext *s, X86DecodedInsn *decode)
 {
     tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);

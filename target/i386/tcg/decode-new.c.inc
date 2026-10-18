@@ -484,12 +484,12 @@ static void decode_group15(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
         [4] = X86_OP_ENTRYw(XSAVE,      M,y, cpuid(XSAVE) p_00),
         [5] = X86_OP_ENTRYr(XRSTOR,     M,y, cpuid(XSAVE) p_00),
         [6] = X86_OP_ENTRYw(XSAVEOPT,   M,b, cpuid(XSAVEOPT) p_00),
-        [7] = X86_OP_ENTRYw(NOP,        M,b, cpuid(CLFLUSH) p_00),
+        [7] = X86_OP_ENTRYw(CLFLUSH,    M,b, cpuid(CLFLUSH) p_00),
     };
 
     static const X86OpEntry group15_mem_66[8] = {
-        [6] = X86_OP_ENTRYw(NOP,        M,b, cpuid(CLWB)),
-        [7] = X86_OP_ENTRYw(NOP,        M,b, cpuid(CLFLUSHOPT)),
+        [6] = X86_OP_ENTRYw(CLFLUSH,    M,b, cpuid(CLWB)),
+        [7] = X86_OP_ENTRYw(CLFLUSH,    M,b, cpuid(CLFLUSHOPT)),
     };
 
     uint8_t modrm = get_modrm(s, env);

@@ -2061,7 +2061,7 @@ static void vmem_w(Ctx *c, const Insn *d, const MemTab tab, bool has_own,
     if (ea) {
         emit_ea(c, d);
     }
-    aok_emit_gadget(&c->g, tab[ea ? F_EA : c->c64 ? F_BD : F_B3][c->mb]);
+    aok_emit_gadget(&c->g, tab[ea ? F_EA : c->c64 && !d->a32 ? F_BD : F_B3][c->mb]);
     if (has_own) {
         aok_emit(&c->g, own);
     }
@@ -2224,6 +2224,7 @@ static int vex(Ctx *c, Insn *d, const uint8_t *code, unsigned lead)
     d->rr = r ? 8 : 0;
     d->rx = x ? 8 : 0;
     d->rb = b ? 8 : 0;
+    d->a32_ok = true;
     modrm(d);
     v.reg = d->reg & 15;
     v.rm = (d->rm & 7) | d->rb;
@@ -2548,6 +2549,7 @@ static int evex_at(Ctx *c, Insn *d, const uint8_t *code, unsigned p0,
     d->rr = (r ? 8 : 0) | (r2 ? 16 : 0);
     d->rx = x ? 8 : 0;
     d->rb = b ? 8 : 0;
+    d->a32_ok = true;           /* 67 in 64-bit code: a 32-bit address (emit_ea) */
     mp = d->p;
     modrm(d);
     if (d->bad) {
@@ -2624,8 +2626,13 @@ static int evex_at(Ctx *c, Insn *d, const uint8_t *code, unsigned p0,
         if (word < 0) {
             return vex_ud(c, d, code);
         }
-        if (!c->c64) {
+        if (!c->c64 || d->a32) {
             word |= 1l << 22;           /* each element's address wraps at 4 GB */
+        }
+        if (c->c64 && d->a32 && base.m.seg >= 0) {
+            /* 67 and fs or gs in 64-bit code: their base after the wrap */
+            word |= 1l << 23 | (long)SEGBASE(base.m.seg) << 32;
+            base.m.seg = -1;
         }
         FIN();
         base.m.index = -1;      /* the address without the index: the vector register's */
@@ -2717,8 +2724,7 @@ static int sse_evex(Ctx *c, Insn *d, const uint8_t *code, unsigned esc)
         return UNKNOWN;
     }
     op = d->p[0];
-    if (!d->o16 || d->rep || d->repne || d->lock || d->a32 ||
-        !sse_via_evex(map, op)) {
+    if (!d->o16 || d->rep || d->repne || d->lock || !sse_via_evex(map, op)) {
         return UNKNOWN;
     }
     /* s1 is the destination (the ModRM reg); AESIMC, AESKEYGENASSIST have none */

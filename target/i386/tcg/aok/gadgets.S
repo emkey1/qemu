@@ -327,6 +327,36 @@ miss_\id:
     add _ea, x9, x10
     gret 2
 
+/*
+ * 67 in 64-bit code: the sum wraps at 32 bits, and a segment's base (fs's or
+ * gs's, 64 bits there) is added after: ea32's operands and the base's, and
+ * eip-relative, whose sum wraps the same.
+ */
+.gadget ea32_seg64
+    ldp x9, x10, [_ip]
+    ldp x11, x12, [_ip, #16]
+    ldr x13, [_ip, #32]
+    ldr w9, [_cpu, x9]
+    ldr w10, [_cpu, x10]
+    ldr x13, [_cpu, x13]
+    lsl w10, w10, w11
+    add w9, w9, w12
+    add w9, w9, w10
+    add _ea, x9, x13
+    gret 5
+.gadget ea_pc32
+    ldr x9, [_ip]
+    add x9, _pc, x9
+    mov w6, w9
+    gret 1
+.gadget ea_pc32_seg
+    ldp x9, x10, [_ip]
+    ldr x10, [_cpu, x10]
+    add x9, _pc, x9
+    mov w9, w9
+    add _ea, x9, x10
+    gret 2
+
 /* ---- Moves -------------------------------------------------------------- */
 
 /* Register to register: [destination][source] */

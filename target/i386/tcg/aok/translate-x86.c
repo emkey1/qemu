@@ -59,6 +59,7 @@ typedef Gadget MemTab[3][2];
                   { G(n##_b3), G(n##_b3_mp) } },
 
 DECL(ea) DECL(ea_seg) DECL(ea_pc) DECL(ea_pc_seg) DECL(ea32) DECL(ea32_seg)
+DECL(ea32_seg64) DECL(ea_pc32) DECL(ea_pc32_seg)
 DECL(bt_ea64) DECL(bt_ea32) DECL(bt_ea32_32)
 SIZES(DECL, mov)
 DECL(movzx8) DECL(movzx16) DECL(movsx8_32) DECL(movsx8_64)
@@ -334,6 +335,8 @@ typedef struct Insn {
     bool bad;               /* ran into the end of the page */
     bool o16, rep, repne, lock;
     bool a32;               /* 67: fine where there is no address */
+    bool a32_ok;            /* ... and in 64-bit code a 32-bit one (the vector insns') */
+    bool a32_bad;           /* declined for 67's address, not the page's end */
     bool rex, w;
     int rr, rx, rb;         /* REX.R, REX.X and REX.B, as 0 or 8 */
     int seg;
@@ -396,8 +399,8 @@ static void modrm(Insn *d)
         d->rm |= d->rb;
         return;
     }
-    if (d->a32) {
-        d->bad = true;
+    if (d->a32 && !(d->c64 && d->a32_ok)) {
+        d->bad = d->a32_bad = true;     /* (32-bit code's 16-bit addresses: TCG's) */
     }
     if (d->rm == 4) {
         unsigned sib = f8(d);
@@ -478,10 +481,15 @@ static uint64_t word(Ctx *c, int sz)
  * @again: this is the store of an insn whose load was the gadget before the
  * last, and what that load's ea gadget left is still there.
  */
-/* The ea gadget of the insn's memory operand. */
+/*
+ * The ea gadget of the insn's memory operand. With 67 in 64-bit code (a32_ok)
+ * the sum wraps at 32 bits as 32-bit code's does, and then fs's or gs's base,
+ * which is 64 bits there, is added: ea32_seg64, ea_pc32 (eip + disp).
+ */
 static void emit_ea(Ctx *c, const Insn *d)
 {
     const Mem *m = &d->m;
+    bool a32 = c->c64 && d->a32;
 
     if (m->ea_done) {
         return;
@@ -489,15 +497,15 @@ static void emit_ea(Ctx *c, const Insn *d)
         uint64_t delta = (int64_t)c->off + c->len + m->disp;
 
         if (m->seg >= 0) {
-            E2(G(ea_pc_seg), delta, SEGBASE(m->seg));
+            E2(a32 ? G(ea_pc32_seg) : G(ea_pc_seg), delta, SEGBASE(m->seg));
         } else {
-            E1(G(ea_pc), delta);
+            E1(a32 ? G(ea_pc32) : G(ea_pc), delta);
         }
     } else if (m->seg >= 0) {
-        E5(c->c64 ? G(ea_seg) : G(ea32_seg), ro(m->base), ro(m->index),
-           m->scale, m->disp, SEGBASE(m->seg));
+        E5(!c->c64 ? G(ea32_seg) : a32 ? G(ea32_seg64) : G(ea_seg), ro(m->base),
+           ro(m->index), m->scale, m->disp, SEGBASE(m->seg));
     } else {
-        E4(c->c64 ? G(ea) : G(ea32), ro(m->base), ro(m->index), m->scale,
+        E4(c->c64 && !a32 ? G(ea) : G(ea32), ro(m->base), ro(m->index), m->scale,
            m->disp);
     }
 }
@@ -511,7 +519,7 @@ static void mem2(Ctx *c, const Insn *d, const MemTab tab, uint64_t own, int sz,
     if (ea && !again) {
         emit_ea(c, d);
     }
-    aok_emit_gadget(&c->g, tab[ea ? F_EA : c->c64 ? F_BD : F_B3][c->mb]);
+    aok_emit_gadget(&c->g, tab[ea ? F_EA : c->c64 && !d->a32 ? F_BD : F_B3][c->mb]);
     aok_emit(&c->g, own);
     if (!ea) {
         aok_emit(&c->g, ro(m->base));
@@ -3452,6 +3460,9 @@ static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
     case 0x18 ... 0x19:
     case 0x1c ... 0x1f:
         modrm(d);
+        if (b == 0x0d && d->mod == 3) {
+            return UNKNOWN;     /* prefetch of a register: #UD (TCG's) */
+        }
         FIN();
         return NEXT;
 
@@ -4109,6 +4120,9 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
     case 0x70 ... 0x7f:
         imm = fimm(d, 1);
         FIN();
+        if (d->o16) {
+            return UNKNOWN;     /* a 16-bit ip (as jcc rel16's, jmp's and call's) */
+        }
         return jcc(c, b & 15, imm);
 
     case 0x80:
@@ -4554,7 +4568,7 @@ static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
     int r = insn1(c, &d, code);
 
     /* Unknown because it ran into the end of the page? */
-    c->cut = r == UNKNOWN && d.bad && !d.a32;
+    c->cut = r == UNKNOWN && d.bad && !d.a32_bad;
     return r;
 }
 

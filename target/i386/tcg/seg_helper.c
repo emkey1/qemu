@@ -2047,6 +2047,30 @@ static inline void validate_seg(CPUX86State *env, X86Seg seg_reg, int cpl)
 }
 
 /* protected mode iret */
+/*
+ * Where a far RET or IRET goes, checked before anything changes: a 64-bit
+ * code segment wants a canonical RIP, any other one an EIP within its limit
+ * (a 64-bit RIP past a 32-bit segment's 4 GiB is #GP at the IRET).
+ */
+static void check_ret_eip(CPUX86State *env, target_ulong new_eip,
+                          uint32_t e1, uint32_t e2, uintptr_t retaddr)
+{
+#ifdef TARGET_X86_64
+    if ((env->hflags & HF_LMA_MASK) && (e2 & DESC_L_MASK)) {
+        int shift = (get_pg_mode(env) & PG_MODE_LA57) ? 56 : 47;
+        int64_t sext = (int64_t)new_eip >> shift;
+
+        if (sext != 0 && sext != -1) {
+            raise_exception_err_ra(env, EXCP0D_GPF, 0, retaddr);
+        }
+        return;
+    }
+#endif
+    if (new_eip > get_seg_limit(e1, e2)) {
+        raise_exception_err_ra(env, EXCP0D_GPF, 0, retaddr);
+    }
+}
+
 static inline void helper_ret_protected(CPUX86State *env, int shift,
                                         int is_iret, int addend,
                                         uintptr_t retaddr)
@@ -2133,6 +2157,7 @@ static inline void helper_ret_protected(CPUX86State *env, int shift,
     if (rpl == cpl && (!(env->hflags & HF_CS64_MASK) ||
                        ((env->hflags & HF_CS64_MASK) && !is_iret))) {
         /* return to same privilege level */
+        check_ret_eip(env, new_eip, e1, e2, retaddr);
         cpu_x86_load_seg_cache(env, R_CS, new_cs,
                        get_seg_base(e1, e2),
                        get_seg_limit(e1, e2),
@@ -2163,6 +2188,7 @@ static inline void helper_ret_protected(CPUX86State *env, int shift,
             /* NULL ss is allowed in long mode if cpl != 3 */
             /* XXX: test CS64? */
             if ((env->hflags & HF_LMA_MASK) && rpl != 3) {
+                check_ret_eip(env, new_eip, e1, e2, retaddr);
                 cpu_x86_load_seg_cache(env, R_SS, new_ss,
                                        0, 0xffffffff,
                                        DESC_G_MASK | DESC_B_MASK | DESC_P_MASK |
@@ -2193,6 +2219,7 @@ static inline void helper_ret_protected(CPUX86State *env, int shift,
             if (!(ss_e2 & DESC_P_MASK)) {
                 raise_exception_err_ra(env, EXCP0B_NOSEG, new_ss & 0xfffc, retaddr);
             }
+            check_ret_eip(env, new_eip, e1, e2, retaddr);
             cpu_x86_load_seg_cache(env, R_SS, new_ss,
                                    get_seg_base(ss_e1, ss_e2),
                                    get_seg_limit(ss_e1, ss_e2),

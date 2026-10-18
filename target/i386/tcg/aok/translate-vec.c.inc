@@ -2135,10 +2135,20 @@ static void vex_frame(Ctx *c, const Insn *d, const struct vex_entry *e,
 }
 
 /*
- * A VEX insn, @lead (C4 or C5) and the legacy prefixes before it read. In
- * 64-bit code; 32-bit code's (where C4 and C5 are also les and lds) and
- * anything the table does not have are TCG's. An encoding the hardware
- * rejects is #UD here, as iSH-AOK's table says.
+ * A VEX insn, @lead (C4 or C5) and the legacy prefixes before it read (in
+ * 32-bit code the caller has seen the byte after it start with two set bits:
+ * otherwise C4 and C5 are les and lds). Anything the table does not have is
+ * TCG's. An encoding the hardware rejects is #UD here, as iSH-AOK's table
+ * says.
+ *
+ * 32-bit code has eight vector registers. As iSH-AOK's gen_vex32 has it (an
+ * AMD Ryzen and SDE): VEX.R, X and B are no register bits there, and vvvv's
+ * bit 3 is none either, but it still counts where vvvv must be 1111b
+ * (vvvv_hi); W is ignored where it would make a GPR 64 bits (VMOVD, VCVT*SI*,
+ * VPEXTRD, VPINSRD, KMOVD, BMI's); VZEROUPPER and VZEROALL clear eight
+ * registers.
+ * These gadgets take it rather than TCG for AVX-512's sake: TCG's VEX clears
+ * a destination only to bit 255, and the EVEX code beside it reads to 511.
  */
 static int vex(Ctx *c, Insn *d, const uint8_t *code, unsigned lead)
 {
@@ -2146,11 +2156,8 @@ static int vex(Ctx *c, Insn *d, const uint8_t *code, unsigned lead)
     struct vex_insn v = { 0 };
     struct vex_plan p;
     unsigned b1, b2;
-    bool r, x, b;
+    bool r, x, b, c32 = !c->c64;
 
-    if (!c->c64) {
-        return UNKNOWN;
-    }
     b1 = f8(d);
     if (lead == 0xc5) {
         r = !(b1 & 0x80);
@@ -2178,11 +2185,24 @@ static int vex(Ctx *c, Insn *d, const uint8_t *code, unsigned lead)
         v.map < 1 || v.map > 3) {
         return c->avx ? vex_ud(c, d, code) : UNKNOWN;
     }
+    if (c32) {
+        r = x = b = false;
+        v.vvvv_hi = v.vvvv > 7;
+        v.vvvv &= 7;
+        if ((v.map == 1 && v.pp == 1 && (v.op == 0x6e || v.op == 0x7e)) ||
+            (v.map == 1 && (v.op == 0x2a || v.op == 0x2c || v.op == 0x2d)) ||
+            (v.map == 3 && (v.op == 0x16 || v.op == 0x22)) ||
+            (v.map == 1 && v.pp == 3 && (v.op == 0x92 || v.op == 0x93)) ||
+            (v.map == 2 && v.op >= 0xf2 && v.op <= 0xf7 && v.op != 0xf4) ||
+            (v.map == 3 && v.op == 0xf0)) {
+            v.w = 0;                    /* (and BMI's: ANDN to SHRX, RORX) */
+        }
+    }
     if (v.map == 1 && v.op == 0x77) {           /* vzeroupper, vzeroall */
         if (!c->avx) {
             return UNKNOWN;
         }
-        v.rm = 16;
+        v.rm = c32 ? 8 : 16;
         if (!vex_plan(&v, &p, false) || p.type == VP_UD) {
             return vex_ud(c, d, code);
         }
@@ -2197,7 +2217,8 @@ static int vex(Ctx *c, Insn *d, const uint8_t *code, unsigned lead)
         if (!c->avx) {
             return UNKNOWN;
         }
-        vex_to_evex(r, x, b, v.map, v.w, v.vvvv, v.l, v.pp, &p0, &p1, &p2);
+        vex_to_evex(r, x, b, v.map, v.w, v.vvvv | (v.vvvv_hi ? 8 : 0), v.l, v.pp,
+                    &p0, &p1, &p2);
         return evex_at(c, d, code, p0, p1, p2, v.op, EVF_VEX);
     }
     d->rr = r ? 8 : 0;
@@ -2224,6 +2245,12 @@ static int vex(Ctx *c, Insn *d, const uint8_t *code, unsigned lead)
     }
     if (vex_has_imm8(v.map, v.op)) {
         v.imm = f8(d);
+    }
+    if (d->bad) {
+        return UNKNOWN;
+    }
+    if (c32 && e->kind == VXK_BLENDV && (v.imm >> 4) >= 8) {
+        return vex_ud(c, d, code);      /* imm8's register: xmm8-15 are none in 32-bit code */
     }
     FIN();
     vex_plan(&v, &p, false);
@@ -2492,6 +2519,32 @@ static int evex_at(Ctx *c, Insn *d, const uint8_t *code, unsigned p0,
     if (v.map == 0 || v.map > 3 || (p0 & 0x08) || !(p1 & 4)) {
         return vex_ud(c, d, code);      /* map 0, 4-7, or a reserved bit */
     }
+    if (!c->c64) {
+        /*
+         * 32-bit code, as iSH-AOK's gen_evex32_at has it (SDE): eight
+         * registers, so EVEX.R, X, B and R' are no register bits and nor is
+         * vvvv's bit 3, which still counts where vvvv must be 1111b
+         * (vvvv_hi); V' set is #UD. W is ignored where it would make a GPR
+         * 64 bits: VCVT(U)SI2SS/SD, VCVT(T)SS/SD2(U)SI, VMOVD/Q, VPEXTRD/Q,
+         * VPINSRD/Q, VPBROADCASTD/Q from a GPR (the SDM's N.E.); VPINSRB/W
+         * are WIG.
+         */
+        if (v2) {
+            return vex_ud(c, d, code);
+        }
+        r = x = b = r2 = false;
+        v.vvvv_hi = ((~p1 >> 3) & 15) > 7;
+        v.vvvv = (~p1 >> 3) & 7;
+        if ((v.map == 1 && (v.pp == 2 || v.pp == 3) &&
+             (v.op == 0x2a || v.op == 0x2c || v.op == 0x2d || v.op == 0x78 ||
+              v.op == 0x79 || v.op == 0x7b)) ||
+            (v.map == 1 && v.pp == 1 && (v.op == 0x6e || v.op == 0x7e)) ||
+            (v.map == 3 && v.pp == 1 && (v.op == 0x16 || v.op == 0x22 || v.op == 0x20)) ||
+            (v.map == 1 && v.pp == 1 && v.op == 0xc4) ||
+            (v.map == 2 && v.pp == 1 && v.op == 0x7c)) {
+            v.w = 0;
+        }
+    }
     d->rr = (r ? 8 : 0) | (r2 ? 16 : 0);
     d->rx = x ? 8 : 0;
     d->rb = b ? 8 : 0;
@@ -2571,6 +2624,9 @@ static int evex_at(Ctx *c, Insn *d, const uint8_t *code, unsigned p0,
         if (word < 0) {
             return vex_ud(c, d, code);
         }
+        if (!c->c64) {
+            word |= 1l << 22;           /* each element's address wraps at 4 GB */
+        }
         FIN();
         base.m.index = -1;      /* the address without the index: the vector register's */
         vmem(c, &base, e->kind == EVK_GATHER ? vgather_tab : vscatter_tab, true, word,
@@ -2626,12 +2682,16 @@ static int evex_at(Ctx *c, Insn *d, const uint8_t *code, unsigned p0,
     return NEXT;
 }
 
-/* An EVEX insn (62 read), in 64-bit code with AVX-512 enabled; TCG's otherwise, which raises #UD. */
+/*
+ * An EVEX insn (62 read), with AVX-512 enabled: in 64-bit code, or in 32-bit
+ * code where the byte after 62 starts with two set bits (the caller's; bound
+ * otherwise). TCG's otherwise, which raises #UD.
+ */
 static int evex(Ctx *c, Insn *d, const uint8_t *code)
 {
     unsigned p0, p1, p2, op;
 
-    if (!c->c64 || !c->avx512) {
+    if (!c->avx512) {
         return UNKNOWN;
     }
     p0 = f8(d);
@@ -2653,7 +2713,7 @@ static int sse_evex(Ctx *c, Insn *d, const uint8_t *code, unsigned esc)
 {
     unsigned map = esc == 0x38 ? 2 : 3, op, vvvv = 0, p0, p1, p2;
 
-    if (!c->c64 || !c->sse || d->end - d->p < 2) {
+    if (!c->sse || d->end - d->p < 2) {
         return UNKNOWN;
     }
     op = d->p[0];
@@ -2672,14 +2732,18 @@ static int sse_evex(Ctx *c, Insn *d, const uint8_t *code, unsigned esc)
 }
 
 /*
- * Whether the 64-bit insn at @p is one only these gadgets compute: EVEX's,
- * the opmask insns, and the VEX and legacy forms of the EVEX table's ops
- * (TCG has neither AVX-512 nor GFNI nor AVX-VNNI, and would raise #UD).
- * Then a TB that is TCG's otherwise (one being stepped) is this
- * translator's, of that insn alone (x86_aok_translate_code).
+ * Whether the insn at @p, in 64-bit code or (@c64 false) flat 32-bit code,
+ * is one only these gadgets compute: EVEX's, the opmask insns, and the VEX
+ * and legacy forms of the EVEX table's ops (TCG has neither AVX-512 nor GFNI
+ * nor AVX-VNNI, and would raise #UD): 1, or 0; -1 if what tells runs past
+ * @end (the page's: ask again with the next page's bytes after). Then a TB
+ * that is TCG's otherwise (one being stepped) is this translator's, of that
+ * insn alone (x86_aok_translate_code). In 32-bit code 40-4F are no REX, and
+ * C4, C5 and 62 are VEX and EVEX only before a byte that starts with two set
+ * bits.
  */
-static bool x86_aok_only(const uint8_t *p, const uint8_t *end, bool avx,
-                         bool avx512)
+static int x86_aok_only(const uint8_t *p, const uint8_t *end, bool c64,
+                        bool avx, bool avx512)
 {
     struct vex_insn v = { 0 };
     const struct vex_entry *e;
@@ -2687,8 +2751,8 @@ static bool x86_aok_only(const uint8_t *p, const uint8_t *end, bool avx,
     unsigned b;
 
     for (;;) {
-        if (end - p < 6) {
-            return false;
+        if (p >= end) {
+            return -1;
         }
         b = *p++;
         if (b == 0x66) {
@@ -2699,8 +2763,18 @@ static bool x86_aok_only(const uint8_t *p, const uint8_t *end, bool avx,
             break;
         }
     }
-    if ((b & 0xf0) == 0x40) {
+    if (c64 && (b & 0xf0) == 0x40) {
+        if (p >= end) {
+            return -1;
+        }
         b = *p++;
+    }
+    if ((b == 0x62 || b == 0xc4 || b == 0xc5 || b == 0x0f) &&
+        end - p < (b == 0xc4 ? 4 : b == 0xc5 ? 3 : 2)) {
+        return -1;                      /* the bytes looked at below */
+    }
+    if (!c64 && (b == 0x62 || b == 0xc4 || b == 0xc5) && (p[0] & 0xc0) != 0xc0) {
+        return 0;                       /* bound, les, lds */
     }
     switch (b) {
     case 0x62:
@@ -2730,7 +2804,7 @@ static bool x86_aok_only(const uint8_t *p, const uint8_t *end, bool avx,
         return o16 && (p[0] == 0x38 || p[0] == 0x3a) &&
                sse_via_evex(p[0] == 0x38 ? 2 : 3, p[1]);
     default:
-        return false;
+        return 0;
     }
 }
 
@@ -2744,10 +2818,16 @@ static bool x86_aok_only(const uint8_t *p, const uint8_t *end, bool avx,
  */
 bool x86_aok_tcg_stop(uint32_t flags, const uint8_t *p, const uint8_t *end)
 {
-    return aok_enabled && (flags & HF_CS64_MASK) && !x86_no64 &&
-           x86_aok_only(p, end, !(flags & (HF_EM_MASK | HF_TS_MASK)) &&
+    bool c64 = flags & HF_CS64_MASK;
+
+    /*
+     * (-1, an insn that runs into the next page: TCG ends its TB before
+     * that anyway, and this translator has the TB that starts with it.)
+     */
+    return aok_enabled && (c64 ? !x86_no64 : x86_aok_flat32(flags) && !x86_no32) &&
+           x86_aok_only(p, end, c64, !(flags & (HF_EM_MASK | HF_TS_MASK)) &&
                         (flags & HF_OSFXSR_MASK) && (flags & HF_AVX_EN_MASK),
-                        flags & HF_AVX512_EN_MASK);
+                        flags & HF_AVX512_EN_MASK) == 1;
 }
 
 /* The end of such a TB: at the next insn, the main loop's. */

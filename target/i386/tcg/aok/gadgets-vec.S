@@ -585,8 +585,10 @@ slow_\name:
  * gadget's address, without the index: that is the vector register), the
  * word's size the element's. EVEX word: [the data register (0-4) | the
  * index register (5-9) | scale (10-11) | qword data (12) | qword indices
- * (13) | VL (16-17) | opmask (18-20) | scatter (21) | 32-bit code (22: each
- * element's address wraps at 4 GB)]; n elements: the VL's, of the wider of
+ * (13) | VL (16-17) | opmask (18-20) | scatter (21) | 32-bit addresses (22:
+ * each element's wraps at 4 GB) | a segment's base after that wrap (23; its
+ * offset in bits 32-47: 67 with fs or gs in 64-bit code)]; n elements: the
+ * VL's, of the wider of
  * data and index. Restartable as x86's: each step takes the lowest element
  * the opmask still enables, moves it and clears its bit, so a fault leaves
  * the elements below it done and their bits clear, the rest as they were.
@@ -712,7 +714,11 @@ loop_\name:
     evg_index
     add _addr, x1, x13
     tbz w8, #22, 1f
-    mov w7, w7                           /* 32-bit code: _addr (x7) wraps */
+    mov w7, w7                           /* 32-bit addresses: _addr (x7) wraps */
+    tbz w8, #23, 1f
+    ubfx x9, x8, #32, #16
+    ldr x9, [_cpu, x9]
+    add _addr, _addr, x9                 /* and then fs's or gs's base */
 1:
     .if \scatter
     evg_get

@@ -3095,10 +3095,12 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         }
     }
 
-    if (decode.e.special == X86_SPECIAL_MMX &&
-        !(s->prefix & (PREFIX_REPZ | PREFIX_REPNZ | PREFIX_DATA))) {
-        gen_helper_enter_mmx(tcg_env);
-    }
+    /*
+     * The MMX form: TOP 0 and every tag valid, once the insn has done its
+     * memory access -- one that faults changes neither (below).
+     */
+    bool enter_mmx = decode.e.special == X86_SPECIAL_MMX &&
+                     !(s->prefix & (PREFIX_REPZ | PREFIX_REPNZ | PREFIX_DATA));
 
     if (decode.e.special != X86_SPECIAL_NoLoadEA &&
         (decode.op[0].has_ea || decode.op[1].has_ea || decode.op[2].has_ea)) {
@@ -3118,6 +3120,9 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         gen_load(s, &decode, 2, s->T1);
         decode.e.gen(s, &decode);
         gen_writeback(s, &decode, 0, s->T0);
+    }
+    if (enter_mmx) {
+        gen_helper_enter_mmx(tcg_env);
     }
 
     /*

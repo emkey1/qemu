@@ -2610,13 +2610,25 @@ static int jcc(Ctx *c, unsigned cc, int64_t rel)
 
 /*
  * Whether the CPU may offer AVX-512 (target/i386/cpu.c): only TCG with these
- * gadgets computes it, so not with QEMU_AOK=0, QEMU_AOK_X86_NOVEC or
- * QEMU_AOK_X86_NO64, nor with QEMU_AOK_X86_NOAVX512.
+ * gadgets computes it, in 64-bit code and flat 32-bit code alike (a 32-bit
+ * Linux's CRC code uses it), so not with QEMU_AOK=0, QEMU_AOK_X86_NOVEC,
+ * QEMU_AOK_X86_NO64 or QEMU_AOK_X86_NO32, nor with QEMU_AOK_X86_NOAVX512.
  */
 bool x86_aok_avx512(void)
 {
-    return aok_enabled && !x86_novec && !x86_no64 &&
+    return aok_enabled && !x86_novec && !x86_no64 && !x86_no32 &&
            !getenv("QEMU_AOK_X86_NOAVX512");
+}
+
+/*
+ * 32-bit code this translator takes: protected mode with a 32-bit stack and
+ * every segment but fs and gs at zero (a TB's cs_base too: the caller's), so
+ * that an address is an offset and eip is the pc.
+ */
+static bool x86_aok_flat32(uint32_t flags)
+{
+    return (flags & (HF_PE_MASK | HF_CS32_MASK | HF_SS32_MASK | HF_ADDSEG_MASK |
+                     HF_VM_MASK)) == (HF_PE_MASK | HF_CS32_MASK | HF_SS32_MASK);
 }
 
 /* Opcodes this translator is told to leave to TCG: QEMU_AOK_X86_SKIP. */
@@ -3968,10 +3980,20 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
     if (b == 0x0f) {
         return insn_0f(c, d, code, sz);
     }
-    if (c->c64 && (b == 0xc4 || b == 0xc5)) {
+    /*
+     * VEX and EVEX; in 32-bit code only where the next byte starts with two
+     * set bits: otherwise they are les, lds and bound (TCG's). With that
+     * byte in the next page, the insn runs into it (translate() then reads
+     * on there).
+     */
+    if (!c->c64 && (b == 0xc4 || b == 0xc5 || b == 0x62) && d->p >= d->end) {
+        d->bad = true;
+        return UNKNOWN;
+    }
+    if ((b == 0xc4 || b == 0xc5) && (c->c64 || (d->p[0] & 0xc0) == 0xc0)) {
         return vex(c, d, code, b);
     }
-    if (c->c64 && b == 0x62) {
+    if (b == 0x62 && (c->c64 || (d->p[0] & 0xc0) == 0xc0)) {
         return evex(c, d, code);
     }
     /* rep ret, and bnd before a branch, are that ret and that branch. */
@@ -4696,15 +4718,36 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
          * not got the insn (AVX-512). Then it is this translator's, with
          * the main loop's after it, or the step's #DB.
          */
-        one = (flags & HF_CS64_MASK) && !x86_no64 && !x86_noone &&
-              x86_aok_only(host_pc, (const uint8_t *)host_pc +
-                           (TARGET_PAGE_SIZE - (pc & ~TARGET_PAGE_MASK)),
-                           !(flags & (HF_EM_MASK | HF_TS_MASK)) &&
-                           (flags & HF_OSFXSR_MASK) && (flags & HF_AVX_EN_MASK),
-                           flags & HF_AVX512_EN_MASK);
-        if (!one) {
+        bool c64 = flags & HF_CS64_MASK;
+        bool avx = !(flags & (HF_EM_MASK | HF_TS_MASK)) &&
+                   (flags & HF_OSFXSR_MASK) && (flags & HF_AVX_EN_MASK);
+        unsigned rem = TARGET_PAGE_SIZE - (pc & ~TARGET_PAGE_MASK);
+        int only;
+
+        if ((c64 ? x86_no64 : !x86_aok_flat32(flags) || tb->cs_base || x86_no32) ||
+            x86_noone) {
             return 0;
         }
+        only = x86_aok_only(host_pc, (const uint8_t *)host_pc + rem, c64, avx,
+                            flags & HF_AVX512_EN_MASK);
+        if (only < 0 && rem < 16) {
+            /* It runs into the next page: ask again with that page's bytes. */
+            const uint8_t *next;
+            uint8_t buf[32];
+
+            c->g.tb = tb;
+            next = aok_gen_next_page(&c->g, cs, pc + rem);
+            if (next) {
+                memcpy(buf, host_pc, rem);
+                memcpy(buf + rem, next, 16);
+                only = x86_aok_only(buf, buf + rem + 16, c64, avx,
+                                    flags & HF_AVX512_EN_MASK);
+            }
+        }
+        if (only != 1) {
+            return 0;
+        }
+        one = true;
         *max_insns = 1;
     }
     /*
@@ -4713,10 +4756,7 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
      * is an offset, eip is the pc, and what the two differ in is sizes.
      */
     c->c64 = flags & HF_CS64_MASK;
-    if (!c->c64 &&
-        ((flags & (HF_PE_MASK | HF_CS32_MASK | HF_SS32_MASK | HF_ADDSEG_MASK))
-         != (HF_PE_MASK | HF_CS32_MASK | HF_SS32_MASK) || tb->cs_base ||
-         x86_no32)) {
+    if (!c->c64 && (!x86_aok_flat32(flags) || tb->cs_base || x86_no32)) {
         return 0;
     }
     if (c->c64 && x86_no64) {

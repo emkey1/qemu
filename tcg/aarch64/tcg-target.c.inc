@@ -552,7 +552,6 @@ typedef enum {
 
     /* Logical shifted register instructions (with a shift).  */
     Iaddsub_realshift_AND_LSR  = Ilogic_shift_AND | (1 << 22),
-    Iaddsub_realshift_EOR_LSR  = Ilogic_shift_EOR | (1 << 22),
 
     /* AdvSIMD copy */
     Isimd_copy_DUP     = 0x0e000400,
@@ -1972,11 +1971,9 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP1, TCG_AREG0,
                      tlb_mask_table_ofs(s, mem_index), 1, 0);
 
-        /* Extract the TLB index from the address, as tlb_index() does. */
-        tcg_out_insn(s, addsub_realshift, EOR_LSR, TCG_TYPE_I64,
-                     TCG_REG_TMP2, addr_reg, addr_reg, CPU_TLB_INDEX_FOLD);
+        /* Extract the TLB index from the address into X0.  */
         tcg_out_insn(s, addsub_realshift, AND_LSR, TCG_TYPE_I64,
-                     TCG_REG_TMP0, TCG_REG_TMP0, TCG_REG_TMP2,
+                     TCG_REG_TMP0, TCG_REG_TMP0, addr_reg,
                      TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
 
         /* Add the tlb_table pointer, forming the CPUTLBEntry address. */

@@ -1746,13 +1746,10 @@ static TCTIGadget2 *const tcti_qemu_st_slow[2][2][MO_64 + 1] = {
 
 /*
  * Whether a TLB fast-path gadget can serve this access. The gadgets hard-code
- * 4K pages and 32-byte TLB entries in their index and comparison arithmetic,
- * and tlb_index()'s fold.
+ * 4K pages and 32-byte TLB entries in their index and comparison arithmetic.
  */
 static bool tcti_has_fast_path(TCGContext *s, unsigned mmu_idx)
 {
-    QEMU_BUILD_BUG_ON(CPU_TLB_INDEX_FOLD != 8);
-
     if (mmu_idx >= TCTI_TLB_FAST_MMU_INDICES ||
         TARGET_PAGE_BITS != 12 || CPU_TLB_ENTRY_BITS != 5) {
         return false;

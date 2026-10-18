@@ -4112,6 +4112,9 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
     case 0x70 ... 0x7f:
         imm = fimm(d, 1);
         FIN();
+        if (d->o16) {
+            return UNKNOWN;     /* a 16-bit ip (as jcc rel16's, jmp's and call's) */
+        }
         return jcc(c, b & 15, imm);
 
     case 0x80:

@@ -64,20 +64,26 @@ static void *access_ptr(X86Access *ac, vaddr addr, unsigned len)
         return NULL;
     }
 
+    /*
+     * (size and size1 are uint16_t: "size1 - len" would be unsigned, and an
+     * access that starts within len bytes of the first page's end would pass
+     * a check written that way and run off the first page's host memory.)
+     */
 #ifdef CONFIG_USER_ONLY
-    assert(offset <= ac->size1 - len);
+    assert(len <= ac->size1 && offset <= ac->size1 - len);
     return ac->haddr1 + offset;
 #else
-    if (likely(offset <= ac->size1 - len)) {
+    if (likely(len <= ac->size1 && offset <= ac->size1 - len)) {
         return ac->haddr1 + offset;
     }
-    assert(offset <= ac->size - len);
+    assert(len <= ac->size && offset <= ac->size - len);
     /*
      * If the address is not naturally aligned, it might span both pages.
      * Only return ac->haddr2 if the area is entirely within the second page,
-     * otherwise fall back to slow accesses.
+     * otherwise fall back to slow accesses, as for a second page that has
+     * no host address of its own (probe_access wants the slow path there).
      */
-    if (likely(offset >= ac->size1)) {
+    if (likely(offset >= ac->size1) && ac->haddr2) {
         return ac->haddr2 + (offset - ac->size1);
     }
     return NULL;

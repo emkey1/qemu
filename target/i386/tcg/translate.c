@@ -480,6 +480,27 @@ static inline void gen_op_jmp_v(DisasContext *s, TCGv dest)
     s->pc_save = -1;
 }
 
+/*
+ * In 64-bit code a near branch to a non-canonical address is #GP at the
+ * branch, before it pushes or pops: checked before either. 48 bits are
+ * tested inline, and the helper decides an address past them (5-level
+ * paging has 57).
+ */
+static void gen_check_canonical(DisasContext *s, TCGv dest)
+{
+#ifdef TARGET_X86_64
+    if (CODE64(s)) {
+        TCGLabel *ok = gen_new_label();
+        TCGv t = tcg_temp_new();
+
+        tcg_gen_sextract_tl(t, dest, 0, 48);
+        tcg_gen_brcond_tl(TCG_COND_EQ, t, dest, ok);
+        gen_helper_check_canonical(tcg_env, dest);
+        gen_set_label(ok);
+    }
+#endif
+}
+
 static inline void gen_op_add_reg(DisasContext *s, MemOp size, int reg, TCGv val)
 {
     /* Using cpu_regs[reg] does not work for xH registers.  */
@@ -2212,6 +2233,27 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
     mod = (modrm >> 6) & 3;
     rm = modrm & 7;
     op = ((b & 7) << 3) | ((modrm >> 3) & 7);
+
+    /*
+     * A waiting x87 insn first takes the #MF of an unmasked exception that an
+     * earlier one left pending, as FWAIT does; the FN forms do not wait:
+     * FNSTENV, FNSTCW, FNSAVE, FNSTSW, and FNCLEX, FNINIT and the 8087's
+     * FNENI, FNDISI, FNSETPM.
+     */
+    if (mod != 3 ? !(op == 0x0e || op == 0x0f || op == 0x2e || op == 0x2f)
+                 : !(op == 0x1c || (op == 0x3c && rm == 0))) {
+        TCGLabel *nothing_pending = gen_new_label();
+        TCGv_i32 fpus = tcg_temp_new_i32();
+
+        tcg_gen_ld16u_i32(fpus, tcg_env, offsetof(CPUX86State, fpus));
+        tcg_gen_andi_i32(fpus, fpus, 1 << 7); /* FPUS_SE */
+        tcg_gen_brcondi_i32(TCG_COND_EQ, fpus, 0, nothing_pending);
+        /* needs to be treated as I/O because of ferr_irq, as FWAIT is */
+        translator_io_start(&s->base);
+        gen_helper_fwait(tcg_env);
+        gen_set_label(nothing_pending);
+    }
+
     if (mod != 3) {
         /* memory op */
         TCGv ea = gen_lea_modrm_1(s, decode->mem, false);

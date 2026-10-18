@@ -130,6 +130,28 @@ int get_pg_mode(CPUX86State *env)
     return pg_mode;
 }
 
+#ifdef TARGET_X86_64
+/* An address the paging mode can map: 48 bits sign-extended, or 57. */
+static bool is_canonical(CPUX86State *env, target_ulong addr)
+{
+    int shift = (get_pg_mode(env) & PG_MODE_LA57) ? 56 : 47;
+    int64_t sext = (int64_t)addr >> shift;
+
+    return sext == 0 || sext == -1;
+}
+
+/*
+ * A near JMP, CALL or RET to a non-canonical address in 64-bit code is #GP
+ * at the branch, before its push or pop.
+ */
+void helper_check_canonical(CPUX86State *env, target_ulong addr)
+{
+    if (!is_canonical(env, addr)) {
+        raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
+    }
+}
+#endif
+
 static int x86_mmu_index_kernel_pl(CPUX86State *env, unsigned pl)
 {
     int mmu_index_32 = (env->hflags & HF_LMA_MASK) ? 0 : 1;
@@ -647,6 +669,20 @@ static inline unsigned int get_sp_mask(unsigned int e2)
     } else {
         return 0xffff;
     }
+}
+
+/*
+ * The stack's address size for a far CALL, RET or IRET: in 64-bit code it is
+ * 64 bits whatever the operand size, and SS's B bit counts only outside it.
+ */
+static inline target_ulong get_far_sp_mask(CPUX86State *env)
+{
+#ifdef TARGET_X86_64
+    if (env->hflags & HF_CS64_MASK) {
+        return -1;
+    }
+#endif
+    return get_sp_mask(env->segs[R_SS].flags);
 }
 
 static int exception_is_fault(int intno)
@@ -1726,7 +1762,7 @@ void helper_lcall_protected(CPUX86State *env, int new_cs, target_ulong new_eip,
 #endif
         {
             sa.sp = env->regs[R_ESP];
-            sa.sp_mask = get_sp_mask(env->segs[R_SS].flags);
+            sa.sp_mask = get_far_sp_mask(env);
             sa.ss_base = env->segs[R_SS].base;
             if (shift) {
                 pushl(&sa, env->segs[R_CS].selector);
@@ -2033,6 +2069,27 @@ static inline void validate_seg(CPUX86State *env, X86Seg seg_reg, int cpl)
 }
 
 /* protected mode iret */
+/*
+ * Where a far RET or IRET goes, checked before anything changes: a 64-bit
+ * code segment wants a canonical RIP, any other one an EIP within its limit
+ * (a 64-bit RIP past a 32-bit segment's 4 GiB is #GP at the IRET).
+ */
+static void check_ret_eip(CPUX86State *env, target_ulong new_eip,
+                          uint32_t e1, uint32_t e2, uintptr_t retaddr)
+{
+#ifdef TARGET_X86_64
+    if ((env->hflags & HF_LMA_MASK) && (e2 & DESC_L_MASK)) {
+        if (!is_canonical(env, new_eip)) {
+            raise_exception_err_ra(env, EXCP0D_GPF, 0, retaddr);
+        }
+        return;
+    }
+#endif
+    if (new_eip > get_seg_limit(e1, e2)) {
+        raise_exception_err_ra(env, EXCP0D_GPF, 0, retaddr);
+    }
+}
+
 static inline void helper_ret_protected(CPUX86State *env, int shift,
                                         int is_iret, int addend,
                                         uintptr_t retaddr)
@@ -2050,14 +2107,7 @@ static inline void helper_ret_protected(CPUX86State *env, int shift,
     sa.ra = retaddr;
     sa.mmu_index = x86_mmu_index_pl(env, cpl);
 
-#ifdef TARGET_X86_64
-    if (shift == 2) {
-        sa.sp_mask = -1;
-    } else
-#endif
-    {
-        sa.sp_mask = get_sp_mask(env->segs[R_SS].flags);
-    }
+    sa.sp_mask = get_far_sp_mask(env);
     sa.sp = env->regs[R_ESP];
     sa.ss_base = env->segs[R_SS].base;
     new_eflags = 0; /* avoid warning */
@@ -2126,6 +2176,7 @@ static inline void helper_ret_protected(CPUX86State *env, int shift,
     if (rpl == cpl && (!(env->hflags & HF_CS64_MASK) ||
                        ((env->hflags & HF_CS64_MASK) && !is_iret))) {
         /* return to same privilege level */
+        check_ret_eip(env, new_eip, e1, e2, retaddr);
         cpu_x86_load_seg_cache(env, R_CS, new_cs,
                        get_seg_base(e1, e2),
                        get_seg_limit(e1, e2),
@@ -2156,6 +2207,7 @@ static inline void helper_ret_protected(CPUX86State *env, int shift,
             /* NULL ss is allowed in long mode if cpl != 3 */
             /* XXX: test CS64? */
             if ((env->hflags & HF_LMA_MASK) && rpl != 3) {
+                check_ret_eip(env, new_eip, e1, e2, retaddr);
                 cpu_x86_load_seg_cache(env, R_SS, new_ss,
                                        0, 0xffffffff,
                                        DESC_G_MASK | DESC_B_MASK | DESC_P_MASK |
@@ -2186,6 +2238,7 @@ static inline void helper_ret_protected(CPUX86State *env, int shift,
             if (!(ss_e2 & DESC_P_MASK)) {
                 raise_exception_err_ra(env, EXCP0B_NOSEG, new_ss & 0xfffc, retaddr);
             }
+            check_ret_eip(env, new_eip, e1, e2, retaddr);
             cpu_x86_load_seg_cache(env, R_SS, new_ss,
                                    get_seg_base(ss_e1, ss_e2),
                                    get_seg_limit(ss_e1, ss_e2),
@@ -2459,7 +2512,11 @@ target_ulong helper_lar(CPUX86State *env, target_ulong selector1)
         }
     }
     CC_SRC |= CC_Z;
-    return e2 & 0x00f0ff00;
+    /*
+     * Bits 8-23 of the descriptor's second word: the SDM leaves the limit's
+     * bits 19:16 undefined, AMD's manual and its processors return them.
+     */
+    return e2 & 0x00ffff00;
 }
 
 void helper_verr(CPUX86State *env, target_ulong selector1)

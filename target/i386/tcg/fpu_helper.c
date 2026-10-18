@@ -798,9 +798,33 @@ void update_fp_status(CPUX86State *env)
     set_floatx80_rounding_precision(rnd_prec, &env->fp_status);
 }
 
+/*
+ * ES, and B with it, as the hardware recomputes them when the control or
+ * the status word is loaded or the exceptions are masked: whether an
+ * exception flag is set that the control word does not mask.
+ */
+static void fpu_update_es(CPUX86State *env)
+{
+    if (env->fpus & ~env->fpuc & 0x3f) {
+        env->fpus |= FPUS_SE | FPUS_B;
+    } else {
+        env->fpus &= ~(FPUS_SE | FPUS_B);
+#if !defined(CONFIG_USER_ONLY)
+        cpu_clear_ignne();
+#endif
+    }
+}
+
+/* A control word loaded by the guest: the bits that exist, bit 6 reads 1. */
+static void fpu_load_fpuc(CPUX86State *env, uint32_t val)
+{
+    cpu_set_fpuc(env, (val & 0x1f3f) | 0x40);
+}
+
 void helper_fldcw(CPUX86State *env, uint32_t val)
 {
-    cpu_set_fpuc(env, val);
+    fpu_load_fpuc(env, val);
+    fpu_update_es(env);
 }
 
 void helper_fclex(CPUX86State *env)
@@ -2482,14 +2506,14 @@ static void do_fstenv(X86Access *ac, target_ulong ptr, int data32)
         }
     }
     if (data32) {
-        /* 32 bit */
-        access_stl(ac, ptr, env->fpuc);
-        access_stl(ac, ptr + 4, fpus);
-        access_stl(ac, ptr + 8, fptag);
+        /* 32 bit: the words' high halves, and the data selector's, all ones */
+        access_stl(ac, ptr, env->fpuc | 0xffff0000);
+        access_stl(ac, ptr + 4, fpus | 0xffff0000);
+        access_stl(ac, ptr + 8, fptag | 0xffff0000);
         access_stl(ac, ptr + 12, env->fpip); /* fpip */
-        access_stl(ac, ptr + 16, env->fpcs); /* fpcs */
+        access_stl(ac, ptr + 16, env->fpcs | (env->fpop & 0x7ff) << 16); /* fpcs, fop */
         access_stl(ac, ptr + 20, env->fpdp); /* fpoo */
-        access_stl(ac, ptr + 24, env->fpds); /* fpos */
+        access_stl(ac, ptr + 24, (env->fpds & 0xffff) | 0xffff0000); /* fpos */
     } else {
         /* 16 bit */
         access_stw(ac, ptr, env->fpuc);
@@ -2508,6 +2532,9 @@ void helper_fstenv(CPUX86State *env, target_ulong ptr, int data32)
 
     access_prepare(&ac, env, ptr, 14 << data32, MMU_DATA_STORE, GETPC());
     do_fstenv(&ac, ptr, data32);
+    /* and then every exception is masked, ES and B clear with them */
+    cpu_set_fpuc(env, env->fpuc | 0x3f);
+    fpu_update_es(env);
 }
 
 static void cpu_set_fpus(CPUX86State *env, uint16_t fpus)
@@ -2531,14 +2558,30 @@ static void do_fldenv(X86Access *ac, target_ulong ptr, int data32)
     int i, fpus, fptag;
     CPUX86State *env = ac->env;
 
-    cpu_set_fpuc(env, access_ldw(ac, ptr));
+    fpu_load_fpuc(env, access_ldw(ac, ptr));
     fpus = access_ldw(ac, ptr + (2 << data32));
     fptag = access_ldw(ac, ptr + (4 << data32));
 
     cpu_set_fpus(env, fpus);
+    fpu_update_es(env);
     for (i = 0; i < 8; i++) {
         env->fptags[i] = ((fptag & 3) == 3);
         fptag >>= 2;
+    }
+    /* and the instruction and data pointers and the opcode, as stored */
+    if (data32) {
+        uint32_t cs_op = access_ldl(ac, ptr + 16);
+
+        env->fpip = access_ldl(ac, ptr + 12);
+        env->fpcs = cs_op;
+        env->fpop = (cs_op >> 16) & 0x7ff;
+        env->fpdp = access_ldl(ac, ptr + 20);
+        env->fpds = access_ldw(ac, ptr + 24);
+    } else {
+        env->fpip = access_ldw(ac, ptr + 6);
+        env->fpcs = access_ldw(ac, ptr + 8);
+        env->fpdp = access_ldw(ac, ptr + 10);
+        env->fpds = access_ldw(ac, ptr + 12);
     }
 }
 
@@ -2546,7 +2589,7 @@ void helper_fldenv(CPUX86State *env, target_ulong ptr, int data32)
 {
     X86Access ac;
 
-    access_prepare(&ac, env, ptr, 14 << data32, MMU_DATA_STORE, GETPC());
+    access_prepare(&ac, env, ptr, 14 << data32, MMU_DATA_LOAD, GETPC());
     do_fldenv(&ac, ptr, data32);
 }
 
@@ -2615,6 +2658,11 @@ static void do_xsave_fpu(X86Access *ac, target_ulong ptr)
     access_stw(ac, ptr + XO(legacy.fcw), env->fpuc);
     access_stw(ac, ptr + XO(legacy.fsw), fpus);
     access_stw(ac, ptr + XO(legacy.ftw), fptag ^ 0xff);
+    /*
+     * The opcode, like the pointers below, as AMD's processors keep them:
+     * only while an exception is pending, zero otherwise.
+     */
+    access_stw(ac, ptr + XO(legacy.fpop), env->fpus & FPUS_SE ? env->fpop : 0);
 
     /* In 32-bit mode this is eip, sel, dp, sel.
        In 64-bit mode this is rip, rdp.
@@ -2627,6 +2675,8 @@ static void do_xsave_fpu(X86Access *ac, target_ulong ptr)
     for (i = 0; i < 8; i++) {
         floatx80 tmp = ST(i);
         do_fstt(ac, addr, tmp);
+        access_stw(ac, addr + 10, 0);   /* a slot's last six bytes are zero */
+        access_stl(ac, addr + 12, 0);
         addr += 16;
     }
 }
@@ -2880,8 +2930,9 @@ static void do_xrstor_fpu(X86Access *ac, target_ulong ptr)
     fpuc = access_ldw(ac, ptr + XO(legacy.fcw));
     fpus = access_ldw(ac, ptr + XO(legacy.fsw));
     fptag = access_ldw(ac, ptr + XO(legacy.ftw));
-    cpu_set_fpuc(env, fpuc);
+    fpu_load_fpuc(env, fpuc);
     cpu_set_fpus(env, fpus);
+    fpu_update_es(env);
 
     fptag ^= 0xff;
     for (i = 0; i < 8; i++) {

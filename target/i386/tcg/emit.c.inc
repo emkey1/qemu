@@ -352,6 +352,14 @@ static void gen_writeback(DisasContext *s, X86DecodedInsn *decode, int opn, TCGv
         }
         break;
     case X86_OP_MMX:
+        /*
+         * An MMX register is a physical x87 register's significand, and a
+         * write to it sets that register's sign and exponent to all ones.
+         */
+        if (!op->has_ea) {
+            tcg_gen_st16_i32(tcg_constant_i32(0xffff), tcg_env,
+                             offsetof(CPUX86State, fpregs[op->n].d.high));
+        }
         break;
     case X86_OP_SSE:
         /*
@@ -1149,8 +1157,15 @@ static void gen_AAA(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_AAD(DisasContext *s, X86DecodedInsn *decode)
 {
+    TCGv prod = tcg_temp_new();
+
+    /* AL + AH * imm is an 8-bit ADD, and the flags are all six of its. */
+    tcg_gen_extract_tl(prod, s->T0, 8, 8);
+    tcg_gen_mul_tl(prod, prod, s->T1);
+    tcg_gen_ext8u_tl(prod, prod);
     gen_helper_aad(s->T0, s->T0, s->T1);
-    prepare_update1_cc(decode, s, CC_OP_LOGICB);
+    tcg_gen_mov_tl(s->T1, prod);
+    prepare_update2_cc(decode, s, CC_OP_ADDB);
 }
 
 static void gen_AAM(DisasContext *s, X86DecodedInsn *decode)
@@ -1400,6 +1415,23 @@ static void gen_BOUND(DisasContext *s, X86DecodedInsn *decode)
 }
 
 /* Non-standard convention - on entry T0 is zero-extended input, T1 is the output.  */
+/*
+ * At 32 bits, a zero source leaves all 64 bits of the destination, without
+ * the zero extension of a 32-bit write, as the hardware does.
+ */
+static void gen_bitscan_writeback(DisasContext *s, X86DecodedInsn *decode)
+{
+#ifdef TARGET_X86_64
+    if (decode->op[0].ot == MO_32) {
+        TCGv reg = cpu_regs[decode->op[0].n];
+
+        tcg_gen_movcond_tl(TCG_COND_EQ, reg, decode->cc_dst,
+                           tcg_constant_tl(0), reg, s->T0);
+        decode->op[0].unit = X86_OP_SKIP;
+    }
+#endif
+}
+
 static void gen_BSF(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[0].ot;
@@ -1416,6 +1448,7 @@ static void gen_BSF(DisasContext *s, X86DecodedInsn *decode)
      * by passing the output as the value to return upon zero.
      */
     tcg_gen_ctz_tl(s->T0, s->T0, s->T1);
+    gen_bitscan_writeback(s, decode);
 }
 
 /* Non-standard convention - on entry T0 is zero-extended input, T1 is the output.  */
@@ -1438,6 +1471,7 @@ static void gen_BSR(DisasContext *s, X86DecodedInsn *decode)
     tcg_gen_xori_tl(s->T1, s->T1, TARGET_LONG_BITS - 1);
     tcg_gen_clz_tl(s->T0, s->T0, s->T1);
     tcg_gen_xori_tl(s->T0, s->T0, TARGET_LONG_BITS - 1);
+    gen_bitscan_writeback(s, decode);
 }
 
 static void gen_BSWAP(DisasContext *s, X86DecodedInsn *decode)
@@ -1594,8 +1628,11 @@ static void gen_CALL(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_CALL_m(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_check_canonical(s, s->T0);
     gen_push_v(s, eip_next_tl(s));
-    gen_JMP_m(s, decode);
+    gen_op_jmp_v(s, s->T0);
+    gen_bnd_jmp(s);
+    s->base.is_jmp = DISAS_JUMP;
 }
 
 static void gen_CALLF(DisasContext *s, X86DecodedInsn *decode)
@@ -2314,6 +2351,7 @@ static void gen_JMP(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_JMP_m(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_check_canonical(s, s->T0);
     gen_op_jmp_v(s, s->T0);
     gen_bnd_jmp(s);
     s->base.is_jmp = DISAS_JUMP;
@@ -2496,6 +2534,16 @@ static void gen_LZCNT(DisasContext *s, X86DecodedInsn *decode)
      */
     tcg_gen_clzi_tl(s->T0, s->T0, TARGET_LONG_BITS);
     tcg_gen_subi_tl(s->T0, s->T0, TARGET_LONG_BITS - (8 << ot));
+}
+
+/*
+ * CLFLUSH, CLFLUSHOPT and CLWB: no cache to write back, but the address is
+ * checked as a byte's read would check it (AMD's manual; Intel's #PF), and
+ * nothing is read, which a device's register would see.
+ */
+static void gen_CLFLUSH(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_helper_clflush(tcg_env, s->A0);
 }
 
 static void gen_MFENCE(DisasContext *s, X86DecodedInsn *decode)
@@ -3608,6 +3656,7 @@ static void gen_RET(DisasContext *s, X86DecodedInsn *decode)
     int16_t adjust = decode->e.op1 == X86_TYPE_I ? decode->immediate : 0;
 
     MemOp ot = gen_pop_T0(s);
+    gen_check_canonical(s, s->T0);
     gen_stack_update(s, adjust + (1 << ot));
     gen_op_jmp_v(s, s->T0);
     gen_bnd_jmp(s);

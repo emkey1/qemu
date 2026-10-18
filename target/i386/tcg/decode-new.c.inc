@@ -484,12 +484,12 @@ static void decode_group15(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
         [4] = X86_OP_ENTRYw(XSAVE,      M,y, cpuid(XSAVE) p_00),
         [5] = X86_OP_ENTRYr(XRSTOR,     M,y, cpuid(XSAVE) p_00),
         [6] = X86_OP_ENTRYw(XSAVEOPT,   M,b, cpuid(XSAVEOPT) p_00),
-        [7] = X86_OP_ENTRYw(NOP,        M,b, cpuid(CLFLUSH) p_00),
+        [7] = X86_OP_ENTRYw(CLFLUSH,    M,b, cpuid(CLFLUSH) p_00),
     };
 
     static const X86OpEntry group15_mem_66[8] = {
-        [6] = X86_OP_ENTRYw(NOP,        M,b, cpuid(CLWB)),
-        [7] = X86_OP_ENTRYw(NOP,        M,b, cpuid(CLFLUSHOPT)),
+        [6] = X86_OP_ENTRYw(CLFLUSH,    M,b, cpuid(CLWB)),
+        [7] = X86_OP_ENTRYw(CLFLUSH,    M,b, cpuid(CLFLUSHOPT)),
     };
 
     uint8_t modrm = get_modrm(s, env);
@@ -1407,8 +1407,8 @@ static const X86OpEntry opcodes_0F[256] = {
     [0xf6] = X86_OP_ENTRY3(PSADBW,   V,x, H,x, W,x,         vex4 mmx avx2_256 p_00_66),
     [0xf7] = X86_OP_ENTRY3(MASKMOV,  None,None, V,dq, U,dq, vex4_unal avx2_256 mmx p_00_66),
 
-    [0x08] = X86_OP_ENTRY0(NOP,           svm(INVD)),
-    [0x09] = X86_OP_ENTRY0(NOP,           svm(WBINVD)),
+    [0x08] = X86_OP_ENTRY0(NOP,           chk(cpl0) svm(INVD)),
+    [0x09] = X86_OP_ENTRY0(NOP,           chk(cpl0) svm(WBINVD)),
     [0x0b] = X86_OP_ENTRY0(UD),           /* UD2 */
     [0x0d] = X86_OP_ENTRY1(NOP,  M,v),    /* 3DNow! prefetch */
     [0x0e] = X86_OP_ENTRY0(EMMS,                              cpuid(3DNOW)), /* femms */
@@ -3095,10 +3095,12 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         }
     }
 
-    if (decode.e.special == X86_SPECIAL_MMX &&
-        !(s->prefix & (PREFIX_REPZ | PREFIX_REPNZ | PREFIX_DATA))) {
-        gen_helper_enter_mmx(tcg_env);
-    }
+    /*
+     * The MMX form: TOP 0 and every tag valid, once the insn has done its
+     * memory access -- one that faults changes neither (below).
+     */
+    bool enter_mmx = decode.e.special == X86_SPECIAL_MMX &&
+                     !(s->prefix & (PREFIX_REPZ | PREFIX_REPNZ | PREFIX_DATA));
 
     if (decode.e.special != X86_SPECIAL_NoLoadEA &&
         (decode.op[0].has_ea || decode.op[1].has_ea || decode.op[2].has_ea)) {
@@ -3118,6 +3120,9 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         gen_load(s, &decode, 2, s->T1);
         decode.e.gen(s, &decode);
         gen_writeback(s, &decode, 0, s->T0);
+    }
+    if (enter_mmx) {
+        gen_helper_enter_mmx(tcg_env);
     }
 
     /*

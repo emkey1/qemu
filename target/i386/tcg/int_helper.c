@@ -149,6 +149,7 @@ target_ulong helper_aam(target_ulong al, target_ulong base)
     int ah;
 
     al &= 0xff;
+    base &= 0xff;           /* the decoder sign-extends the immediate */
     ah = al / base;
     al = al % base;
     return al | (ah << 8);
@@ -164,114 +165,70 @@ target_ulong helper_aad(target_ulong ax, target_ulong base)
     return al;
 }
 
-void helper_aaa(CPUX86State *env)
+/*
+ * The flags the SDM leaves undefined are an AMD Ryzen's: DAA and DAS set SF
+ * ZF PF OF as the 8-bit ADD or SUB of their correction to AL does, and AAA
+ * and AAS as the 16-bit ADD or SUB of 0x106 to AX (of 0, when the low digit
+ * needs no adjusting) does. (AAD's are its 8-bit ADD's: gen_AAD().)
+ */
+static int bcd_flags(int a, int b, int bits, bool sub)
 {
-    int icarry;
-    int al, ah, af;
-    int eflags;
+    int sign = 1 << (bits - 1);
+    int r = (sub ? a - b : a + b) & ((sign << 1) - 1);
+    int over = sub ? (a ^ b) & (a ^ r) : ~(a ^ b) & (a ^ r);
 
-    eflags = cpu_cc_compute_all(env);
-    af = eflags & CC_A;
-    al = env->regs[R_EAX] & 0xff;
-    ah = (env->regs[R_EAX] >> 8) & 0xff;
+    return (r & sign ? CC_S : 0) | (r == 0 ? CC_Z : 0) | compute_pf(r) |
+           (over & sign ? CC_O : 0);
+}
 
-    icarry = (al > 0xf9);
-    if (((al & 0x0f) > 9) || af) {
-        al = (al + 6) & 0x0f;
-        ah = (ah + 1 + icarry) & 0xff;
-        eflags |= CC_C | CC_A;
-    } else {
-        eflags &= ~(CC_C | CC_A);
-        al &= 0x0f;
-    }
-    env->regs[R_EAX] = (env->regs[R_EAX] & ~0xffff) | al | (ah << 8);
+static void helper_aaa_aas(CPUX86State *env, bool sub)
+{
+    int eflags = cpu_cc_compute_all(env);
+    int ax = env->regs[R_EAX] & 0xffff;
+    bool adj = (ax & 0x0f) > 9 || (eflags & CC_A);
+    int corr = adj ? 0x106 : 0;
+
+    eflags = bcd_flags(ax, corr, 16, sub) | (adj ? CC_C | CC_A : 0);
+    ax = (sub ? ax - corr : ax + corr) & 0xff0f;
+    env->regs[R_EAX] = (env->regs[R_EAX] & ~0xffff) | ax;
     CC_SRC = eflags;
     CC_OP = CC_OP_EFLAGS;
 }
 
+void helper_aaa(CPUX86State *env)
+{
+    helper_aaa_aas(env, false);
+}
+
 void helper_aas(CPUX86State *env)
 {
-    int icarry;
-    int al, ah, af;
-    int eflags;
+    helper_aaa_aas(env, true);
+}
 
-    eflags = cpu_cc_compute_all(env);
-    af = eflags & CC_A;
-    al = env->regs[R_EAX] & 0xff;
-    ah = (env->regs[R_EAX] >> 8) & 0xff;
+static void helper_daa_das(CPUX86State *env, bool sub)
+{
+    int eflags = cpu_cc_compute_all(env);
+    int al = env->regs[R_EAX] & 0xff;
+    bool adj1 = (al & 0x0f) > 9 || (eflags & CC_A);
+    bool adj2 = al > 0x99 || (eflags & CC_C);
+    int corr = (adj1 ? 6 : 0) + (adj2 ? 0x60 : 0);
+    bool cf = adj2 || (sub && adj1 && al < 6);
 
-    icarry = (al < 6);
-    if (((al & 0x0f) > 9) || af) {
-        al = (al - 6) & 0x0f;
-        ah = (ah - 1 - icarry) & 0xff;
-        eflags |= CC_C | CC_A;
-    } else {
-        eflags &= ~(CC_C | CC_A);
-        al &= 0x0f;
-    }
-    env->regs[R_EAX] = (env->regs[R_EAX] & ~0xffff) | al | (ah << 8);
+    eflags = bcd_flags(al, corr, 8, sub) | (adj1 ? CC_A : 0) | (cf ? CC_C : 0);
+    al = (sub ? al - corr : al + corr) & 0xff;
+    env->regs[R_EAX] = (env->regs[R_EAX] & ~0xff) | al;
     CC_SRC = eflags;
     CC_OP = CC_OP_EFLAGS;
 }
 
 void helper_daa(CPUX86State *env)
 {
-    int old_al, al, af, cf;
-    int eflags;
-
-    eflags = cpu_cc_compute_all(env);
-    cf = eflags & CC_C;
-    af = eflags & CC_A;
-    old_al = al = env->regs[R_EAX] & 0xff;
-
-    eflags = 0;
-    if (((al & 0x0f) > 9) || af) {
-        al = (al + 6) & 0xff;
-        eflags |= CC_A;
-    }
-    if ((old_al > 0x99) || cf) {
-        al = (al + 0x60) & 0xff;
-        eflags |= CC_C;
-    }
-    env->regs[R_EAX] = (env->regs[R_EAX] & ~0xff) | al;
-    /* well, speed is not an issue here, so we compute the flags by hand */
-    eflags |= (al == 0) << 6; /* zf */
-    eflags |= compute_pf(al);
-    eflags |= (al & 0x80); /* sf */
-    CC_SRC = eflags;
-    CC_OP = CC_OP_EFLAGS;
+    helper_daa_das(env, false);
 }
 
 void helper_das(CPUX86State *env)
 {
-    int al, al1, af, cf;
-    int eflags;
-
-    eflags = cpu_cc_compute_all(env);
-    cf = eflags & CC_C;
-    af = eflags & CC_A;
-    al = env->regs[R_EAX] & 0xff;
-
-    eflags = 0;
-    al1 = al;
-    if (((al & 0x0f) > 9) || af) {
-        eflags |= CC_A;
-        if (al < 6 || cf) {
-            eflags |= CC_C;
-        }
-        al = (al - 6) & 0xff;
-    }
-    if ((al1 > 0x99) || cf) {
-        al = (al - 0x60) & 0xff;
-        eflags |= CC_C;
-    }
-    env->regs[R_EAX] = (env->regs[R_EAX] & ~0xff) | al;
-    /* well, speed is not an issue here, so we compute the flags by hand */
-    eflags |= (al == 0) << 6; /* zf */
-    eflags |= compute_pf(al);
-    eflags |= (al & 0x80); /* sf */
-    CC_SRC = eflags;
-    CC_OP = CC_OP_EFLAGS;
+    helper_daa_das(env, true);
 }
 
 #ifdef TARGET_X86_64

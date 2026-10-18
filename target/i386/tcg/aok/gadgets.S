@@ -1236,25 +1236,26 @@ g_bt \op\()64_rr, \op, 64, 1
 
 /*
  * bsf and bsr: [destination][source]. Of zero they leave the destination
- * as it was, and the flags are the source's. tzcnt and lzcnt: the size for
- * zero, and flags of their own (CC_OP_BMILG: cc_src the source).
+ * as it was, all 64 bits of it even at 32 bits (not zero-extended, as the
+ * hardware does), and the flags are the source's. tzcnt and lzcnt: the size
+ * for zero, and flags of their own (CC_OP_BMILG: cc_src the source).
  */
 .macro g_bitscan name, kind, r, ccop, top=0
 .gadget \name
     ldp x8, x9, [_ip]
     ldr \r\()10, [_cpu, x9]
-    ldr \r\()13, [_cpu, x8]
+    ldr x13, [_cpu, x8]
     .ifc \kind, bsf
     rbit \r\()12, \r\()10
     clz \r\()12, \r\()12
     cmp \r\()10, #0
-    csel \r\()12, \r\()13, \r\()12, eq
+    csel x12, x13, x12, eq
     .endif
     .ifc \kind, bsr
     clz \r\()12, \r\()10
     eor \r\()12, \r\()12, #\top
     cmp \r\()10, #0
-    csel \r\()12, \r\()13, \r\()12, eq
+    csel x12, x13, x12, eq
     .endif
     .ifc \kind, tzcnt
     rbit \r\()12, \r\()10
@@ -1742,6 +1743,16 @@ g_loop jcxz32, w, 0
 .endm
 
 /*
+ * A near jmp, call or ret's target in 64-bit code that is not 48 bits sign-
+ * extended: aok_x86_helper_branch_target raises #GP at the insn unless
+ * 5-level paging makes it canonical, and returns if it does. \t (x4 or x17,
+ * which the call keeps) holds the target; the word is at _ip + \woff.
+ */
+.macro x86_branch_target t, woff=-16
+    x86_call_slow aok_x86_helper_branch_target, \t, \woff
+.endm
+
+/*
  * call: [return address's distance from the TB's first insn][word], then a
  * way out: the return address is pushed, then it is a jmp.
  */
@@ -1764,6 +1775,7 @@ g_loop jcxz32, w, 0
 /*
  * An indirect call: [target's offset][return address's distance][word], then
  * a lookup's operands. The target is read first: it may be rsp-relative.
+ * In 64-bit code one past 48 bits goes to x86_branch_target before the push.
  */
 .macro g_calli name, r, bytes, bits
 .gadget \name
@@ -1771,6 +1783,12 @@ g_loop jcxz32, w, 0
     add _ip, _ip, #32
     ldr \r\()4, [_cpu, x8]
     add \r\()17, \r\()19, \r\()9
+    .if \bits == 64
+    sbfx x10, x4, #0, #48
+    cmp x10, x4
+    b.ne nc_\name
+ncb_\name:
+    .endif
     ldr \r\()5, [_cpu, #AOK_X86_ENV_RSP]
     sub \r\()5, \r\()5, #\bytes
     mov _addr, x5
@@ -1783,8 +1801,16 @@ g_loop jcxz32, w, 0
     sub _ip, _ip, #8
     b SYM(aok_x86_lookup_pc)
     x86_slow_st \bits, \name
+    .if \bits == 64
+nc_\name:
+    x86_branch_target x4
+    b ncb_\name
+    .endif
 .endm
-/* ret: [bytes to drop besides][word], then a lookup's operands */
+/*
+ * ret: [bytes to drop besides][word], then a lookup's operands. In 64-bit
+ * code a target past 48 bits goes to x86_branch_target before the pop.
+ */
 .macro g_ret name, r, bytes, bits
 .gadget \name
     ldr x8, [_ip]
@@ -1794,6 +1820,12 @@ g_loop jcxz32, w, 0
     x86_probe \bits, \name, TLBE_READ
     ldr \r\()10, [_addr]
     ld_barrier
+    .if \bits == 64
+    sbfx x9, x10, #0, #48
+    cmp x9, x10
+    b.ne nc_\name
+ncb_\name:
+    .endif
     add \r\()5, \r\()5, #\bytes
     add \r\()5, \r\()5, \r\()8
     str x5, [_cpu, #AOK_X86_ENV_RSP]
@@ -1801,6 +1833,13 @@ g_loop jcxz32, w, 0
     sub _ip, _ip, #8
     b SYM(aok_x86_lookup_pc)
     x86_slow_ld \bits, \name
+    .if \bits == 64
+nc_\name:
+    mov x17, x10
+    x86_branch_target x17
+    mov x10, x17
+    b ncb_\name
+    .endif
 .endm
 .set X86_MP, 0
 g_push push, 0, x, 8, 64
@@ -1834,13 +1873,25 @@ g_calli calli32_mp, w, 4, 32
 g_ret ret32_mp, w, 4, 32
 .set X86_MP, 0
 
-/* An indirect jmp: [target's offset], then a lookup's operands */
+/*
+ * An indirect jmp: [target's offset], in 64-bit code [word] too, then a
+ * lookup's operands
+ */
 .gadget jmpi
     ldr x8, [_ip]
+    add _ip, _ip, #16
     ldr x10, [_cpu, x8]
+    sbfx x9, x10, #0, #48
+    cmp x9, x10
+    b.ne nc_jmpi
+ncb_jmpi:
     str x10, [_pcp]
-    add _ip, _ip, #8
     b SYM(aok_x86_lookup_pc)
+nc_jmpi:
+    mov x17, x10
+    x86_branch_target x17, -8
+    mov x10, x17
+    b ncb_jmpi
 .gadget jmpi32
     ldr x8, [_ip]
     ldr w10, [_cpu, x8]

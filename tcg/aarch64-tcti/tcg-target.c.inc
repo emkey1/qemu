@@ -2206,26 +2206,27 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc, unsigned vecl, unsigned
             case TCG_COND_GT:
                 tcg_out_ternary_vector_gadget_with_scalar(s, cmgt, is_scalar, vece, w0, w1, w2);
                 break;
+            /* a <= b is b >= a, and a < b is b > a: the operands swap */
             case TCG_COND_LE:
-                tcg_out_ternary_vector_gadget_with_scalar(s, cmgt, is_scalar, vece, w0, w2, w1);
+                tcg_out_ternary_vector_gadget_with_scalar(s, cmge, is_scalar, vece, w0, w2, w1);
                 break;
             case TCG_COND_GE:
                 tcg_out_ternary_vector_gadget_with_scalar(s, cmge, is_scalar, vece, w0, w1, w2);
                 break;
             case TCG_COND_LT:
-                tcg_out_ternary_vector_gadget_with_scalar(s, cmge, is_scalar, vece, w0, w2, w1);
+                tcg_out_ternary_vector_gadget_with_scalar(s, cmgt, is_scalar, vece, w0, w2, w1);
                 break;
             case TCG_COND_GTU:
                 tcg_out_ternary_vector_gadget_with_scalar(s, cmhi, is_scalar, vece, w0, w1, w2);
                 break;
             case TCG_COND_LEU:
-                tcg_out_ternary_vector_gadget_with_scalar(s, cmhi, is_scalar, vece, w0, w2, w1);
+                tcg_out_ternary_vector_gadget_with_scalar(s, cmhs, is_scalar, vece, w0, w2, w1);
                 break;
             case TCG_COND_GEU:
                 tcg_out_ternary_vector_gadget_with_scalar(s, cmhs, is_scalar, vece, w0, w1, w2);
                 break;
             case TCG_COND_LTU:
-                tcg_out_ternary_vector_gadget_with_scalar(s, cmhs, is_scalar, vece, w0, w2, w1);
+                tcg_out_ternary_vector_gadget_with_scalar(s, cmhi, is_scalar, vece, w0, w2, w1);
                 break;
             default:
                 g_assert_not_reached();

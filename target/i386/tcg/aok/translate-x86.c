@@ -745,6 +745,24 @@ static void x86_sync(CPUX86State *env, uint64_t pc)
     env->eip = pc;
 }
 
+/*
+ * A near jmp, call or ret in 64-bit code whose target is not 48 bits sign-
+ * extended (the gadgets' test): #GP at the insn, before its push or pop,
+ * unless 5-level paging makes the target canonical.
+ */
+void aok_x86_helper_branch_target(CPUX86State *env, uint64_t addr,
+                                  uint64_t pc, uint32_t sz, uint64_t target);
+void aok_x86_helper_branch_target(CPUX86State *env, uint64_t addr,
+                                  uint64_t pc, uint32_t sz, uint64_t target)
+{
+    int bits = env->cr[4] & CR4_LA57_MASK ? 57 : 48;
+
+    if (sextract64(target, 0, bits) != (int64_t)target) {
+        x86_sync(env, pc);
+        raise_exception_err_ra(env, EXCP0D_GPF, 0, 0);
+    }
+}
+
 static MemOpIdx x86_oi(CPUX86State *env, unsigned sz)
 {
     return make_memop_idx(sz | MO_LE, cpu_mmu_index(env_cpu(env), false));
@@ -2543,7 +2561,11 @@ static int group5(Ctx *c, const Insn *d, int sz, bool ff)
             return UNKNOWN;
         }
         e = src_e(c, d, SW(c));
-        E1(c->c64 ? G(jmpi) : G(jmpi32), e);
+        if (c->c64) {
+            E2(G(jmpi), e, word(c, SW(c)));
+        } else {
+            E1(G(jmpi32), e);
+        }
         aok_emit_lookup_operands(&c->g);
         return END;
     case 6:

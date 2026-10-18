@@ -1236,25 +1236,26 @@ g_bt \op\()64_rr, \op, 64, 1
 
 /*
  * bsf and bsr: [destination][source]. Of zero they leave the destination
- * as it was, and the flags are the source's. tzcnt and lzcnt: the size for
- * zero, and flags of their own (CC_OP_BMILG: cc_src the source).
+ * as it was, all 64 bits of it even at 32 bits (not zero-extended, as the
+ * hardware does), and the flags are the source's. tzcnt and lzcnt: the size
+ * for zero, and flags of their own (CC_OP_BMILG: cc_src the source).
  */
 .macro g_bitscan name, kind, r, ccop, top=0
 .gadget \name
     ldp x8, x9, [_ip]
     ldr \r\()10, [_cpu, x9]
-    ldr \r\()13, [_cpu, x8]
+    ldr x13, [_cpu, x8]
     .ifc \kind, bsf
     rbit \r\()12, \r\()10
     clz \r\()12, \r\()12
     cmp \r\()10, #0
-    csel \r\()12, \r\()13, \r\()12, eq
+    csel x12, x13, x12, eq
     .endif
     .ifc \kind, bsr
     clz \r\()12, \r\()10
     eor \r\()12, \r\()12, #\top
     cmp \r\()10, #0
-    csel \r\()12, \r\()13, \r\()12, eq
+    csel x12, x13, x12, eq
     .endif
     .ifc \kind, tzcnt
     rbit \r\()12, \r\()10

@@ -480,6 +480,27 @@ static inline void gen_op_jmp_v(DisasContext *s, TCGv dest)
     s->pc_save = -1;
 }
 
+/*
+ * In 64-bit code a near branch to a non-canonical address is #GP at the
+ * branch, before it pushes or pops: checked before either. 48 bits are
+ * tested inline, and the helper decides an address past them (5-level
+ * paging has 57).
+ */
+static void gen_check_canonical(DisasContext *s, TCGv dest)
+{
+#ifdef TARGET_X86_64
+    if (CODE64(s)) {
+        TCGLabel *ok = gen_new_label();
+        TCGv t = tcg_temp_new();
+
+        tcg_gen_sextract_tl(t, dest, 0, 48);
+        tcg_gen_brcond_tl(TCG_COND_EQ, t, dest, ok);
+        gen_helper_check_canonical(tcg_env, dest);
+        gen_set_label(ok);
+    }
+#endif
+}
+
 static inline void gen_op_add_reg(DisasContext *s, MemOp size, int reg, TCGv val)
 {
     /* Using cpu_regs[reg] does not work for xH registers.  */

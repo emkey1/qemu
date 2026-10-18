@@ -130,6 +130,28 @@ int get_pg_mode(CPUX86State *env)
     return pg_mode;
 }
 
+#ifdef TARGET_X86_64
+/* An address the paging mode can map: 48 bits sign-extended, or 57. */
+static bool is_canonical(CPUX86State *env, target_ulong addr)
+{
+    int shift = (get_pg_mode(env) & PG_MODE_LA57) ? 56 : 47;
+    int64_t sext = (int64_t)addr >> shift;
+
+    return sext == 0 || sext == -1;
+}
+
+/*
+ * A near JMP, CALL or RET to a non-canonical address in 64-bit code is #GP
+ * at the branch, before its push or pop.
+ */
+void helper_check_canonical(CPUX86State *env, target_ulong addr)
+{
+    if (!is_canonical(env, addr)) {
+        raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
+    }
+}
+#endif
+
 static int x86_mmu_index_kernel_pl(CPUX86State *env, unsigned pl)
 {
     int mmu_index_32 = (env->hflags & HF_LMA_MASK) ? 0 : 1;
@@ -2057,10 +2079,7 @@ static void check_ret_eip(CPUX86State *env, target_ulong new_eip,
 {
 #ifdef TARGET_X86_64
     if ((env->hflags & HF_LMA_MASK) && (e2 & DESC_L_MASK)) {
-        int shift = (get_pg_mode(env) & PG_MODE_LA57) ? 56 : 47;
-        int64_t sext = (int64_t)new_eip >> shift;
-
-        if (sext != 0 && sext != -1) {
+        if (!is_canonical(env, new_eip)) {
             raise_exception_err_ra(env, EXCP0D_GPF, 0, retaddr);
         }
         return;

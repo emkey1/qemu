@@ -43,6 +43,9 @@ DEF_HELPER_5(lcall_protected, void, env, int, tl, int, tl)
 DEF_HELPER_2(iret_real, void, env, int)
 DEF_HELPER_3(iret_protected, void, env, int, int)
 DEF_HELPER_3(lret_protected, void, env, int, int)
+#ifdef TARGET_X86_64
+DEF_HELPER_2(check_canonical, void, env, tl)
+#endif
 DEF_HELPER_1(clts, void, env)
 
 #ifndef CONFIG_USER_ONLY

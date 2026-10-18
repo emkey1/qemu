@@ -1157,8 +1157,15 @@ static void gen_AAA(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_AAD(DisasContext *s, X86DecodedInsn *decode)
 {
+    TCGv prod = tcg_temp_new();
+
+    /* AL + AH * imm is an 8-bit ADD, and the flags are all six of its. */
+    tcg_gen_extract_tl(prod, s->T0, 8, 8);
+    tcg_gen_mul_tl(prod, prod, s->T1);
+    tcg_gen_ext8u_tl(prod, prod);
     gen_helper_aad(s->T0, s->T0, s->T1);
-    prepare_update1_cc(decode, s, CC_OP_LOGICB);
+    tcg_gen_mov_tl(s->T1, prod);
+    prepare_update2_cc(decode, s, CC_OP_ADDB);
 }
 
 static void gen_AAM(DisasContext *s, X86DecodedInsn *decode)

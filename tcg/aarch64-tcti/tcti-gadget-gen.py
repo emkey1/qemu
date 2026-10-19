@@ -445,7 +445,7 @@ C_CALL_EPILOGUE = [
 ]
 
 
-def create_tlb_fastpath(is_aligned, is_write, miss_label="0", size=8):
+def create_tlb_fastpath(is_write, miss_label="0", size=8, align=None):
     """ Creates a set of instructions that perform a soft-MMU TLB lookup.
 
     This is used for `qemu_ld`/qemu_st` instructions; to emit a prologue that
@@ -458,6 +458,11 @@ def create_tlb_fastpath(is_aligned, is_write, miss_label="0", size=8):
           to get the host virtual address (the address in our local memory space).
         - If a TLB entry isn't found, it branches to the "miss_label" (by default, 0:),
           so address lookup can be handled by the fastpath.
+
+    align, if given, is the alignment in bytes the access must have: an
+    address without it also branches to the miss label, where the helper
+    raises the fault, and an aligned access cannot cross a page. Otherwise the
+    hit takes all size bytes from Xn to be on the page.
 
     Clobbers x24, and x26; provides output in x27.
     """
@@ -479,10 +484,11 @@ def create_tlb_fastpath(is_aligned, is_write, miss_label="0", size=8):
 
     ]
 
-    if is_aligned:
+    if align:
         fast_path.extend([
-            # Store the page mask part of the address into X24.
-            "and x24, Xn, #0xfffffffffffff000",
+            # Store the page mask part of the address into X24, and the bits
+            # below the alignment, which must be clear for a hit.
+            f"and x24, Xn, #{0xfffffffffffff000 | (align - 1):#x}",
 
             # Compare the masked address with the TLB value.
             "cmp x26, x24",
@@ -515,11 +521,12 @@ def tlb_operands(mmu_idx):
     return f'[tlb_ofs] "i" (TCTI_TLB_FAST_OFS({mmu_idx}))'
 
 
-def granule_check(size):
-    """ For an ordered access of size bytes, not known to be aligned: branches
-    to the slow path if it crosses a 16-byte boundary, where an LDAPR or STLR
-    faults even with LSE2. That is, if (addr & 15) > 16 - size. """
-    if size == 1:
+def granule_check(size, align=None):
+    """ For an ordered access of size bytes, with the alignment align
+    already checked if given: branches to the slow path if it crosses a
+    16-byte boundary, where an LDAPR or STLR faults even with LSE2. That is,
+    if (addr & 15) > 16 - size. """
+    if size == 1 or (align or 1) >= size:
         return []
     return [
         "and x26, Xn, #15",
@@ -528,13 +535,15 @@ def granule_check(size):
     ]
 
 
-def ld_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None, is_aligned=False, force_slowpath=False, ordered=None):
+def ld_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None,
+        align=None, force_slowpath=False, ordered=None):
     """ Creates a thunk into our C runtime for a QEMU LD operation.
 
-    ordered, if given, is the access size in bytes: the fast path is then
-    the given LDAPR sequence (on x27, the host address), after a check that
-    the access does not cross a 16-byte boundary, and the slow path orders
-    the helper's plain load after it, as an LDAPR would be. """
+    align is as for create_tlb_fastpath(). ordered, if given, is the access
+    size in bytes: the fast path is then the given LDAPR sequence (on x27,
+    the host address), after a check that the access does not cross a 16-byte
+    boundary unless align says it cannot, and the slow path orders the
+    helper's plain load after it, as an LDAPR would be. """
 
     # A slow-path gadget serves every MMU index, so there is just the one;
     # otherwise there is one per index with a fast path.
@@ -554,9 +563,10 @@ def ld_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None, 
                 fastpath_ops = [
                     # Create a fastpath that jumps to miss_lable on a TLB miss,
                     # or sets x27 to the TLB addend on a TLB hit.
-                    *create_tlb_fastpath(is_aligned=is_aligned, is_write=False),
+                    *create_tlb_fastpath(is_write=False, align=align),
                     # LDAPR is FEAT_LRCPC (ARMv8.3), past what we may be built for.
-                    *(granule_check(ordered) + ["add x27, x27, Xn", ".arch_extension rcpc"] if ordered else []),
+                    *(granule_check(ordered, align)
+                      + ["add x27, x27, Xn", ".arch_extension rcpc"] if ordered else []),
 
                     # On a hit, we can just perform an appropriate load...
                     *fastpath,
@@ -612,11 +622,12 @@ def ld_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None, 
             )
 
 
-def st_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None, is_aligned=False, force_slowpath=False, ordered=None):
+def st_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None,
+        align=None, force_slowpath=False, ordered=None):
     """ Creates a thunk into our C runtime for a QEMU ST operation.
 
-    ordered is as for ld_thunk, with STLR; the slow path orders the helper's
-    plain store after earlier stores, as an STLR would be. """
+    align and ordered are as for ld_thunk, with STLR; the slow path orders
+    the helper's plain store after earlier stores, as an STLR would be. """
 
     # As for ld_thunk.
     indices = [None] if force_slowpath else QEMU_TLB_FAST_MMU_INDICES
@@ -636,8 +647,9 @@ def st_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None, 
 
                     # Create a fastpath that jumps to miss_lable on a TLB miss,
                     # or sets x27 to the TLB addend on a TLB hit.
-                    *create_tlb_fastpath(is_aligned=is_aligned, is_write=True),
-                    *(granule_check(ordered) + ["add x27, x27, Xn"] if ordered else []),
+                    *create_tlb_fastpath(is_write=True, align=align),
+                    *(granule_check(ordered, align)
+                      + ["add x27, x27, Xn"] if ordered else []),
 
                     # On a hit, we can just perform an appropriate load...
                     *fastpath,
@@ -1278,7 +1290,8 @@ for ordered in (False, True):
         for signedness, ops in (("unsigned", LD_OPS[:4]), ("signed", LD_OPS[4:])):
             START_COLLECTION(f"qemu_ld_{variant}_{signedness}_le", needs_defs=not is_slowpath)
             for op, helper, size, plain32, plain64, ord32, ord64 in ops:
-                ld_thunk(f"qemu_ld_{op}_{variant}", is_aligned=is_aligned, slowpath_helper=helper,
+                ld_thunk(f"qemu_ld_{op}_{variant}", align=size if is_aligned else None,
+                    slowpath_helper=helper,
                     fastpath_32b=ord32 if ordered else plain32,
                     fastpath_64b=ord64 if ordered else plain64,
                     force_slowpath=is_slowpath, ordered=size if ordered else None,
@@ -1302,7 +1315,8 @@ for ordered in (False, True):
 
         START_COLLECTION(f"qemu_st_{variant}_le", needs_defs=not is_slowpath)
         for op, helper, size, plain, ord32, ord64 in ST_OPS:
-            st_thunk(f"qemu_st_{op}_{variant}", is_aligned=is_aligned, slowpath_helper=helper,
+            st_thunk(f"qemu_st_{op}_{variant}", align=size if is_aligned else None,
+                slowpath_helper=helper,
                 fastpath_32b=[ord32] if ordered else [plain],
                 fastpath_64b=[ord64] if ordered else [plain],
                 force_slowpath=is_slowpath, ordered=size if ordered else None,
@@ -1332,7 +1346,7 @@ def ldst_i128(is_ld, align, mmu_idx, ordered):
     fast = []
     if mmu_idx is not None:
         fast = [
-            *create_tlb_fastpath(is_aligned=False, is_write=not is_ld, size=16),
+            *create_tlb_fastpath(is_write=not is_ld, size=16),
             *([f"tst Xn, #{align - 1}", "b.ne 0f"] if align else []),
             "add x27, x27, Xn",
             *st_barrier,

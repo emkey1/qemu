@@ -1758,6 +1758,21 @@ static bool tcti_has_fast_path(TCGContext *s, unsigned mmu_idx)
     return true;
 }
 
+/*
+ * Whether a fast-path gadget can check this access's alignment, and if so in
+ * *is_aligned which kind: the aligned gadgets require the access to be
+ * aligned to its size, so that it cannot cross a page either, and the
+ * unaligned ones require nothing. Any other alignment is left to the slow
+ * path, whose helper checks it and raises the fault.
+ */
+static bool tcti_fast_alignment(MemOp opc, bool *is_aligned)
+{
+    unsigned a_bits = memop_alignment_bits(opc);
+
+    *is_aligned = a_bits == (opc & MO_SIZE);
+    return a_bits == 0 || *is_aligned;
+}
+
 static void tgen_qemu_ld(TCGContext *s, TCGType type, TCGReg data,
                          TCGReg addr, MemOpIdx oi)
 {
@@ -1765,13 +1780,14 @@ static void tgen_qemu_ld(TCGContext *s, TCGType type, TCGReg data,
     unsigned mmu_idx = get_mmuidx(oi);
     bool is_i64 = (type == TCG_TYPE_I64);
     bool ordered = tcg_ldst_ordered(s);
+    bool is_aligned;
     TCTIGadget2 *gadget;
 
     /* tcg_target_has_memory_bswap() says no, so TCG swaps separately. */
     tcg_debug_assert(!(opc & MO_BSWAP));
 
-    if (tcti_has_fast_path(s, mmu_idx)) {
-        bool is_aligned = (opc & MO_SIZE) == MO_8;
+    if (tcti_has_fast_path(s, mmu_idx) &&
+        tcti_fast_alignment(opc, &is_aligned)) {
         gadget = tcti_qemu_ld_fast[ordered][is_aligned][is_i64][opc & MO_SSIZE][mmu_idx];
     } else {
         gadget = tcti_qemu_ld_slow[ordered][is_i64][opc & MO_SSIZE];
@@ -1867,12 +1883,13 @@ static void tgen_qemu_st(TCGContext *s, TCGType type, TCGReg data,
     unsigned mmu_idx = get_mmuidx(oi);
     bool is_i64 = (type == TCG_TYPE_I64);
     bool ordered = tcg_ldst_ordered(s);
+    bool is_aligned;
     TCTIGadget2 *gadget;
 
     tcg_debug_assert(!(opc & MO_BSWAP));
 
-    if (tcti_has_fast_path(s, mmu_idx)) {
-        bool is_aligned = (opc & MO_SIZE) == MO_8;
+    if (tcti_has_fast_path(s, mmu_idx) &&
+        tcti_fast_alignment(opc, &is_aligned)) {
         gadget = tcti_qemu_st_fast[ordered][is_aligned][is_i64][opc & MO_SIZE][mmu_idx];
     } else {
         gadget = tcti_qemu_st_slow[ordered][is_i64][opc & MO_SIZE];

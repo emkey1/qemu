@@ -1,0 +1,70 @@
+# Builds the fork on Apple silicon, as TCTI needs, and runs the TCG system tests
+# for x86_64 and AArch64 guests under each backend of the hybrid: TCTI, then the
+# JIT. A pull request's commits are also checked against QEMU's coding style.
+
+name: CI
+
+on:
+  push:
+    branches: [tctish-edition]
+  pull_request:
+    branches: [tctish-edition]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checkpatch:
+    name: QEMU Patch Check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check Each Commit
+        run: |
+          .github/workflows/ci-checkpatch.sh \
+            ${{ github.event.pull_request.base.sha }} \
+            ${{ github.event.pull_request.head.sha }}
+
+  macos:
+    name: Test TCG
+    runs-on: xcode-27
+    timeout-minutes: 150
+    # Every step runs in the flake's tests shell, as check-tcg does locally:
+    # its libraries, toolchain and the guests' cross compilers.
+    defaults:
+      run:
+        shell: nix develop .#tests --command bash --noprofile --norc -eo pipefail {0}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: Configure
+        run: |
+          mkdir build
+          cd build
+          ../configure --target-list=x86_64-softmmu,aarch64-softmmu \
+            --enable-tcg-hybrid=runtime --disable-werror --disable-docs \
+            --disable-tools --disable-guest-agent --disable-plugins \
+            --cross-cc-x86_64=x86_64-elf-gcc \
+            --cross-cc-aarch64=aarch64-none-elf-gcc
+
+      - name: Build
+        run: make -C build -j"$(sysctl -n hw.ncpu)"
+
+      - name: Test (TCTI)
+        run: .github/workflows/ci-check-tcg.sh on
+
+      - name: Test (JIT)
+        if: success() || failure()
+        run: .github/workflows/ci-check-tcg.sh off

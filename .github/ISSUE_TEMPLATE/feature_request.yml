@@ -1,0 +1,55 @@
+name: Feature or change
+description: Propose something the fork should do, or do differently.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For anything large, such as a new backend, a second translator or a change to how TCTI
+        dispatches, open this before writing the code. The fork is rebased as a series of commits on
+        top of upstream QEMU, so we care a lot about the maintenance impact of changes as well as
+        their functionality.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: >
+        Explain the problem you want to solve, rather than what you think the solution is. Are you
+        having performance issues? Is something awkward? If it is performance related, numbers from
+        benchmarks are worth far more than just a description.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like to happen?
+      description: >
+        Explain what you think would solve this (e.g. new gadgets, an op the backend should
+        implement, or a change to the hybrid architecture). If you mean to contribute the change,
+        please mention that too.
+    validations:
+      required: true
+
+  - type: textarea
+    id: cost
+    attributes:
+      label: What would it cost?
+      description: >
+        What is the impact of your proposed fix on binary size, performance, and so on? Does it
+        impact JIT and TCTI differently?
+
+  - type: dropdown
+    id: upstream
+    attributes:
+      label: Would upstream QEMU want it?
+      description: >
+        A change that is useful beyond TCTI and tctiSH may be better sent to qemu-devel, and reaches
+        the fork when it is next rebased.
+      options:
+        - "No — it is about TCTI or tctiSH"
+        - "Maybe — it could go upstream as well"
+        - "Not sure"
+    validations:
+      required: true

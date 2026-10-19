@@ -1130,22 +1130,28 @@ static inline void tb_jmp_unlink(TranslationBlock *dest)
 static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
 {
     CPUState *cpu;
+    uint32_t h;
 
+    /*
+     * A CF_PCREL TB may be cached under any virtual address, so its entries
+     * can't be found, and they needn't be: CF_INVALID is set by now, and
+     * tb_lookup() compares cflags exactly, so a stale entry never hits. The
+     * TB's memory is only reused after tb_flush(), which clears every jump
+     * cache. Clearing them all here instead swept every vCPU's whole cache
+     * for each TB invalidated, which dominated when a guest reused memory
+     * that had held code.
+     */
     if (tb_cflags(tb) & CF_PCREL) {
-        /* A TB may be at any virtual address */
-        CPU_FOREACH(cpu) {
-            tcg_flush_jmp_cache(cpu);
-        }
-    } else {
-        uint32_t h = tb_jmp_cache_hash_func(tb->pc);
+        return;
+    }
 
-        CPU_FOREACH(cpu) {
-            CPUJumpCache *jc = cpu->tb_jmp_cache;
+    h = tb_jmp_cache_hash_func(tb->pc);
+    CPU_FOREACH(cpu) {
+        CPUJumpCache *jc = cpu->tb_jmp_cache;
 
-            for (int way = 0; way < 2; way++) {
-                if (qatomic_read(&jc->array[h ^ way].tb) == tb) {
-                    qatomic_set(&jc->array[h ^ way].tb, NULL);
-                }
+        for (int way = 0; way < 2; way++) {
+            if (qatomic_read(&jc->array[h ^ way].tb) == tb) {
+                qatomic_set(&jc->array[h ^ way].tb, NULL);
             }
         }
     }

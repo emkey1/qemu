@@ -239,6 +239,18 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
     return qht_lookup_custom(&tb_ctx.htable, &desc, h, tb_lookup_cmp);
 }
 
+/* The jump cache missed: look in the hash table, and cache what it finds. */
+static __attribute__((noinline)) TranslationBlock *
+tb_lookup_slow(CPUState *cpu, TCGTBCPUState s, uint32_t hash)
+{
+    TranslationBlock *tb = tb_htable_lookup(cpu, s);
+
+    if (tb) {
+        tb_jmp_cache_insert(cpu->tb_jmp_cache, hash, s.pc, tb);
+    }
+    return tb;
+}
+
 /**
  * tb_lookup:
  * @cpu: CPU that will execute the returned translation block
@@ -251,9 +263,14 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
  * @cflags. Uses @cpu's tb_jmp_cache. Might cause an exception, so have a
  * longjmp destination ready.
  *
+ * Always inlined, with misses out of line: helper_lookup_tb_ptr() calls
+ * this on every indirect branch the guest takes, and as a call it passed
+ * @s through memory.
+ *
  * Returns: an existing translation block or NULL.
  */
-static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
+static inline QEMU_ALWAYS_INLINE
+TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 {
     TranslationBlock *tb;
     CPUJumpCache *jc;
@@ -276,12 +293,10 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
         }
     }
 
-    tb = tb_htable_lookup(cpu, s);
+    tb = tb_lookup_slow(cpu, s, hash);
     if (tb == NULL) {
         return NULL;
     }
-
-    tb_jmp_cache_insert(jc, hash, s.pc, tb);
 
 hit:
     /*

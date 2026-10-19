@@ -638,7 +638,7 @@ void glue(helper_cvtpd2ps, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
         }
     }
     for (i = (1 << SHIFT) >> 1; i < 1 << SHIFT; i++) {
-         d->Q(i) = 0;
+        d->Q(i) = 0;
     }
 }
 
@@ -850,7 +850,7 @@ void glue(helper_cvtpd2dq, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
         }
     }
     for (i = (1 << SHIFT) >> 1; i < 1 << SHIFT; i++) {
-         d->Q(i) = 0;
+        d->Q(i) = 0;
     }
 }
 
@@ -937,7 +937,7 @@ void glue(helper_cvttpd2dq, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
         }
     }
     for (i = (1 << SHIFT) >> 1; i < 1 << SHIFT; i++) {
-         d->Q(i) = 0;
+        d->Q(i) = 0;
     }
 }
 

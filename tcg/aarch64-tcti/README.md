@@ -94,7 +94,7 @@ At 14 GP registers, that means that
 
 Calls a helper function by address.
 
-**IR Format**: `br <ptr address>`  
+**IR Format**: `br <ptr address>`\
 **Gadget type:** single
 
 ```asm
@@ -125,7 +125,7 @@ Calls a helper function by address.
 
 Branches to a given immediate address. Branches are
 
-**IR Format**: `br <ptr address>`  
+**IR Format**: `br <ptr address>`\
 **Gadget type:** single
 
 ```asm
@@ -137,7 +137,7 @@ ldr x28, [x28]
 
 Performs a comparison between two 32-bit operands.
 
-**IR Format**: `setcond32 <cond>, Rd, Rn, Rm`  
+**IR Format**: `setcond32 <cond>, Rd, Rn, Rm`\
 **Gadget type:** treated as 10 operations with variants for every `Rd`/`Rn`/`Rm` (40,960)
 
 ```asm
@@ -162,7 +162,7 @@ cset Wd, <cond>
 
 Performs a comparison between two 32-bit operands.
 
-**IR Format**: `setcond64 <cond>, Rd, Rn, Rm`  
+**IR Format**: `setcond64 <cond>, Rd, Rn, Rm`\
 **Gadget type:** treated as 10 operations with variants for every `Rd`/`Rn`/`Rm` (40,960)
 
 ```asm
@@ -176,7 +176,7 @@ Comparison chart is the same as the `_i32` variant.
 
 Compares two 32-bit numbers, and branches if the comparison is true.
 
-**IR Format**: `brcond Rn, Rm, <cond>`  
+**IR Format**: `brcond Rn, Rm, <cond>`\
 **Gadget type:** treated as 10 operations with variants for every `Rn`/`Rm` (2560)
 
 ```asm
@@ -202,7 +202,7 @@ Comparison chart is the same as in `setcond_i32` .
 
 Compares two 64-bit numbers, and branches if the comparison is true.
 
-**IR Format**: `brcond Rn, Rm, <cond>`  
+**IR Format**: `brcond Rn, Rm, <cond>`\
 **Gadget type:** treated as 10 operations with variants for every `Rn`/`Rm` (2560)
 
 ```asm
@@ -228,7 +228,7 @@ Comparison chart is the same as in `setcond_i32` .
 
 Moves a value from a register to another register.
 
-**IR Format**: `mov Rd, Rn`  
+**IR Format**: `mov Rd, Rn`\
 **Gadget type:** gadget per `Rd` + `Rn` combo (256)
 
 ```asm
@@ -239,7 +239,7 @@ mov Rd, Rn
 
 Moves a value from a register to another register.
 
-**IR Format**: `mov Rd, Rn`  
+**IR Format**: `mov Rd, Rn`\
 **Gadget type:** gadget per `Rd` + `Rn` combo (256)
 
 ```asm
@@ -250,7 +250,7 @@ mov Xd, Xn
 
 Moves an 32b immediate into a register.
 
-**IR Format**: `mov Rd, #imm32`  
+**IR Format**: `mov Rd, #imm32`\
 **Gadget type:** gadget per `Rd` (16)
 
 ```asm
@@ -262,7 +262,7 @@ mov Wd, w27
 
 Moves an 64b immediate into a register.
 
-**IR Format**: `mov Rd, #imm64`  
+**IR Format**: `mov Rd, #imm64`\
 **Gadget type:** gadget per `Rd` (16)
 
 ```asm
@@ -274,7 +274,7 @@ mov Xd, x27
 
 Load byte from host memory to register.
 
-**IR Format**: `ldr Rd, Rn, <signed offset>`  
+**IR Format**: `ldr Rd, Rn, <signed offset>`\
 **Gadget type:** gadget per `Rd` & `Rn` (256)
 
 ```asm
@@ -286,7 +286,7 @@ ldrb Xd, [Xn, x27]
 
 Load byte from host memory to register; sign extending.
 
-**IR Format**: `ldr Rd, Rn, <signed offset>`  
+**IR Format**: `ldr Rd, Rn, <signed offset>`\
 **Gadget type:** gadget per `Rd` & `Rn` (256)
 
 ```asm
@@ -298,7 +298,7 @@ ldrsb Xd, [Xn, x27]
 
 Load 16b from host memory to register.
 
-**IR Format**: `ldr Rd, Rn, <signed offset>`  
+**IR Format**: `ldr Rd, Rn, <signed offset>`\
 **Gadget type:** gadget per `Rd` & `Rn` (256)
 
 ```asm
@@ -310,7 +310,7 @@ ldrh Wd, [Xn, x27]
 
 Load 16b from host memory to register; sign extending.
 
-**IR Format**: `ldr Rd, Rn, <signed offset>`  
+**IR Format**: `ldr Rd, Rn, <signed offset>`\
 **Gadget type:** gadget per `Rd` & `Rn` (256)
 
 ```asm
@@ -322,7 +322,7 @@ ldrsh Xd, [Xn, x27]
 
 Load 32b from host memory to register.
 
-**IR Format**: `ldr Rd, Rn, <signed offset>`  
+**IR Format**: `ldr Rd, Rn, <signed offset>`\
 **Gadget type:** gadget per `Rd` & `Rn` (256)
 
 ```asm
@@ -334,7 +334,7 @@ ldr Wd, [Xn, x27]
 
 Load 32b from host memory to register; sign extending.
 
-**IR Format**: `ldr Rd, Rn, <signed offset>`  
+**IR Format**: `ldr Rd, Rn, <signed offset>`\
 **Gadget type:** gadget per `Rd` & `Rn` (256)
 
 ```asm
@@ -346,7 +346,7 @@ ldrsw Xd, [Xn, x27]
 
 Load 64b from host memory to register.
 
-**IR Format**: `ldr Rd, Rn, <signed offset>`  
+**IR Format**: `ldr Rd, Rn, <signed offset>`\
 **Gadget type:** gadget per `Rd` & `Rn` (256)
 
 ```asm
@@ -358,7 +358,7 @@ ldr Xd, [Xn, x27]
 
 Stores byte from register to host memory.
 
-**IR Format**: `str Rd, Rn, <signed offset>`  
+**IR Format**: `str Rd, Rn, <signed offset>`\
 **Gadget type:** gadget per `Rd` & `Rn` (256)
 
 ```asm
@@ -370,7 +370,7 @@ strb Wd, [Xn, x27]
 
 Stores 16b from register to host memory.
 
-**IR Format**: `str Rd, Rn, <signed offset>`  
+**IR Format**: `str Rd, Rn, <signed offset>`\
 **Gadget type:** gadget per `Rd` & `Rn` (256)
 
 ```asm
@@ -382,7 +382,7 @@ strh Wd, [Xn, x27]
 
 Stores 32b from register to host memory.
 
-**IR Format**: `str Rd, Rn, <signed offset>`  
+**IR Format**: `str Rd, Rn, <signed offset>`\
 **Gadget type:** gadget per `Rd` & `Rn` (256)
 
 ```asm
@@ -394,7 +394,7 @@ str Wd, [Xn, x27]
 
 Stores 64b from register to host memory.
 
-**IR Format**: `str Rd, Rn, <signed offset>`  
+**IR Format**: `str Rd, Rn, <signed offset>`\
 **Gadget type:** gadget per `Rd` & `Rn` (256)
 
 ```asm
@@ -406,28 +406,28 @@ str Xd, [Xn, x27]
 
 Loads 32b from _guest_ memory to register.
 
-**IR Format**: `ld Rd, <foreign/guest pointer>, <memory operation>`  
+**IR Format**: `ld Rd, <foreign/guest pointer>, <memory operation>`\
 **Gadget type:** thunk per `Rd` into C impl?
 
 ### qemu_ld_i64
 
 Loads 64b from _guest_ memory to register.
 
-**IR Format**: `ld Rd, <foreign/guest pointer>, <memory operation>`  
+**IR Format**: `ld Rd, <foreign/guest pointer>, <memory operation>`\
 **Gadget type:** thunk per `Rd` into C impl?
 
 ### qemu_st_i32
 
 Stores 32b from a register to _guest_ memory.
 
-**IR Format**: `st Rd, <foreign/guest pointer>, <memory operation>`  
+**IR Format**: `st Rd, <foreign/guest pointer>, <memory operation>`\
 **Gadget type:** thunk per `Rd` into C impl
 
 ### qemu_st_i64
 
 Stores 64b from a register to _guest_ memory.
 
-**IR Format**: `st Rd, <foreign/guest pointer>, <memory operation>`  
+**IR Format**: `st Rd, <foreign/guest pointer>, <memory operation>`\
 **Gadget type:** thunk per `Rd` into C impl?
 
 #### Note
@@ -438,7 +438,7 @@ See note on `qemu_ld_i32`.
 
 Adds two 32-bit numbers.
 
-**IR Format**: `add Rd, Rn, Rm`  
+**IR Format**: `add Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -449,7 +449,7 @@ add Wd, Wn, Wm
 
 Adds two 64-bit numbers.
 
-**IR Format**: `add Rd, Rn, Rm`  
+**IR Format**: `add Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -460,7 +460,7 @@ add Xd, Xn, Xm
 
 Subtracts two 32-bit numbers.
 
-**IR Format**: `add Rd, Rn, Rm`  
+**IR Format**: `add Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -471,7 +471,7 @@ Sub Wd, Wn, Wm
 
 Subtracts two 64-bit numbers.
 
-**IR Format**: `sub Rd, Rn, Rm`  
+**IR Format**: `sub Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -482,7 +482,7 @@ sub Xd, Xn, Xm
 
 Multiplies two 32-bit numbers.
 
-**IR Format**: `mul Rd, Rn, Rm`  
+**IR Format**: `mul Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -493,7 +493,7 @@ mul Wd, Wn, Wm
 
 Multiplies two 64-bit numbers.
 
-**IR Format**: `mul Rd, Rn, Rm`  
+**IR Format**: `mul Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -504,7 +504,7 @@ mul Xd, Xn, Xm
 
 Divides two 32-bit numbers; considering them signed.
 
-**IR Format**: `div Rd, Rn, Rm`  
+**IR Format**: `div Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -515,7 +515,7 @@ sdiv Wd, Wn, Wm
 
 Divides two 64-bit numbers; considering them signed.
 
-**IR Format**: `div Rd, Rn, Rm`  
+**IR Format**: `div Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -526,7 +526,7 @@ sdiv Xd, Xn, Xm
 
 Divides two 32-bit numbers; considering them unsigned.
 
-**IR Format**: `div Rd, Rn, Rm`  
+**IR Format**: `div Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -537,7 +537,7 @@ udiv Wd, Wn, Wm
 
 Divides two 32-bit numbers; considering them unsigned.
 
-**IR Format**: `div Rd, Rn, Rm`  
+**IR Format**: `div Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -548,7 +548,7 @@ udiv Xd, Xn, Xm
 
 Computes the division remainder (modulus) of two 32-bit numbers; considering them signed.
 
-**IR Format**: `rem Rd, Rn, Rm`  
+**IR Format**: `rem Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -560,7 +560,7 @@ msub    Wd, w27, Wm, Wn
 
 Computes the division remainder (modulus) of two 64-bit numbers; considering them signed.
 
-**IR Format**: `rem Rd, Rn, Rm`  
+**IR Format**: `rem Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -572,7 +572,7 @@ msub    Xd, x27, Xm, Xn
 
 Computes the division remainder (modulus) of two 32-bit numbers; considering them unsigned.
 
-**IR Format**: `rem Rd, Rn, Rm`  
+**IR Format**: `rem Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -584,7 +584,7 @@ msub    Wd, w27, Wm, Wn
 
 Computes the division remainder (modulus) of two 32-bit numbers; considering them unsigned.
 
-**IR Format**: `rem Rd, Rn, Rm`  
+**IR Format**: `rem Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -596,7 +596,7 @@ msub    Xd, x27, Xm, Xn
 
 Logically inverts a 32-bit number.
 
-**IR Format**: `not Rd, Rn`  
+**IR Format**: `not Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -607,7 +607,7 @@ mvn Wd, Wn
 
 Logically inverts a 64-bit number.
 
-**IR Format**: `not Rd, Rn`  
+**IR Format**: `not Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -618,7 +618,7 @@ mvn Xd, Xn
 
 Arithmetically inverts (two's compliment) a 32-bit number.
 
-**IR Format**: `not Rd, Rn`  
+**IR Format**: `not Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -629,7 +629,7 @@ neg Wd, Wn
 
 Arithmetically inverts (two's compliment) a 64-bit number.
 
-**IR Format**: `not Rd, Rn`  
+**IR Format**: `not Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -640,7 +640,7 @@ neg Xd, Xn
 
 Logically ANDs two 32-bit numbers.
 
-**IR Format**: `and Rd, Rn, Rm`  
+**IR Format**: `and Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -651,7 +651,7 @@ and Wd, Wn, Wm
 
 Logically ANDs two 64-bit numbers.
 
-**IR Format**: `and Rd, Rn, Rm`  
+**IR Format**: `and Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -662,7 +662,7 @@ and Xd, Xn, Xm
 
 Logically ORs two 32-bit numbers.
 
-**IR Format**: `or Rd, Rn, Rm`  
+**IR Format**: `or Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -673,7 +673,7 @@ or Wd, Wn, Wm
 
 Logically ORs two 64-bit numbers.
 
-**IR Format**: `or Rd, Rn, Rm`  
+**IR Format**: `or Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -684,7 +684,7 @@ or Xd, Xn, Xm
 
 Logically XORs two 32-bit numbers.
 
-**IR Format**: `xor Rd, Rn, Rm`  
+**IR Format**: `xor Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -695,7 +695,7 @@ eor Wd, Wn, Wm
 
 Logically XORs two 64-bit numbers.
 
-**IR Format**: `xor Rd, Rn, Rm`  
+**IR Format**: `xor Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -706,7 +706,7 @@ eor Xd, Xn, Xm
 
 Logically shifts a 32-bit number left.
 
-**IR Format**: `shl Rd, Rn, Rm`  
+**IR Format**: `shl Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -717,7 +717,7 @@ lsl Wd, Wn, Wm
 
 Logically shifts a 64-bit number left.
 
-**IR Format**: `shl Rd, Rn, Rm`  
+**IR Format**: `shl Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -728,7 +728,7 @@ lsl Xd, Xn, Xm
 
 Logically shifts a 32-bit number right.
 
-**IR Format**: `shr Rd, Rn, Rm`  
+**IR Format**: `shr Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -739,7 +739,7 @@ lsr Wd, Wn, Wm
 
 Logically shifts a 64-bit number right.
 
-**IR Format**: `shr Rd, Rn, Rm`  
+**IR Format**: `shr Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -750,7 +750,7 @@ lsr Xd, Xn, Xm
 
 Arithmetically shifts a 32-bit number right.
 
-**IR Format**: `sar Rd, Rn, Rm`  
+**IR Format**: `sar Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -761,7 +761,7 @@ asr Wd, Wn, Wm
 
 Arithmetically shifts a 64-bit number right.
 
-**IR Format**: `sar Rd, Rn, Rm`  
+**IR Format**: `sar Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -772,7 +772,7 @@ asr Xd, Xn, Xm
 
 Rotates a 32-bit number left.
 
-**IR Format**: `rotl Rd, Rn, Rm`  
+**IR Format**: `rotl Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -783,7 +783,7 @@ rol Wd, Wn, Wm
 
 Rotates a 64-bit number left.
 
-**IR Format**: `rotl Rd, Rn, Rm`  
+**IR Format**: `rotl Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -794,7 +794,7 @@ rol Xd, Xn, Xm
 
 Rotates a 32-bit number right.
 
-**IR Format**: `rotr Rd, Rn, Rm`  
+**IR Format**: `rotr Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -805,7 +805,7 @@ ror Wd, Wn, Wm
 
 Rotates a 64-bit number right.
 
-**IR Format**: `rotr Rd, Rn, Rm`  
+**IR Format**: `rotr Rd, Rn, Rm`\
 **Gadget type:** gadget per `Rd`, `Rn`, `Rm` (4096)
 
 ```asm
@@ -824,7 +824,7 @@ Optional; not currently implementing.
 
 Sign extends the lower 8b of a register into a 32b destination.
 
-**IR Format**: `ext8s Rd, Rn`  
+**IR Format**: `ext8s Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -835,7 +835,7 @@ sxtb Wd, Wn
 
 Sign extends the lower 8b of a register into a 64b destination.
 
-**IR Format**: `ext8s Rd, Rn`  
+**IR Format**: `ext8s Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -846,7 +846,7 @@ sxtb Xd, Wn
 
 Zero extends the lower 8b of a register into a 32b destination.
 
-**IR Format**: `ext8u Rd, Rn`  
+**IR Format**: `ext8u Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -857,7 +857,7 @@ and Xd, Xn, #0xff
 
 Zero extends the lower 8b of a register into a 64b destination.
 
-**IR Format**: `ext8u Rd, Rn`  
+**IR Format**: `ext8u Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -868,7 +868,7 @@ and Xd, Xn, #0xff
 
 Sign extends the lower 16b of a register into a 32b destination.
 
-**IR Format**: `ext16s Rd, Rn`  
+**IR Format**: `ext16s Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -879,7 +879,7 @@ sxth Xd, Wn
 
 Sign extends the lower 16b of a register into a 64b destination.
 
-**IR Format**: `ext16s Rd, Rn`  
+**IR Format**: `ext16s Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -890,7 +890,7 @@ sxth Xd, Wn
 
 Zero extends the lower 16b of a register into a 32b destination.
 
-**IR Format**: `ext16u Rd, Rn`  
+**IR Format**: `ext16u Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -901,7 +901,7 @@ and Wd, Wn, #0xffff
 
 Zero extends the lower 16b of a register into a 32b destination.
 
-**IR Format**: `ext16u Rd, Rn`  
+**IR Format**: `ext16u Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -912,7 +912,7 @@ and Wd, Wn, #0xffff
 
 Sign extends the lower 32b of a register into a 64b destination.
 
-**IR Format**: `ext32s Rd, Rn`  
+**IR Format**: `ext32s Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -923,7 +923,7 @@ sxtw Xd, Wn
 
 Zero extends the lower 32b of a register into a 64b destination.
 
-**IR Format**: `ext32s Rd, Rn`  
+**IR Format**: `ext32s Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -934,7 +934,7 @@ sxtw Xd, Wn
 
 Sign extends the lower 32b of a register into a 64b destination.
 
-**IR Format**: `ext32s Rd, Rn`  
+**IR Format**: `ext32s Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -945,7 +945,7 @@ sxtw Xd, Wn
 
 Zero extends the lower 32b of a register into a 32b destination.
 
-**IR Format**: `ext32u Rd, Rn`  
+**IR Format**: `ext32u Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -956,7 +956,7 @@ and Xd, Xn, #0xffffffff
 
 Byte-swaps a 16b quantity.
 
-**IR Format**: `bswap16 Rd, Rn`  
+**IR Format**: `bswap16 Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -968,7 +968,7 @@ lsr     Wd, w27, #16
 
 Byte-swaps a 16b quantity.
 
-**IR Format**: `bswap16 Rd, Rn`  
+**IR Format**: `bswap16 Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -980,7 +980,7 @@ lsr     Wd, w27, #16
 
 Byte-swaps a 32b quantity.
 
-**IR Format**: `bswap32 Rd, Rn`  
+**IR Format**: `bswap32 Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -991,7 +991,7 @@ rev     Wd, Wn
 
 Byte-swaps a 32b quantity.
 
-**IR Format**: `bswap32 Rd, Rn`  
+**IR Format**: `bswap32 Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -1002,7 +1002,7 @@ rev     Wd, Wn
 
 Byte-swaps a 64b quantity.
 
-**IR Format**: `bswap64 Rd, Rn`  
+**IR Format**: `bswap64 Rd, Rn`\
 **Gadget type:** gadget per `Rd`, `Rn` (256)
 
 ```asm
@@ -1018,7 +1018,7 @@ Exits the translation block. Has no gadget; but instead inserts the address of t
 
 Memory barrier.
 
-**IR Format**: `mb <type>`  
+**IR Format**: `mb <type>`\
 **Gadget type:** gadget per type
 
 ```asm

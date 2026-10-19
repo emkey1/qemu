@@ -10,23 +10,25 @@
  * tcg-target-con-str.h; the constraint combination is inclusive or.
  */
 
-// Simple register functions.
+/* Simple register functions. */
 C_O0_I1(r)
 C_O0_I2(r, r)
 C_O0_I2(r, ri)
 C_O0_I3(r, r, r)
-//C_O0_I4(r, r, r, r)
+/* C_O0_I4(r, r, r, r) */
 C_O1_I1(r, r)
 C_O1_I2(r, r, r)
 C_O1_I2(r, r, ri)
 C_O1_I4(r, r, r, r, r)
 C_O2_I1(a, b, r)
 C_O0_I3(c, d, r)
-//C_O2_I1(r, r, r)
-//C_O2_I2(r, r, r, r)
-//C_O2_I4(r, r, r, r, r, r)
+/*
+ * C_O2_I1(r, r, r)
+ * C_O2_I2(r, r, r, r)
+ * C_O2_I4(r, r, r, r, r, r)
+ */
 
-// Vector functions.
+/* Vector functions. */
 C_O1_I1(w, w)
 C_O1_I1(w, r)
 C_O0_I2(w, r)

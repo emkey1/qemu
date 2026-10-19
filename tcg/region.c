@@ -24,6 +24,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "qemu/cutils.h"
 #include "qemu/madvise.h"
 #include "qemu/mprotect.h"
 #include "qemu/memalign.h"
@@ -237,7 +238,9 @@ static size_t G_GNUC_UNUSED tctish_requested_chunk(void)
         return 0;
     }
 
-    mib = strtoul(value, NULL, 10);
+    if (qemu_strtoul(value, NULL, 10, &mib) < 0) {
+        return 0;
+    }
     return (size_t)mib * MiB;
 }
 
@@ -908,26 +911,7 @@ static int alloc_code_gen_buffer_splitwx_memfd(size_t size, TCGCodeBuffer *cb,
 #endif /* CONFIG_POSIX */
 
 #ifdef CONFIG_DARWIN
-#include <mach/mach.h>
-
-#include <mach/vm_purgable.h>
-
-extern kern_return_t mach_vm_purgable_control(vm_map_t target_task,
-                                              mach_vm_address_t address,
-                                              vm_purgable_t control,
-                                              int *state);
-
-extern kern_return_t mach_vm_remap(vm_map_t target_task,
-                                   mach_vm_address_t *target_address,
-                                   mach_vm_size_t size,
-                                   mach_vm_offset_t mask,
-                                   int flags,
-                                   vm_map_t src_task,
-                                   mach_vm_address_t src_address,
-                                   boolean_t copy,
-                                   vm_prot_t *cur_protection,
-                                   vm_prot_t *max_protection,
-                                   vm_inherit_t inheritance);
+#include "darwin-vm.h"
 
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
@@ -982,7 +966,7 @@ static int is_debugger_attached(void)
     size = sizeof(info);
 
     if (sysctl(mib, 4, &info, &size, NULL, 0) == -1) {
-        return 0; // sysctl failed, be conservative
+        return 0; /* sysctl failed, be conservative */
     }
 
     /* P_TRACED means the process is being debugged */

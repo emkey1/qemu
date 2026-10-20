@@ -360,6 +360,11 @@
 #
 # @tftp-server-name: RFC2132 "TFTP server name" string (Since 3.1)
 #
+# @mtu: largest IP packet, in bytes, the user mode stack sends to
+#     the guest, and largest IPv6 packet it accepts from it, from 68
+#     to 65521.  The guest's interface MTU must not be larger.
+#     Default is 1500.  (Since 11.2)
+#
 # Since: 1.2
 ##
 { 'struct': 'NetdevUserOptions',
@@ -385,7 +390,8 @@
     '*smbserver': 'str',
     '*hostfwd':   ['NetdevUserHostForward'],
     '*guestfwd':  ['NetdevUserGuestForward'],
-    '*tftp-server-name': 'str' } }
+    '*tftp-server-name': 'str',
+    '*mtu':       'uint32' } }
 
 ##
 # @NetdevTapOptions:

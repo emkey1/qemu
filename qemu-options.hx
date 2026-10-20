@@ -2994,7 +2994,8 @@ DEF("netdev", HAS_ARG, QEMU_OPTION_netdev,
     "         [,ipv6=on|off][,ipv6-net=addr[/int]][,ipv6-host=addr]\n"
     "         [,restrict=on|off][,hostname=host][,dhcpstart=addr]\n"
     "         [,dns=addr][,ipv6-dns=addr][,dnssearch=domain][,domainname=domain]\n"
-    "         [,tftp=dir][,tftp-server-name=name][,bootfile=f][,hostfwd=rule][,guestfwd=rule]"
+    "         [,tftp=dir][,tftp-server-name=name][,bootfile=f][,hostfwd=rule][,guestfwd=rule]\n"
+    "         [,mtu=bytes]"
 #ifndef _WIN32
                                              "[,smb=dir[,smbserver=addr]]\n"
 #endif
@@ -3438,6 +3439,16 @@ SRST
         (RFC2132 option 66). This can be used to advise the guest to
         load boot files or configurations from a different server than
         the host address.
+
+    ``mtu=bytes``
+        The largest IP packet the user mode network stack sends to the
+        guest, and the largest IPv6 packet it accepts from it, from 68 to
+        65521; the default is 1500.
+        Its TCP segments grow with it, so a guest moving bulk data makes
+        far fewer trips through its network stack. The guest's interface
+        MTU must not be larger, and should match: give the NIC the same
+        value with ``host_mtu`` where it has one (virtio-net does), or
+        set it in the guest.
 
     ``bootfile=file``
         When using the user mode network stack, broadcast file as the

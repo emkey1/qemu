@@ -439,7 +439,7 @@ static int net_slirp_init(NetClientState *peer, const char *model,
                           const char *vnameserver, const char *vnameserver6,
                           const char *smb_export, const char *vsmbserver,
                           const char **dnssearch, const char *vdomainname,
-                          const char *tftp_server_name,
+                          const char *tftp_server_name, uint32_t mtu,
                           Error **errp)
 {
     /* default settings according to historic slirp */
@@ -663,6 +663,13 @@ static int net_slirp_init(NetClientState *peer, const char *model,
     cfg.vnameserver6 = ip6_dns;
     cfg.vdnssearch = dnssearch;
     cfg.vdomainname = vdomainname;
+    /*
+     * One value for both directions: the guest's interface has a single
+     * MTU, and libslirp's TCP takes its MSS from the smaller of the two.
+     * Zero leaves libslirp's default of 1500.
+     */
+    cfg.if_mtu = mtu;
+    cfg.if_mru = mtu;
     s->slirp = slirp_new(&cfg, &slirp_cb, s);
     QTAILQ_INSERT_TAIL(&slirp_stacks, s, entry);
 
@@ -1284,6 +1291,12 @@ int net_init_slirp(const Netdev *netdev, const char *name,
     assert(netdev->type == NET_CLIENT_DRIVER_USER);
     user = &netdev->u.user;
 
+    /* libslirp's IF_MTU_MIN and IF_MTU_MAX, which it does not export. */
+    if (user->has_mtu && (user->mtu < 68 || user->mtu > 65521)) {
+        error_setg(errp, "'mtu' must be between 68 and 65521");
+        return -1;
+    }
+
     if ((user->has_ipv6 && user->ipv6 && !user->has_ipv4) ||
         (user->has_ipv4 && !user->ipv4)) {
         ipv4 = 0;
@@ -1311,7 +1324,8 @@ int net_init_slirp(const Netdev *netdev, const char *name,
                          user->bootfile, user->dhcpstart,
                          user->dns, user->ipv6_dns, user->smb,
                          user->smbserver, dnssearch, user->domainname,
-                         user->tftp_server_name, errp);
+                         user->tftp_server_name,
+                         user->has_mtu ? user->mtu : 0, errp);
 
     while (slirp_configs) {
         config = slirp_configs;

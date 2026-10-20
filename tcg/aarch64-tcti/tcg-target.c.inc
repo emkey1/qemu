@@ -1800,13 +1800,13 @@ static TCTIGadget2 *const tcti_qemu_st_slow[2][2][MO_64 + 1] = {
 };
 
 /*
- * Whether a TLB fast-path gadget can serve this access. The gadgets hard-code
- * 4K pages and 32-byte TLB entries in their index and comparison arithmetic.
+ * Whether a TLB fast-path gadget can serve this access. The gadgets are built
+ * for one guest page size, which TCG's common code knows only at run time.
  */
 static bool tcti_has_fast_path(TCGContext *s, unsigned mmu_idx)
 {
     if (mmu_idx >= TCTI_TLB_FAST_MMU_INDICES ||
-        TARGET_PAGE_BITS != 12 || CPU_TLB_ENTRY_BITS != 5) {
+        TARGET_PAGE_BITS != TCTI_TLB_PAGE_BITS) {
         return false;
     }
     tcg_debug_assert(tlb_mask_table_ofs(s, mmu_idx) == TCTI_TLB_FAST_OFS(mmu_idx));

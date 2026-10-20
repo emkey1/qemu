@@ -490,6 +490,9 @@ def create_tlb_fastpath(is_write, miss_label="0", size=8, align=None):
     raises the fault, and an aligned access cannot cross a page. Otherwise the
     hit takes all size bytes from Xn to be on the page.
 
+    QEMU's constants, the TLB's layout among them, are the gadget's asm
+    operands, which tlb_operands() gives for the same is_write and align.
+
     Clobbers x24, and x26; provides output in x27.
     """
 
@@ -499,14 +502,14 @@ def create_tlb_fastpath(is_write, miss_label="0", size=8, align=None):
         "ldp x26, x27, [x14, %[tlb_ofs]]",
 
         # Extract the TLB index from the address into X26.
-        "and x26, x26, Xn, lsr #7", # Xn = addr register
+        "and x26, x26, Xn, lsr %[tlb_shift]", # Xn = addr register
 
         # Add the tlb_table pointer, creating the CPUTLBEntry address into X27.
         "add x27, x27, x26",
 
         # Load the tlb comparator into X26, and the fast path addend into X27.
-        "ldr x26, [x27, #8]" if is_write else "ldr x26, [x27]",
-        "ldr x27, [x27, #0x18]",
+        "ldr x26, [x27, %[tlb_cmp]]",
+        "ldr x27, [x27, %[tlb_addend]]",
 
     ]
 
@@ -514,7 +517,7 @@ def create_tlb_fastpath(is_write, miss_label="0", size=8, align=None):
         fast_path.extend([
             # Store the page mask part of the address into X24, and the bits
             # below the alignment, which must be clear for a hit.
-            f"and x24, Xn, #{0xfffffffffffff000 | (align - 1):#x}",
+            "and x24, Xn, %[tlb_page_mask]",
 
             # Compare the masked address with the TLB value.
             "cmp x26, x24",
@@ -529,7 +532,7 @@ def create_tlb_fastpath(is_write, miss_label="0", size=8, align=None):
             f"add x24, Xn, #{size - 1}",
 
             # Store the page mask part of the address into X24.
-            "and x24, x24, #0xfffffffffffff000",
+            "and x24, x24, %[tlb_page_mask]",
 
             # Compare the masked address with the TLB value.
             "cmp x26, x24",
@@ -542,9 +545,21 @@ def create_tlb_fastpath(is_write, miss_label="0", size=8, align=None):
 
 
 
-def tlb_operands(mmu_idx):
-    """ The asm operand list for a fast-path gadget serving mmu_idx. """
-    return f'[tlb_ofs] "i" (TCTI_TLB_FAST_OFS({mmu_idx}))'
+def tlb_operands(mmu_idx, is_write, align=None):
+    """ The asm operand list for a fast-path gadget serving mmu_idx, with the
+    is_write and align its create_tlb_fastpath() was given. Each value is
+    worked out by the C compiler from QEMU's own definitions. """
+    comparator = "addr_write" if is_write else "addr_read"
+    page_mask = "TCTI_TLB_PAGE_MASK"
+    if (align or 1) > 1:
+        page_mask += f" | {align - 1}"
+    return ", ".join([
+        f'[tlb_ofs] "i" (TCTI_TLB_FAST_OFS({mmu_idx}))',
+        '[tlb_shift] "i" (TCTI_TLB_INDEX_SHIFT)',
+        f'[tlb_cmp] "i" (offsetof(CPUTLBEntry, {comparator}))',
+        '[tlb_addend] "i" (offsetof(CPUTLBEntry, addend))',
+        f'[tlb_page_mask] "i" ({page_mask})',
+    ])
 
 
 def granule_check(size, align=None):
@@ -576,7 +591,8 @@ def ld_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None,
     indices = [None] if force_slowpath else QEMU_TLB_FAST_MMU_INDICES
     for mmu_idx in indices:
         suffix = "any" if mmu_idx is None else f"idx{mmu_idx}"
-        operands = None if mmu_idx is None else tlb_operands(mmu_idx)
+        operands = (None if mmu_idx is None
+                    else tlb_operands(mmu_idx, is_write=False, align=align))
 
         for is_32b in (True, False):
             fastpath = fastpath_32b if is_32b else fastpath_64b
@@ -661,7 +677,8 @@ def st_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None,
     indices = [None] if force_slowpath else QEMU_TLB_FAST_MMU_INDICES
     for mmu_idx in indices:
         suffix = "any" if mmu_idx is None else f"idx{mmu_idx}"
-        operands = None if mmu_idx is None else tlb_operands(mmu_idx)
+        operands = (None if mmu_idx is None
+                    else tlb_operands(mmu_idx, is_write=True, align=align))
 
         for is_32b in (True, False):
             fastpath = fastpath_32b if is_32b else fastpath_64b
@@ -1436,7 +1453,8 @@ def ldst_i128(is_ld, align, mmu_idx, ordered):
     variant = "i128_ord" if ordered else "i128"
     with_single(f"qemu_{op}_{variant}_a{align}_{suffix}", "n", *fast, "0:", *slow,
                 "add x28, x28, #8",
-                operands=None if mmu_idx is None else tlb_operands(mmu_idx))
+                operands=(None if mmu_idx is None
+                          else tlb_operands(mmu_idx, is_write=not is_ld)))
 
 for ordered in (False, True):
     for is_ld in (True, False):

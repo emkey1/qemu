@@ -32,7 +32,9 @@
 #include <sys/wait.h>
 #endif
 #include "net/eth.h"
+#include "net/checksum.h"
 #include "net/net.h"
+#include "standard-headers/linux/virtio_net.h"
 #include "clients.h"
 #include "hub.h"
 #include "monitor/monitor.h"
@@ -97,6 +99,18 @@ typedef struct SlirpState {
     gchar *smb_dir;
 #endif
     GSList *fwd;
+    /*
+     * offload=on: frames to and from the NIC may carry a virtio-net header,
+     * and once the NIC asks for one (vnet_hdr_len), every frame does. The
+     * NIC then leaves TCP and UDP checksums, and large TCP sends, for us to
+     * finish, in tx_buf. guest_csum says whether the guest takes frames
+     * marked as checksummed; rx_buf holds each frame for it with its header.
+     */
+    bool offload;
+    int vnet_hdr_len;
+    bool guest_csum;
+    uint8_t *tx_buf;
+    uint8_t *rx_buf;
 } SlirpState;
 
 static struct slirp_config_str *slirp_configs;
@@ -128,16 +142,230 @@ static ssize_t net_slirp_send_packet(const void *pkt, size_t pkt_len,
         }
     }
 
+    if (s->vnet_hdr_len) {
+        /*
+         * libslirp builds every frame it sends, checksums included, so a
+         * guest that takes our word for them need not check them again.
+         * The header and the frame go to the NIC in one buffer: virtio-net
+         * takes a frame only whole, so two would cost an allocation and a
+         * copy on the way in.
+         */
+        struct virtio_net_hdr hdr = { };
+        ssize_t ret;
+
+        if (pkt_len > NET_BUFSIZE) {
+            return -1;
+        }
+        if (s->guest_csum) {
+            hdr.flags = VIRTIO_NET_HDR_F_DATA_VALID;
+        }
+        memset(s->rx_buf, 0, s->vnet_hdr_len);
+        memcpy(s->rx_buf, &hdr, sizeof(hdr));
+        memcpy(s->rx_buf + s->vnet_hdr_len, pkt, pkt_len);
+        ret = qemu_send_packet(&s->nc, s->rx_buf, s->vnet_hdr_len + pkt_len);
+        return ret > s->vnet_hdr_len ? ret - s->vnet_hdr_len : ret;
+    }
+
     return qemu_send_packet(&s->nc, pkt, pkt_len);
+}
+
+/*
+ * Completes the checksum the guest left partial, as virtio-net defines it:
+ * the sender has put the pseudo-header's sum at csum_start + csum_offset, and
+ * the checksum is over everything from csum_start to the end of the frame.
+ */
+static bool net_slirp_complete_csum(uint8_t *frame, size_t len,
+                                    const struct virtio_net_hdr *hdr)
+{
+    size_t start = hdr->csum_start, field = start + hdr->csum_offset;
+
+    if (field + 2 > len) {
+        return false;
+    }
+    /* UDP sends a sum of zero as 0xFFFF; TCP accepts either. */
+    stw_be_p(frame + field,
+             net_checksum_finish_nozero(net_checksum_add(len - start,
+                                                         frame + start)));
+    return true;
+}
+
+/*
+ * Finishes a TCP send the guest made larger than its MSS, in native code,
+ * which is what saves an emulated guest the work: segments get their own
+ * IP and TCP headers and checksums.
+ *
+ * libslirp takes an IPv4 segment of any length, and acknowledges each
+ * segment it is given, so an IPv4 send goes to it whole: the guest then
+ * gets one ACK for it, not one for every gso_size bytes, and handling those
+ * ACKs is most of what a TSO send at a small MSS costs it. libslirp drops
+ * an IPv6 packet longer than its MTU, so an IPv6 send is cut into segments
+ * of gso_size.
+ */
+static void net_slirp_segment(SlirpState *s, const struct virtio_net_hdr *hdr,
+                              const uint8_t *frame, size_t len)
+{
+    bool v6 = (hdr->gso_type & ~VIRTIO_NET_HDR_GSO_ECN) ==
+              VIRTIO_NET_HDR_GSO_TCPV6;
+    size_t l3 = ETH_HLEN, l4 = hdr->csum_start, hlen, payload, off;
+    const uint8_t *ip, *th;
+    uint16_t proto, ip_id = 0;
+    size_t step;
+    uint32_t seq;
+    uint8_t flags;
+    unsigned i;
+
+    proto = lduw_be_p(frame + offsetof(struct eth_header, h_proto));
+    if (proto != (v6 ? ETH_P_IPV6 : ETH_P_IP) || !hdr->gso_size ||
+        l4 < l3 + (v6 ? sizeof(struct ip6_header) : sizeof(struct ip_header)) ||
+        l4 + sizeof(struct tcp_header) > len) {
+        qemu_log_mask(LOG_GUEST_ERROR, "slirp: malformed TCP GSO frame\n");
+        return;
+    }
+    ip = frame + l3;
+    th = frame + l4;
+    /* The data offset, in words, is the top four bits of its byte. */
+    hlen = l4 + (th[offsetof(struct tcp_header, th_offset_flags)] >> 4) * 4;
+    if (ip[0] >> 4 != (v6 ? 6 : 4) ||
+        (!v6 && ((ip[0] & 0xf) * 4 != l4 - l3 ||
+                 ip[offsetof(struct ip_header, ip_p)] != IP_PROTO_TCP)) ||
+        hlen < l4 + sizeof(struct tcp_header) || hlen > len) {
+        qemu_log_mask(LOG_GUEST_ERROR, "slirp: malformed TCP GSO frame\n");
+        return;
+    }
+    payload = len - hlen;
+    seq = ldl_be_p(frame + l4 + offsetof(struct tcp_header, th_seq));
+    flags = frame[l4 + offsetof(struct tcp_header, th_offset_flags) + 1];
+    if (!v6) {
+        ip_id = lduw_be_p(frame + l3 + offsetof(struct ip_header, ip_id));
+    }
+    /* Whole only while the IPv4 total length can say so. */
+    step = v6 || len - l3 > UINT16_MAX ? hdr->gso_size : MAX(payload, 1);
+    /* And no segment larger than its IP length can say. */
+    if (hlen - l3 + MIN(step, payload) >
+        UINT16_MAX + (v6 ? sizeof(struct ip6_header) : 0)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "slirp: TCP GSO segment too long\n");
+        return;
+    }
+
+    for (off = 0, i = 0; off < payload || i == 0; off += step, i++) {
+        size_t n = MIN(step, payload - off), seg_len = hlen + n;
+        uint8_t *seg = s->tx_buf, *tcp = seg + l4;
+        uint32_t cso, sum;
+
+        memcpy(seg, frame, hlen);
+        memcpy(seg + hlen, frame + hlen + off, n);
+
+        /*
+         * FIN and PSH belong to the last segment, and CWR to the first, as
+         * a NIC doing the segmentation would leave them.
+         */
+        stl_be_p(tcp + offsetof(struct tcp_header, th_seq), seq + off);
+        tcp[offsetof(struct tcp_header, th_offset_flags) + 1] = flags &
+            ~(off + n < payload ? TH_FIN | TH_PUSH : 0) & ~(off ? TH_CWR : 0);
+
+        if (v6) {
+            stw_be_p(seg + l3 + offsetof(struct ip6_header, ip6_plen),
+                     seg_len - l3 - sizeof(struct ip6_header));
+            sum = eth_calc_ip6_pseudo_hdr_csum((struct ip6_header *)(seg + l3),
+                                               seg_len - l4, IP_PROTO_TCP,
+                                               &cso);
+        } else {
+            stw_be_p(seg + l3 + offsetof(struct ip_header, ip_len),
+                     seg_len - l3);
+            stw_be_p(seg + l3 + offsetof(struct ip_header, ip_id), ip_id + i);
+            eth_fix_ip4_checksum(seg + l3, l4 - l3);
+            sum = eth_calc_ip4_pseudo_hdr_csum((struct ip_header *)(seg + l3),
+                                               seg_len - l4, &cso);
+        }
+        stw_be_p(tcp + offsetof(struct tcp_header, th_sum), 0);
+        sum += net_checksum_add(seg_len - l4, tcp);
+        stw_be_p(tcp + offsetof(struct tcp_header, th_sum),
+                 net_checksum_finish(sum));
+
+        slirp_input(s->slirp, seg, seg_len);
+    }
 }
 
 static ssize_t net_slirp_receive(NetClientState *nc, const uint8_t *buf, size_t size)
 {
     SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
+    struct virtio_net_hdr hdr;
+    const uint8_t *frame;
+    size_t len;
 
-    slirp_input(s->slirp, buf, size);
+    if (!s->vnet_hdr_len) {
+        slirp_input(s->slirp, buf, size);
+        return size;
+    }
+
+    if (size < s->vnet_hdr_len + ETH_HLEN ||
+        size - s->vnet_hdr_len > NET_BUFSIZE) {
+        return size;
+    }
+    memcpy(&hdr, buf, sizeof(hdr));
+    frame = buf + s->vnet_hdr_len;
+    len = size - s->vnet_hdr_len;
+
+    switch (hdr.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) {
+    case VIRTIO_NET_HDR_GSO_NONE:
+        if (!(hdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+            slirp_input(s->slirp, frame, len);
+            break;
+        }
+        /* The frame is the guest's buffer, so finish it in a copy. */
+        memcpy(s->tx_buf, frame, len);
+        if (net_slirp_complete_csum(s->tx_buf, len, &hdr)) {
+            slirp_input(s->slirp, s->tx_buf, len);
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR, "slirp: checksum outside frame\n");
+        }
+        break;
+    case VIRTIO_NET_HDR_GSO_TCPV4:
+    case VIRTIO_NET_HDR_GSO_TCPV6:
+        net_slirp_segment(s, &hdr, frame, len);
+        break;
+    default:
+        /*
+         * UDP. virtio-net offers no UDP segmentation, as we have no has_ufo
+         * or has_uso, but e1000e, igb and vmxnet3 send UDP GSO frames to any
+         * peer with the header; those are dropped.
+         */
+        qemu_log_mask(LOG_GUEST_ERROR, "slirp: unsupported GSO type 0x%x\n",
+                      hdr.gso_type);
+        break;
+    }
 
     return size;
+}
+
+static bool net_slirp_has_vnet_hdr(NetClientState *nc)
+{
+    SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
+
+    return s->offload;
+}
+
+/* Every header starts with struct virtio_net_hdr, the only part we read. */
+static bool net_slirp_has_vnet_hdr_len(NetClientState *nc, int len)
+{
+    return net_slirp_has_vnet_hdr(nc);
+}
+
+static void net_slirp_set_vnet_hdr_len(NetClientState *nc, int len)
+{
+    SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
+
+    /* Only a NIC that has_vnet_hdr said yes to asks. */
+    assert(s->offload);
+    s->vnet_hdr_len = len;
+}
+
+/* What the guest accepts; it tells us whether to mark checksums valid. */
+static void net_slirp_set_offload(NetClientState *nc, const NetOffloads *ol)
+{
+    SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
+
+    s->guest_csum = ol->csum;
 }
 
 static void slirp_smb_exit(Notifier *n, void *data)
@@ -166,6 +394,8 @@ static void net_slirp_cleanup(NetClientState *nc)
         qemu_remove_exit_notifier(&s->exit_notifier);
     }
     slirp_smb_cleanup(s);
+    g_free(s->tx_buf);
+    g_free(s->rx_buf);
     QTAILQ_REMOVE(&slirp_stacks, s, entry);
 }
 
@@ -174,6 +404,10 @@ static NetClientInfo net_slirp_info = {
     .size = sizeof(SlirpState),
     .receive = net_slirp_receive,
     .cleanup = net_slirp_cleanup,
+    .has_vnet_hdr = net_slirp_has_vnet_hdr,
+    .has_vnet_hdr_len = net_slirp_has_vnet_hdr_len,
+    .set_vnet_hdr_len = net_slirp_set_vnet_hdr_len,
+    .set_offload = net_slirp_set_offload,
 };
 
 static void net_slirp_guest_error(const char *msg, void *opaque)
@@ -440,7 +674,7 @@ static int net_slirp_init(NetClientState *peer, const char *model,
                           const char *smb_export, const char *vsmbserver,
                           const char **dnssearch, const char *vdomainname,
                           const char *tftp_server_name, uint32_t mtu,
-                          Error **errp)
+                          bool offload, Error **errp)
 {
     /* default settings according to historic slirp */
     struct in_addr net  = { .s_addr = htonl(0x0a000200) }; /* 10.0.2.0 */
@@ -641,6 +875,12 @@ static int net_slirp_init(NetClientState *peer, const char *model,
                       restricted ? "on" : "off");
 
     s = DO_UPCAST(SlirpState, nc, nc);
+    s->offload = offload;
+    if (offload) {
+        s->tx_buf = g_malloc(NET_BUFSIZE);
+        s->rx_buf = g_malloc(NET_BUFSIZE +
+                             sizeof(struct virtio_net_hdr_v1_hash_tunnel));
+    }
 
     cfg.version =
          SLIRP_CHECK_VERSION(4, 9, 0) ? 6 :
@@ -1325,7 +1565,8 @@ int net_init_slirp(const Netdev *netdev, const char *name,
                          user->dns, user->ipv6_dns, user->smb,
                          user->smbserver, dnssearch, user->domainname,
                          user->tftp_server_name,
-                         user->has_mtu ? user->mtu : 0, errp);
+                         user->has_mtu ? user->mtu : 0,
+                         user->has_offload && user->offload, errp);
 
     while (slirp_configs) {
         config = slirp_configs;

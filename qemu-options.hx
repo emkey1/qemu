@@ -2995,7 +2995,7 @@ DEF("netdev", HAS_ARG, QEMU_OPTION_netdev,
     "         [,restrict=on|off][,hostname=host][,dhcpstart=addr]\n"
     "         [,dns=addr][,ipv6-dns=addr][,dnssearch=domain][,domainname=domain]\n"
     "         [,tftp=dir][,tftp-server-name=name][,bootfile=f][,hostfwd=rule][,guestfwd=rule]\n"
-    "         [,mtu=bytes]"
+    "         [,mtu=bytes][,offload=on|off]"
 #ifndef _WIN32
                                              "[,smb=dir[,smbserver=addr]]\n"
 #endif
@@ -3449,6 +3449,19 @@ SRST
         MTU must not be larger, and should match: give the NIC the same
         value with ``host_mtu`` where it has one (virtio-net does), or
         set it in the guest.
+
+    ``offload=on|off``
+        Let the NIC hand its checksum and TCP segmentation offloads to
+        the user mode network stack, as it does to a tap device with
+        ``vnet_hdr=on``: the guest leaves its TCP and UDP checksums
+        unfinished and sends TCP data in pieces of up to 64 KiB, and
+        QEMU finishes them in native code, cutting IPv6 ones into
+        segments. Frames the stack sends are marked as already
+        checksummed when the guest accepts that. Use it with
+        virtio-net: e1000e, igb and vmxnet3 carry the header too, but
+        UDP they are asked to segment is dropped. Other NICs are
+        unaffected. Default is off. A snapshot taken with it on can
+        only be loaded with it on.
 
     ``bootfile=file``
         When using the user mode network stack, broadcast file as the

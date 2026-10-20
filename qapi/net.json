@@ -365,6 +365,10 @@
 #     to 65521.  The guest's interface MTU must not be larger.
 #     Default is 1500.  (Since 11.2)
 #
+# @offload: carry the virtio-net header, so that a guest can leave
+#     its TCP and UDP checksums, and its large TCP sends, for QEMU to
+#     finish.  Default is off.  (Since 11.2)
+#
 # Since: 1.2
 ##
 { 'struct': 'NetdevUserOptions',
@@ -391,7 +395,8 @@
     '*hostfwd':   ['NetdevUserHostForward'],
     '*guestfwd':  ['NetdevUserGuestForward'],
     '*tftp-server-name': 'str',
-    '*mtu':       'uint32' } }
+    '*mtu':       'uint32',
+    '*offload':   'bool' } }
 
 ##
 # @NetdevTapOptions:

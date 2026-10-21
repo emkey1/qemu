@@ -126,7 +126,7 @@ static void __attribute__((constructor)) rv_pairs_init(void)
 }
 
 /* gadgets.S: the tag masks of the loads and stores, and rv_lookup's hash. */
-QEMU_BUILD_BUG_ON(TARGET_PAGE_BITS != 12);
+QEMU_BUILD_BUG_ON(TARGET_PAGE_BITS != AOK_TLB_PAGE_BITS);
 
 /*
  * The softmmu slow paths of the load and store gadgets. Called with the

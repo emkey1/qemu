@@ -14,6 +14,17 @@
 #include "accel/tcg/aok.h"
 #include "internal-common.h"
 #include "tb-internal.h"
+#include "exec/tlb-common.h"
+#include "accel/tcg/aok-tlb.h"
+
+/* The TLB as every front end's gadgets read it (aok-tlb.h). */
+QEMU_BUILD_BUG_ON(CPU_TLB_ENTRY_BITS != AOK_TLB_ENTRY_BITS);
+QEMU_BUILD_BUG_ON(sizeof(CPUTLBEntry) != 1 << AOK_TLB_ENTRY_BITS);
+QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, mask) != AOK_TLBF_MASK);
+QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, table) != AOK_TLBF_TABLE);
+QEMU_BUILD_BUG_ON(offsetof(CPUTLBEntry, addr_read) != AOK_TLBE_READ);
+QEMU_BUILD_BUG_ON(offsetof(CPUTLBEntry, addr_write) != AOK_TLBE_WRITE);
+QEMU_BUILD_BUG_ON(offsetof(CPUTLBEntry, addend) != AOK_TLBE_ADDEND);
 
 bool aok_enabled = true;
 bool aok_stats_enabled;

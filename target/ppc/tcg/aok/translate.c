@@ -101,7 +101,7 @@ static void __attribute__((constructor)) ppc_pairs_init(void)
 
 /* What gadgets.S knows of CPUPPCState (aok-ppc-asm.h). */
 QEMU_BUILD_BUG_ON(TARGET_LONG_BITS != 32);
-QEMU_BUILD_BUG_ON(TARGET_PAGE_BITS != 12);
+QEMU_BUILD_BUG_ON(TARGET_PAGE_BITS != AOK_TLB_PAGE_BITS);
 QEMU_BUILD_BUG_ON(offsetof(CPUPPCState, gpr) != AOK_PPC_ENV_GPR);
 QEMU_BUILD_BUG_ON(offsetof(CPUPPCState, aok_zero) != AOK_PPC_ENV_AOK_ZERO);
 QEMU_BUILD_BUG_ON(offsetof(CPUPPCState, lr) != AOK_PPC_ENV_LR);

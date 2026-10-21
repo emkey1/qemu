@@ -21,6 +21,7 @@
 #include "exec/vaddr.h"
 #include "hw/core/cpu.h"
 #include "accel/tcg/cpu-ops.h"
+#include "accel/tcg/aok-tlb.h"
 
 #ifdef CONFIG_AOK_GADGETS
 

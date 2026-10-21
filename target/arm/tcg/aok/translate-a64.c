@@ -2859,7 +2859,7 @@ int arm_aok_translate_code(CPUState *cs, TranslationBlock *tb,
      * ordinary TB: one in RAM that may check for interrupts and need not
      * stop after a set number of insns.
      */
-    if (!code || !(cflags & CF_PCREL) || TARGET_PAGE_BITS != 12 ||
+    if (!code || !(cflags & CF_PCREL) || TARGET_PAGE_BITS != AOK_TLB_PAGE_BITS ||
         (cflags & (CF_COUNT_MASK | CF_SINGLE_STEP | CF_MEMI_ONLY |
                    CF_USE_ICOUNT | CF_NOIRQ | CF_BP_PAGE | CF_STEP_ATOMIC)) ||
         !EX_TBFLAG_ANY(f, AARCH64_STATE) ||

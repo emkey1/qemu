@@ -117,11 +117,6 @@ SYM(aok_gadget_x86_\name):
  * operand that must be aligned (the "a" gadgets) has no second chance, and
  * C raises its #GP.
  */
-#define TLB_FOLD        8
-#define TLB_SHIFT       7
-#define TLBE_READ       0
-#define TLBE_WRITE      8
-#define TLBE_ADDEND     24
 
 .set X86_MP, 0
 .macro ld_barrier
@@ -137,11 +132,10 @@ SYM(aok_gadget_x86_\name):
 
 .macro x86_probe size, id, tag
     ldp x9, x10, [_tlb]
-    eor x11, _addr, _addr, lsr #TLB_FOLD
-    and x9, x9, x11, lsr #TLB_SHIFT
+    and x9, x9, _addr, lsr #AOK_TLB_SHIFT
     add x10, x10, x9
     ldr x11, [x10, #\tag]
-    ldr x10, [x10, #TLBE_ADDEND]
+    ldr x10, [x10, #AOK_TLBE_ADDEND]
     .if \size == 8
     and x9, _addr, #0xfffffffffffff000
     .else
@@ -249,7 +243,7 @@ back_\id:
 .macro g_vldst name, bytes, form, aligned
 .gadget \name
     mem_begin \form, 0
-    x86_probe (\bytes * 8), \name, TLBE_READ
+    x86_probe (\bytes * 8), \name, AOK_TLBE_READ
     vst_load \bytes, _addr
     ld_barrier
     mov x9, #VEX_STAGE
@@ -288,7 +282,7 @@ miss_\name:
 .gadget \name
     ldr x8, [_ip]
     mem_begin \form, 1
-    x86_probe (\bytes * 8), \name, TLBE_WRITE
+    x86_probe (\bytes * 8), \name, AOK_TLBE_WRITE
     add x9, _cpu, x8
     vst_load \bytes, x9
     st_barrier
@@ -328,7 +322,7 @@ miss_\name:
 .macro g_vstprobe name, bytes, form
 .gadget \name
     mem_begin \form, 0
-    x86_probe (\bytes * 8), \name, TLBE_WRITE
+    x86_probe (\bytes * 8), \name, AOK_TLBE_WRITE
 done_\name:
     gret_ahead
 miss_\name:
@@ -456,7 +450,7 @@ vec_mem_aligned \form, \n, _mp
     .else
     mem_begin \form, 0
     .endif
-    x86_probe (\bytes * 8), \name, TLBE_READ
+    x86_probe (\bytes * 8), \name, AOK_TLBE_READ
     .if \bytes == 4
     ld1r {v0.4s}, [_addr]
     .else
@@ -492,7 +486,7 @@ miss_\name:
     vm_align \name
     cbz x16, zero_\name
     vm_onepage \name
-    x86_probe 8, \name, TLBE_READ
+    x86_probe 8, \name, AOK_TLBE_READ
     mov x9, #VEX_STAGE
     add x9, _cpu, x9
     cmp w14, #32
@@ -549,7 +543,7 @@ slow_\name:
     cbz x16, done_\name
     vm_onepage \name
     vm_compress
-    x86_probe 8, \name, TLBE_WRITE
+    x86_probe 8, \name, AOK_TLBE_WRITE
     .if \probe
     b done_\name
     .endif
@@ -723,12 +717,12 @@ loop_\name:
     .if \scatter
     evg_get
     tbnz w8, #12, q_\name
-    x86_probe 32, \name\()_4, TLBE_WRITE
+    x86_probe 32, \name\()_4, AOK_TLBE_WRITE
     st_barrier
     str w3, [_addr]
     b next_\name
 q_\name:
-    x86_probe 64, \name\()_8, TLBE_WRITE
+    x86_probe 64, \name\()_8, AOK_TLBE_WRITE
     st_barrier
     str x3, [_addr]
 next_\name:
@@ -737,11 +731,11 @@ next_\name:
     b loop_\name
     .else
     tbnz w8, #12, q_\name
-    x86_probe 32, \name\()_4, TLBE_READ
+    x86_probe 32, \name\()_4, AOK_TLBE_READ
     ldr w3, [_addr]
     b got_\name
 q_\name:
-    x86_probe 64, \name\()_8, TLBE_READ
+    x86_probe 64, \name\()_8, AOK_TLBE_READ
     ldr x3, [_addr]
 got_\name:
     ld_barrier

@@ -8,6 +8,8 @@
 #ifndef ACCEL_TCG_AOK_ASM_H
 #define ACCEL_TCG_AOK_ASM_H
 
+#include "accel/tcg/aok-tlb.h"
+
 #ifdef __APPLE__
 #define SYM(x) _##x
 #else

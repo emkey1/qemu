@@ -549,7 +549,7 @@
  * insn should it fault.
  *
  * The softmmu fast path, as TCG's own backends inline it: index this TB's
- * fast table by the page number (folded, CPU_TLB_INDEX_FOLD), compare the
+ * fast table by the page number (layout in aok-tlb.h), compare the
  * entry's tag with the address, and on a match the entry's addend turns the
  * guest address into a host one. The tag is compared with the address's page
  * AND its low alignment bits, so only an aligned access to a page with no
@@ -566,11 +566,6 @@
  * the slow path keeps across its call to C.
  */
 _addr   .req x7
-#define TLB_FOLD        8       /* CPU_TLB_INDEX_FOLD */
-#define TLB_SHIFT       7       /* TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS */
-#define TLBE_READ       0
-#define TLBE_WRITE      8
-#define TLBE_ADDEND     24
 
 /* _addr = (rA|0) + d, or (rA|0) + rB: 32 bits, wrapping */
 .macro ea_d
@@ -588,11 +583,10 @@ _addr   .req x7
 /* _addr from the guest address to the host one, or to \miss */
 .macro tlb_probe size, tag, miss
     ldp x9, x10, [_tlb]         /* mask, table */
-    eor x11, _addr, _addr, lsr #TLB_FOLD
-    and x9, x9, x11, lsr #TLB_SHIFT
+    and x9, x9, _addr, lsr #AOK_TLB_SHIFT
     add x10, x10, x9
     ldr x11, [x10, #\tag]
-    ldr x10, [x10, #TLBE_ADDEND]
+    ldr x10, [x10, #AOK_TLBE_ADDEND]
     .if \size == 8
     and x9, _addr, #0xfffffffffffff000
     .else
@@ -623,7 +617,7 @@ _addr   .req x7
     .if \upd
     mov w8, w7
     .endif
-    tlb_probe \size, TLBE_READ, 8f
+    tlb_probe \size, AOK_TLBE_READ, 8f
     \ld w10, [_addr]
     .ifnb \swap
     \swap w10, w10
@@ -659,7 +653,7 @@ _addr   .req x7
     .if \upd
     mov w8, w7
     .endif
-    tlb_probe \size, TLBE_WRITE, 8f
+    tlb_probe \size, AOK_TLBE_WRITE, 8f
     .ifnb \swap
     \swap w10, w6
     \st w10, [_addr]
@@ -780,7 +774,7 @@ _addr   .req x7
     .if \upd
     mov w8, w7
     .endif
-    tlb_probe \size, TLBE_READ, 8f
+    tlb_probe \size, AOK_TLBE_READ, 8f
     .if \size == 64
     ldr x10, [_addr]
     rev x10, x10
@@ -821,7 +815,7 @@ _addr   .req x7
     .if \upd
     mov w8, w7
     .endif
-    tlb_probe \size, TLBE_WRITE, 8f
+    tlb_probe \size, AOK_TLBE_WRITE, 8f
     .if \size == 64
     rev x10, x6
     str x10, [_addr]

@@ -48,7 +48,7 @@ _savw   .req w6
  * insn's distance from the TB's first.
  *
  * The softmmu fast path, as TCG's own backends inline it: index this TB's
- * fast table by the page number (folded, CPU_TLB_INDEX_FOLD), compare the
+ * fast table by the page number (layout in aok-tlb.h), compare the
  * entry's tag with the address, and on a match the entry's addend turns the
  * guest address into a host one. The tag is compared with the address's page
  * AND its low alignment bits, so only an aligned access to a page with no
@@ -62,19 +62,13 @@ _savw   .req w6
  * word, where a load finds the value C read, and where a store's write goes
  * nowhere.
  */
-#define TLB_FOLD        8       /* CPU_TLB_INDEX_FOLD */
-#define TLB_SHIFT       7       /* TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS */
-#define TLBE_READ       0
-#define TLBE_WRITE      8
-#define TLBE_ADDEND     24
 
 .macro rv_tlb_probe size, id, tag
     ldp x9, x10, [_tlb]         /* mask, table */
-    eor x11, _addr, _addr, lsr #TLB_FOLD
-    and x9, x9, x11, lsr #TLB_SHIFT
+    and x9, x9, _addr, lsr #AOK_TLB_SHIFT
     add x10, x10, x9
     ldr x11, [x10, #\tag]
-    ldr x10, [x10, #TLBE_ADDEND]
+    ldr x10, [x10, #AOK_TLBE_ADDEND]
     .if \size == 8
     and x9, _addr, #0xfffffffffffff000
     .else
@@ -87,10 +81,10 @@ back_\id:
 .endm
 
 .macro read_prep size, id, ahead=0
-    rv_tlb_probe \size, \id, TLBE_READ
+    rv_tlb_probe \size, \id, AOK_TLBE_READ
 .endm
 .macro write_prep size, id, ahead=0
-    rv_tlb_probe \size, \id, TLBE_WRITE
+    rv_tlb_probe \size, \id, AOK_TLBE_WRITE
 .endm
 .macro write_done size, id
 .endm

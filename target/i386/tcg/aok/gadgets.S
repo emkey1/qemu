@@ -115,11 +115,6 @@ _ea     .req x6
  * give a guest with several CPUs its ordering: every load before whatever
  * follows it, and stores in their order.
  */
-#define TLB_FOLD        8       /* CPU_TLB_INDEX_FOLD */
-#define TLB_SHIFT       7       /* TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS */
-#define TLBE_READ       0
-#define TLBE_WRITE      8
-#define TLBE_ADDEND     24
 
 .set X86_MP, 0
 
@@ -136,11 +131,10 @@ _ea     .req x6
 
 .macro x86_probe size, id, tag
     ldp x9, x10, [_tlb]         /* mask, table */
-    eor x11, _addr, _addr, lsr #TLB_FOLD
-    and x9, x9, x11, lsr #TLB_SHIFT
+    and x9, x9, _addr, lsr #AOK_TLB_SHIFT
     add x10, x10, x9
     ldr x11, [x10, #\tag]
-    ldr x10, [x10, #TLBE_ADDEND]
+    ldr x10, [x10, #AOK_TLBE_ADDEND]
     .if \size == 8
     and x9, _addr, #0xfffffffffffff000
     .else
@@ -483,7 +477,7 @@ g_xchg xchg64, 64
 .gadget \name
     ldr x8, [_ip]
     mem_begin \form, 1
-    x86_probe \bits, \name, TLBE_READ
+    x86_probe \bits, \name, AOK_TLBE_READ
     \ldinsn, [_addr]
     ld_barrier
     streg \stbits, 17, [_cpu, x8]
@@ -499,7 +493,7 @@ g_xchg xchg64, 64
 .gadget \name
     ldr x8, [_ip]
     mem_begin \form, 1
-    x86_probe \bits, \name, TLBE_WRITE
+    x86_probe \bits, \name, AOK_TLBE_WRITE
     \ldinsn, [_addr]
     ld_barrier
     str x17, [_cpu, x8]
@@ -511,7 +505,7 @@ g_xchg xchg64, 64
     ldr x8, [_ip]
     mem_begin \form, 1
     ldr x17, [_cpu, x8]
-    x86_probe \bits, \name, TLBE_WRITE
+    x86_probe \bits, \name, AOK_TLBE_WRITE
     st_barrier
     stmem \bits, 17, [_addr]
     gret_ahead
@@ -521,7 +515,7 @@ g_xchg xchg64, 64
 .gadget \name
     ldr x17, [_ip]
     mem_begin \form, 1
-    x86_probe \bits, \name, TLBE_WRITE
+    x86_probe \bits, \name, AOK_TLBE_WRITE
     st_barrier
     stmem \bits, 17, [_addr]
     gret_ahead
@@ -677,7 +671,7 @@ loads_stores1 ea, \sfx
 .gadget \name
     ldr x8, [_ip]
     mem_begin \form, 1
-    x86_probe \bits, \name, TLBE_READ
+    x86_probe \bits, \name, AOK_TLBE_READ
     ldsz \bits, 11, [_addr]
     ld_barrier
     ldsz \bits, 10, [_cpu, x8]
@@ -696,9 +690,9 @@ loads_stores1 ea, \sfx
     mem_begin \form, 1
     .if \store
     mov x5, _addr
-    x86_probe \bits, \name, TLBE_WRITE
+    x86_probe \bits, \name, AOK_TLBE_WRITE
     .else
-    x86_probe \bits, \name, TLBE_READ
+    x86_probe \bits, \name, AOK_TLBE_READ
     .endif
     ldsz \bits, 10, [_addr]
     ld_barrier
@@ -769,7 +763,7 @@ alu_mem_forms1 \op, \store, \name, ea, 64, \sfx
 .gadget \name
     ldr x8, [_ip]
     mem_begin \form, 1
-    x86_probe 128, \name, TLBE_READ
+    x86_probe 128, \name, AOK_TLBE_READ
     ldr q16, [_addr]
     ld_barrier
     str q16, [_cpu, x8]
@@ -788,7 +782,7 @@ miss_\name:
     ldr x8, [_ip]
     mem_begin \form, 1
     ldr q16, [_cpu, x8]
-    x86_probe 128, \name, TLBE_WRITE
+    x86_probe 128, \name, AOK_TLBE_WRITE
     st_barrier
     str q16, [_addr]
     gret_ahead
@@ -806,7 +800,7 @@ miss_\name:
 .gadget \name
     ldr x8, [_ip]
     mem_begin \form, 1
-    x86_probe \bits, \name, TLBE_READ
+    x86_probe \bits, \name, AOK_TLBE_READ
     \ldinsn, [_addr]
     ld_barrier
     add x9, _cpu, x8
@@ -1703,7 +1697,7 @@ g_loop jcxz32, w, 0
     ldr \r\()5, [_cpu, #AOK_X86_ENV_RSP]
     sub \r\()5, \r\()5, #\bytes
     mov _addr, x5
-    x86_probe \bits, \name, TLBE_WRITE
+    x86_probe \bits, \name, AOK_TLBE_WRITE
     st_barrier
     str \r\()17, [_addr]
     str x5, [_cpu, #AOK_X86_ENV_RSP]
@@ -1717,7 +1711,7 @@ g_loop jcxz32, w, 0
     add _ip, _ip, #24
     ldr \r\()5, [_cpu, #AOK_X86_ENV_RSP]
     mov _addr, x5
-    x86_probe \bits, \name, TLBE_READ
+    x86_probe \bits, \name, AOK_TLBE_READ
     ldr \r\()17, [_addr]
     ld_barrier
     add \r\()5, \r\()5, #\bytes
@@ -1732,7 +1726,7 @@ g_loop jcxz32, w, 0
     add _ip, _ip, #16
     ldr \r\()5, [_cpu, #AOK_X86_ENV_RBP]
     mov _addr, x5
-    x86_probe \bits, \name, TLBE_READ
+    x86_probe \bits, \name, AOK_TLBE_READ
     ldr \r\()17, [_addr]
     ld_barrier
     add \r\()5, \r\()5, #\bytes
@@ -1764,7 +1758,7 @@ g_loop jcxz32, w, 0
     ldr \r\()5, [_cpu, #AOK_X86_ENV_RSP]
     sub \r\()5, \r\()5, #\bytes
     mov _addr, x5
-    x86_probe \bits, \name, TLBE_WRITE
+    x86_probe \bits, \name, AOK_TLBE_WRITE
     st_barrier
     str \r\()17, [_addr]
     str x5, [_cpu, #AOK_X86_ENV_RSP]
@@ -1792,7 +1786,7 @@ ncb_\name:
     ldr \r\()5, [_cpu, #AOK_X86_ENV_RSP]
     sub \r\()5, \r\()5, #\bytes
     mov _addr, x5
-    x86_probe \bits, \name, TLBE_WRITE
+    x86_probe \bits, \name, AOK_TLBE_WRITE
     st_barrier
     str \r\()17, [_addr]
     str x5, [_cpu, #AOK_X86_ENV_RSP]
@@ -1817,7 +1811,7 @@ nc_\name:
     add _ip, _ip, #24
     ldr \r\()5, [_cpu, #AOK_X86_ENV_RSP]
     mov _addr, x5
-    x86_probe \bits, \name, TLBE_READ
+    x86_probe \bits, \name, AOK_TLBE_READ
     ldr \r\()10, [_addr]
     ld_barrier
     .if \bits == 64

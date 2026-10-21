@@ -4739,7 +4739,7 @@ int x86_aok_translate_code(CPUState *cs, TranslationBlock *tb,
      */
     bool one = false;
 
-    if (!host_pc || !(cflags & CF_PCREL) || TARGET_PAGE_BITS != 12 ||
+    if (!host_pc || !(cflags & CF_PCREL) || TARGET_PAGE_BITS != AOK_TLB_PAGE_BITS ||
         (cflags & (CF_SINGLE_STEP | CF_MEMI_ONLY | CF_USE_ICOUNT |
                    CF_STEP_ATOMIC)) ||
         (flags & (HF_INHIBIT_IRQ_MASK | HF_VM_MASK | HF_SMM_MASK |

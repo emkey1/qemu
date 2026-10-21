@@ -48,7 +48,7 @@ _fval2  .req x1
  * from the TB's first.
  *
  * The softmmu fast path, as TCG's own backends inline it: index this TB's
- * fast table by the page number (folded, CPU_TLB_INDEX_FOLD), compare the
+ * fast table by the page number (layout in aok-tlb.h), compare the
  * entry's tag with the address, and on a match the entry's addend turns the
  * guest address into a host one. The tag is compared with the address's page
  * AND its low alignment bits, so an aligned access to a page with no flags
@@ -67,11 +67,6 @@ _fval2  .req x1
  * makes its access: of the frame's scratch words, where a load finds what C
  * read and where a store's write goes nowhere.
  */
-#define TLB_FOLD        8       /* CPU_TLB_INDEX_FOLD */
-#define TLB_SHIFT       7       /* TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS */
-#define TLBE_READ       0
-#define TLBE_WRITE      8
-#define TLBE_ADDEND     24
 
 /*
  * Two switches for the gadgets instantiated while they are set.
@@ -87,11 +82,10 @@ _fval2  .req x1
     b handle_miss_\id
     .else
     ldp x9, x10, [_tlb]         /* mask, table */
-    eor x11, _addr, _addr, lsr #TLB_FOLD
-    and x9, x9, x11, lsr #TLB_SHIFT
+    and x9, x9, _addr, lsr #AOK_TLB_SHIFT
     add x10, x10, x9
     ldr x11, [x10, #\tag]
-    ldr x10, [x10, #TLBE_ADDEND]
+    ldr x10, [x10, #AOK_TLBE_ADDEND]
     .if \size > 64
     and x9, _addr, #0xfff
     cmp x9, #(0x1000 - \size / 8)
@@ -110,10 +104,10 @@ back_\id:
 .endm
 
 .macro read_prep size, id, ahead=0
-    a64_tlb_probe \size, \id, TLBE_READ
+    a64_tlb_probe \size, \id, AOK_TLBE_READ
 .endm
 .macro write_prep size, id, ahead=0
-    a64_tlb_probe \size, \id, TLBE_WRITE
+    a64_tlb_probe \size, \id, AOK_TLBE_WRITE
 .endm
 .macro write_done size, id
 .endm
@@ -450,7 +444,7 @@ done_\name:
 .macro v_load name, bits, reg, mode
 .gadget \name
     v_addr \mode
-    a64_tlb_probe \bits, \name, TLBE_READ
+    a64_tlb_probe \bits, \name, AOK_TLBE_READ
     ldr \reg, [_addr]
     str q0, [_cpu, x8]
     v_tail \name, \mode
@@ -462,7 +456,7 @@ handle_miss_\name:
 .gadget \name
     v_addr \mode
     ldr q0, [_cpu, x8]
-    a64_tlb_probe \bits, \name, TLBE_WRITE
+    a64_tlb_probe \bits, \name, AOK_TLBE_WRITE
     str \reg, [_addr]
     v_tail \name, \mode
 handle_miss_\name:
@@ -473,7 +467,7 @@ handle_miss_\name:
 .macro v_ldp name, bytes, reg1, reg2, mode
 .gadget \name
     v_addr \mode
-    a64_tlb_probe (\bytes * 16), \name, TLBE_READ
+    a64_tlb_probe (\bytes * 16), \name, AOK_TLBE_READ
     ldr \reg1, [_addr]
     ldr \reg2, [_addr, #\bytes]
     and x9, x8, #0xffff
@@ -492,7 +486,7 @@ handle_miss_\name:
     lsr x10, x8, #16
     ldr q0, [_cpu, x9]
     ldr q1, [_cpu, x10]
-    a64_tlb_probe (\bytes * 16), \name, TLBE_WRITE
+    a64_tlb_probe (\bytes * 16), \name, AOK_TLBE_WRITE
     str \reg1, [_addr]
     str \reg2, [_addr, #\bytes]
     v_tail \name, \mode
@@ -574,7 +568,7 @@ ldpsw_gadget ldpsw_pre, 2
     add _fnewb, _fnewb, x11
     mov _addr, x10
     .if \load
-    a64_tlb_probe (\n * \bytes * 8), \name, TLBE_READ
+    a64_tlb_probe (\n * \bytes * 8), \name, AOK_TLBE_READ
     ldr \reg0, [_addr]
     .if \n > 1
     ldr \reg1, [_addr, #\bytes]
@@ -614,7 +608,7 @@ ldpsw_gadget ldpsw_pre, 2
     lsr x9, x8, #48
     ldr q3, [_cpu, x9]
     .endif
-    a64_tlb_probe (\n * \bytes * 8), \name, TLBE_WRITE
+    a64_tlb_probe (\n * \bytes * 8), \name, AOK_TLBE_WRITE
     str \reg0, [_addr]
     .if \n > 1
     str \reg1, [_addr, #\bytes]

@@ -168,7 +168,7 @@ x87_fcmov_all x87_fcmov, x87h_flag
     add x9, _cpu, #AOK_X86_ENV_AOK_TMP
     .else
     mov _addr, x1
-    x86_probe \bits, \id, TLBE_READ
+    x86_probe \bits, \id, AOK_TLBE_READ
     .if \bits == 16
     ldrh w10, [_addr]
     .endif
@@ -201,7 +201,7 @@ x87_fcmov_all x87_fcmov, x87h_flag
     mov x4, x15
     ldr x17, [_cpu, #AOK_X86_ENV_AOK_TMP]
     mov _addr, x1
-    x86_probe \bits, \id, TLBE_WRITE
+    x86_probe \bits, \id, AOK_TLBE_WRITE
     st_barrier
     .if \bits == 16
     strh w17, [_addr]

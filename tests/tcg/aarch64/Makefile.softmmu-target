@@ -72,6 +72,12 @@ run-semiconsole: semiconsole
 run-plugin-semiconsole-with-%: semiconsole
 	$(call skip-test, $<, "MANUAL ONLY")
 
+# align-fault needs a CPU without FEAT_LSE2
+run-align-fault: QEMU_BASE_MACHINE=-M virt -cpu cortex-a57 -display none
+
+# cross-modifying-smp patches code on one vCPU while three others run it
+run-cross-modifying-smp: QEMU_BASE_MACHINE=-M virt -cpu max -display none -smp 4
+
 # vtimer test needs EL2
 QEMU_EL2_MACHINE=-machine virt,virtualization=on,gic-version=2 -cpu cortex-a57 -smp 4
 QEMU_EL2_BASE_ARGS=-semihosting-config enable=on,target=native,chardev=output,arg="2"

@@ -410,9 +410,29 @@ static void page_unlock(PageDesc *pd)
     page_unlock__debug(pd);
 }
 
+/*
+ * Mark a page we have just locked as holding code, before translation reads
+ * it. From then on, a store into the page takes the slow path and its
+ * invalidation waits for our lock, so it sees the TB we are making. Marking
+ * the page only when its first TB is linked would leave a store between the
+ * read and the link on the fast path, and nothing would invalidate the TB.
+ *
+ * A page with a TB is already marked. One left marked by a translation that
+ * is then dropped is unmarked by its next store, as it holds no TB.
+ */
+static void tb_protect_page(PageDesc *pd, tb_page_addr_t paddr)
+{
+    if (!pd->first_tb) {
+        tlb_protect_code(paddr & TARGET_PAGE_MASK);
+    }
+}
+
 void tb_lock_page0(tb_page_addr_t paddr)
 {
-    page_lock(page_find_alloc(paddr >> TARGET_PAGE_BITS, true));
+    PageDesc *pd = page_find_alloc(paddr >> TARGET_PAGE_BITS, true);
+
+    page_lock(pd);
+    tb_protect_page(pd, paddr);
 }
 
 void tb_lock_page1(tb_page_addr_t paddr0, tb_page_addr_t paddr1)
@@ -430,11 +450,13 @@ void tb_lock_page1(tb_page_addr_t paddr0, tb_page_addr_t paddr1)
     if (pindex0 < pindex1) {
         /* Correct locking order, we may block. */
         page_lock(pd1);
+        tb_protect_page(pd1, paddr1);
         return;
     }
 
     /* Incorrect locking order, we cannot block lest we deadlock. */
     if (!page_trylock(pd1)) {
+        tb_protect_page(pd1, paddr1);
         return;
     }
 
@@ -446,6 +468,9 @@ void tb_lock_page1(tb_page_addr_t paddr0, tb_page_addr_t paddr1)
     page_unlock(pd0);
     page_lock(pd1);
     page_lock(pd0);
+    /* Unlocked, page0 may have lost its last TB, and its mark with it. */
+    tb_protect_page(pd1, paddr1);
+    tb_protect_page(pd0, paddr0);
     siglongjmp(tcg_ctx->jmp_trans, -3);
 }
 
@@ -697,27 +722,15 @@ static void tb_remove_all(void)
 }
 
 /*
- * Add the tb in the target page and protect it if necessary.
+ * Add the tb in the target page, which tb_lock_page0/1 have protected.
  * Called with @p->lock held.
  */
 static void tb_page_add(PageDesc *p, TranslationBlock *tb, unsigned int n)
 {
-    bool page_already_protected;
-
     assert_page_locked(p);
 
     tb->page_next[n] = p->first_tb;
-    page_already_protected = p->first_tb != 0;
     p->first_tb = (uintptr_t)tb | n;
-
-    /*
-     * If some code is already present, then the pages are already
-     * protected. So we handle the case where only the first TB is
-     * allocated in a physical page.
-     */
-    if (!page_already_protected) {
-        tlb_protect_code(tb->page_addr[n] & TARGET_PAGE_MASK);
-    }
 }
 
 static void tb_record(TranslationBlock *tb)
@@ -1130,22 +1143,28 @@ static inline void tb_jmp_unlink(TranslationBlock *dest)
 static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
 {
     CPUState *cpu;
+    uint32_t h;
 
+    /*
+     * A CF_PCREL TB may be cached under any virtual address, so its entries
+     * can't be found, and they needn't be: CF_INVALID is set by now, and
+     * tb_lookup() compares cflags exactly, so a stale entry never hits. The
+     * TB's memory is only reused after tb_flush(), which clears every jump
+     * cache. Clearing them all here instead swept every vCPU's whole cache
+     * for each TB invalidated, which dominated when a guest reused memory
+     * that had held code.
+     */
     if (tb_cflags(tb) & CF_PCREL) {
-        /* A TB may be at any virtual address */
-        CPU_FOREACH(cpu) {
-            tcg_flush_jmp_cache(cpu);
-        }
-    } else {
-        uint32_t h = tb_jmp_cache_hash_func(tb->pc);
+        return;
+    }
 
-        CPU_FOREACH(cpu) {
-            CPUJumpCache *jc = cpu->tb_jmp_cache;
+    h = tb_jmp_cache_hash_func(tb->pc);
+    CPU_FOREACH(cpu) {
+        CPUJumpCache *jc = cpu->tb_jmp_cache;
 
-            for (int way = 0; way < 2; way++) {
-                if (qatomic_read(&jc->array[h ^ way].tb) == tb) {
-                    qatomic_set(&jc->array[h ^ way].tb, NULL);
-                }
+        for (int way = 0; way < 2; way++) {
+            if (qatomic_read(&jc->array[h ^ way].tb) == tb) {
+                qatomic_set(&jc->array[h ^ way].tb, NULL);
             }
         }
     }

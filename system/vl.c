@@ -182,8 +182,6 @@ static const char *loadvm;
  */
 static bool tctish_snapshot_missing;
 
-bool tctish_snapshot_was_missing(void);
-
 bool tctish_snapshot_was_missing(void)
 {
     return tctish_snapshot_missing;

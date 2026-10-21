@@ -1,0 +1,102 @@
+name: Bug report
+description: QEMU behaves incorrectly, crashes or hangs.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. This tracker is for tctiSH's QEMU fork, its TCTI backend, and the
+        hybrid built containing both. If you hit the problem in the tctiSH app and are not sure that
+        the issue comes from QEMU, please report your bug in the
+        [tctiSH tracker](https://github.com/tctiSH/tctiSH/issues) instead. If you can provide a
+        small program that runs in the guest that demonstrates the issue, that is extremely
+        valuable.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you ran, what you expected, and what you got instead.
+      placeholder: |
+        On an AArch64 guest under TCTI, `cmlt v0.8b, v1.8b, #0` sets the lanes that are exactly
+        zero, which it should leave clear …
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: How can we reproduce it?
+      description: >
+        Numbered steps from a build of the fork: the QEMU command line, the guest, and what to run.
+        A bare-metal test in the style of `tests/tcg/*/system/`, or a short program with the output
+        it gives against the output it should, will be the most useful.
+      placeholder: |
+        1. Build the fork with `--enable-tcg-hybrid=runtime`.
+        2. Run `qemu-system-aarch64 -M virt -cpu cortex-a72 -accel tcg,tcti=on -semihosting -kernel test`.
+        3. It prints … instead of …
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Which backend is the issue seen on?
+      description: >
+        A hybrid build runs TCTI with `-accel tcg,tcti=on` and the JIT with `tcti=off`. Trying the
+        other one narrows it down fast.
+      options:
+        - TCTI only
+        - The JIT only
+        - Both
+        - Only tried TCTI
+        - Only tried JIT
+    validations:
+      required: true
+
+  - type: dropdown
+    id: upstream
+    attributes:
+      label: Does upstream QEMU have the same issue?
+      description: >
+        Check same guest and command line on the upstream release the fork is based on. If upstream
+        has the bug, it belongs on [their tracker](https://gitlab.com/qemu-project/qemu/-/issues)
+        instead.
+      options:
+        - "No — only the fork"
+        - "Yes — upstream does too"
+        - "Not tried"
+    validations:
+      required: true
+
+  - type: textarea
+    id: build
+    attributes:
+      label: Build and host
+      description: >
+        The fork commit (`git describe --always`), or the tctiSH commit if it came with the app;
+        the configure flags; and the host: a Mac and its chip, or a device, its chip and its iOS
+        version.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: >
+        What QEMU printed, a crash report or a backtrace, or `-d in_asm,op` around the code that
+        goes wrong if you have narrowed it that far.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: It happens on the latest commit of `tctish-edition`, or I have said above which
+                 commit I used.
+          required: true
+        - label: I searched the existing issues.
+          required: true

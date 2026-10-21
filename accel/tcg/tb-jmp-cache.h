@@ -11,6 +11,7 @@
 
 #include "qemu/rcu.h"
 #include "exec/cpu-common.h"
+#include "exec/translation-block.h"
 
 #define TB_JMP_CACHE_BITS 14
 #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
@@ -35,15 +36,29 @@ typedef struct CPUJumpCache {
     } array[TB_JMP_CACHE_SIZE];
 } CPUJumpCache;
 
+/* Whether entry @h holds a TB that has since been invalidated. */
+static inline bool tb_jmp_cache_stale(CPUJumpCache *jc, uint32_t h)
+{
+    TranslationBlock *tb = qatomic_read(&jc->array[h].tb);
+
+    return tb && (qatomic_read(&tb->cflags) & CF_INVALID);
+}
+
 /*
- * Add @tb for @pc at @h, the pair's first way: into a free way, else into
+ * Add @tb for @pc at @h, the pair's first way: over an invalidated TB, which
+ * a CF_PCREL invalidation leaves in place; else into a free way; else into
  * the first after moving its entry to the second, so that two hot TBs
  * sharing the pair both stay.
  */
 static inline void tb_jmp_cache_insert(CPUJumpCache *jc, uint32_t h,
                                        vaddr pc, TranslationBlock *tb)
 {
-    if (qatomic_read(&jc->array[h].tb) && !qatomic_read(&jc->array[h ^ 1].tb)) {
+    if (tb_jmp_cache_stale(jc, h)) {
+        /* Replace it. */
+    } else if (tb_jmp_cache_stale(jc, h ^ 1)) {
+        h ^= 1;
+    } else if (qatomic_read(&jc->array[h].tb) &&
+               !qatomic_read(&jc->array[h ^ 1].tb)) {
         h ^= 1;
     } else if (qatomic_read(&jc->array[h].tb)) {
         jc->array[h ^ 1].pc = jc->array[h].pc;

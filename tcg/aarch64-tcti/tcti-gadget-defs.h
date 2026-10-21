@@ -31,4 +31,24 @@
 /* LDP takes a signed, 8-byte scaled 7-bit offset. */
 QEMU_BUILD_BUG_ON(TCTI_TLB_FAST_OFS(TCTI_TLB_FAST_MMU_INDICES - 1) < -512);
 
+/*
+ * The guest page size the fast-path gadgets are built for. TCG's common code
+ * learns the guest's only at run time, so the backend uses a gadget only
+ * where the two match (tcti_has_fast_path()).
+ */
+#define TCTI_TLB_PAGE_BITS 12
+#define TCTI_TLB_PAGE_MASK (~(uint64_t)0 << TCTI_TLB_PAGE_BITS)
+
+/* A guest address shifted right by this, and masked, is its entry's offset. */
+#define TCTI_TLB_INDEX_SHIFT (TCTI_TLB_PAGE_BITS - CPU_TLB_ENTRY_BITS)
+
+/* One LDP loads a CPUTLBDescFast's mask and table, in this order. */
+QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, mask) != 0);
+QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, table) != 8);
+
+/* A gadget loads the comparators and the addend as 64-bit words. */
+QEMU_BUILD_BUG_ON(sizeof_field(CPUTLBEntry, addr_read) != 8);
+QEMU_BUILD_BUG_ON(sizeof_field(CPUTLBEntry, addr_write) != 8);
+QEMU_BUILD_BUG_ON(sizeof_field(CPUTLBEntry, addend) != 8);
+
 #endif /* TCTI_GADGET_DEFS_H */

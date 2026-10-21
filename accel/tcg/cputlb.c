@@ -130,9 +130,6 @@ static inline uintptr_t tlb_index(CPUState *cpu, uintptr_t mmu_idx,
 {
     uintptr_t size_mask = cpu_tlb_fast(cpu, mmu_idx)->mask >> CPU_TLB_ENTRY_BITS;
 
-#ifdef CPU_TLB_INDEX_FOLD
-    addr ^= addr >> CPU_TLB_INDEX_FOLD;
-#endif
     return (addr >> TARGET_PAGE_BITS) & size_mask;
 }
 
@@ -954,7 +951,7 @@ static inline void tlb_set_dirty1_locked(CPUTLBEntry *tlb_entry,
 
 /* update the TLB corresponding to virtual page vaddr
    so that it is no longer dirty */
-static void tlb_set_dirty(CPUState *cpu, vaddr addr)
+static void tlb_set_dirty(CPUState *cpu, vaddr addr, ram_addr_t ram_addr)
 {
     int mmu_idx;
 
@@ -962,6 +959,11 @@ static void tlb_set_dirty(CPUState *cpu, vaddr addr)
 
     addr &= TARGET_PAGE_MASK;
     qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    /* As in tlb_set_page_full(), against tlb_protect_code(). */
+    if (physical_memory_is_clean(ram_addr)) {
+        qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+        return;
+    }
     for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
         tlb_set_dirty1_locked(tlb_entry(cpu, mmu_idx, addr), addr);
     }
@@ -1037,7 +1039,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     hwaddr iotlb, xlat, sz, paddr_page;
     vaddr addr_page;
     int asidx, wp_flags, prot;
-    bool is_ram, is_romd;
+    bool is_ram, is_romd, check_clean = false;
 
     assert_cpu_is_self(cpu);
 
@@ -1088,8 +1090,8 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         if (prot & PAGE_WRITE) {
             if (section->readonly) {
                 write_flags |= TLB_DISCARD_WRITE;
-            } else if (physical_memory_is_clean(iotlb)) {
-                write_flags |= TLB_NOTDIRTY;
+            } else {
+                check_clean = true;
             }
         }
     } else {
@@ -1120,6 +1122,15 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
      * is unlikely to be contended.
      */
     qemu_spin_lock(&tlb->c.lock);
+
+    /*
+     * Look at the page under the lock: tlb_protect_code() clears the page's
+     * bit and then takes this lock to flag our entries, so either it finds
+     * the entry we add here or we find the bit cleared.
+     */
+    if (check_clean && physical_memory_is_clean(iotlb)) {
+        write_flags |= TLB_NOTDIRTY;
+    }
 
     /* Note that the tlb is no longer clean.  */
     tlb->c.dirty |= 1 << mmu_idx;
@@ -1338,20 +1349,32 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
 }
 
 /*
- * A store to a page that has translated code invalidates the TBs it overlaps
- * before it is made, and the page's lock is not held from there to the store
- * itself. A TB that another CPU translates in that gap is made of the old
- * bytes and outlives them, as nothing will invalidate it again. An x86 guest
- * patching its kernel shows it: Linux writes a breakpoint, then the new
- * bytes, and counts on no CPU meeting the breakpoint once every CPU has
- * answered an interrupt; a CPU that goes on executing a TB with the
- * breakpoint in it is an oops.
+ * notdirty_write() invalidates the TBs that a store into a page of code
+ * overlaps, but it does so before the store is made, and nothing holds the
+ * page's lock from the invalidation to the store. With several CPUs'
+ * threads, another CPU can translate the page in between. Its TB is made of
+ * the old bytes, nothing invalidates it once the store lands, and every CPU
+ * goes on running the old code.
  *
- * So such a store is noted here and its CPU asked to leave the TB when the
- * TB ends. Before it executes another, the main loop invalidates the range
- * once more: the store is in memory by then, and the page's lock orders this
- * against every translation, so that a TB is either invalidated here or made
- * of the new bytes. Only with several CPUs' threads is there a gap to be in.
+ * Linux on x86 shows this when it patches its kernel. It writes a
+ * breakpoint, then the new bytes, and expects no CPU to hit the breakpoint
+ * once every CPU has answered an interrupt. A CPU still running a TB with
+ * the breakpoint in it oopses.
+ *
+ * So the range is invalidated a second time, after the store is made.
+ * Translation and invalidation both hold the page's lock, so a TB is either
+ * made of the new bytes or removed by the second invalidation. When that
+ * happens depends on who makes the store:
+ *
+ * - A store helper that goes through mmu_lookup() makes the store itself,
+ *   and invalidates again straight after, in mmu_redo().
+ * - A store through a host pointer from a probe, or by an atomic operation,
+ *   is made after notdirty_write() returns. Its range is noted in
+ *   notdirty_redo[] below, and its CPU is asked to leave its TB when the TB
+ *   ends. The main loop invalidates the noted ranges (tlb_notdirty_redo())
+ *   before the CPU executes another TB.
+ *
+ * NOTDIRTY_REDO_MAX is how many ranges a thread can have noted at once.
  */
 #define NOTDIRTY_REDO_MAX 8
 
@@ -1410,17 +1433,28 @@ static void notdirty_redo_note(CPUState *cpu, ram_addr_t start, unsigned size)
     qatomic_set(&cpu->neg.icount_decr.u16.high, -1);
 }
 
-static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
-                           CPUTLBEntryFull *full, uintptr_t retaddr)
+/*
+ * Returns whether the caller, which makes the store itself, must invalidate
+ * the range again once it has: only when @defer is false, and only with
+ * several CPUs' threads.
+ */
+static bool notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
+                           CPUTLBEntryFull *full, uintptr_t retaddr,
+                           bool defer)
 {
     ram_addr_t ram_addr = mem_vaddr + full->xlat_offset;
+    bool redo = false;
 
     trace_memory_notdirty_write_access(mem_vaddr, ram_addr, size);
 
     if (!physical_memory_get_dirty_flag(ram_addr, DIRTY_MEMORY_CODE)) {
         if (cpu->tcg_cflags & CF_PARALLEL) {
-            /* (First: the invalidation may leave by a longjmp.) */
-            notdirty_redo_note(cpu, ram_addr, size);
+            if (defer) {
+                /* (First: the invalidation may leave by a longjmp.) */
+                notdirty_redo_note(cpu, ram_addr, size);
+            } else {
+                redo = true;
+            }
         }
         tb_invalidate_phys_range_fast(cpu, ram_addr, size, retaddr);
     }
@@ -1434,8 +1468,10 @@ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
     /* We remove the notdirty callback only if the code has been flushed. */
     if (!physical_memory_is_clean(ram_addr)) {
         trace_memory_notdirty_set_dirty(mem_vaddr);
-        tlb_set_dirty(cpu, mem_vaddr);
+        tlb_set_dirty(cpu, mem_vaddr, ram_addr);
     }
+
+    return redo;
 }
 
 static int probe_access_internal(CPUState *cpu, vaddr addr,
@@ -1500,7 +1536,7 @@ int probe_access_full(CPUArchState *env, vaddr addr, int size,
     /* Handle clean RAM pages.  */
     if (unlikely(flags & TLB_NOTDIRTY)) {
         int dirtysize = size == 0 ? 1 : size;
-        notdirty_write(env_cpu(env), addr, dirtysize, *pfull, retaddr);
+        notdirty_write(env_cpu(env), addr, dirtysize, *pfull, retaddr, true);
         flags &= ~TLB_NOTDIRTY;
     }
 
@@ -1524,7 +1560,7 @@ int probe_access_full_mmu(CPUArchState *env, vaddr addr, int size,
     /* Handle clean RAM pages.  */
     if (unlikely(flags & TLB_NOTDIRTY)) {
         int dirtysize = size == 0 ? 1 : size;
-        notdirty_write(env_cpu(env), addr, dirtysize, *pfull, 0);
+        notdirty_write(env_cpu(env), addr, dirtysize, *pfull, 0, true);
         flags &= ~TLB_NOTDIRTY;
     }
 
@@ -1547,7 +1583,7 @@ int probe_access_flags(CPUArchState *env, vaddr addr, int size,
     /* Handle clean RAM pages. */
     if (unlikely(flags & TLB_NOTDIRTY)) {
         int dirtysize = size == 0 ? 1 : size;
-        notdirty_write(env_cpu(env), addr, dirtysize, full, retaddr);
+        notdirty_write(env_cpu(env), addr, dirtysize, full, retaddr, true);
         flags &= ~TLB_NOTDIRTY;
     }
 
@@ -1583,7 +1619,7 @@ void *probe_access(CPUArchState *env, vaddr addr, int size,
 
         /* Handle clean RAM pages.  */
         if (flags & TLB_NOTDIRTY) {
-            notdirty_write(env_cpu(env), addr, size, full, retaddr);
+            notdirty_write(env_cpu(env), addr, size, full, retaddr, true);
         }
     }
 
@@ -1692,6 +1728,9 @@ typedef struct MMULookupPageData {
     vaddr addr;
     int flags;
     int size;
+    /* The store is to a page with code, to invalidate again: mmu_redo(). */
+    bool redo;
+    ram_addr_t redo_start;
 } MMULookupPageData;
 
 typedef struct MMULookupLocals {
@@ -1785,7 +1824,8 @@ static void mmu_watch_or_dirty(CPUState *cpu, MMULookupPageData *data,
 
     /* Note that notdirty is only set for writes. */
     if (flags & TLB_NOTDIRTY) {
-        notdirty_write(cpu, addr, size, full, ra);
+        data->redo = notdirty_write(cpu, addr, size, full, ra, false);
+        data->redo_start = addr + full->xlat_offset;
         flags &= ~TLB_NOTDIRTY;
     }
     data->flags = flags;
@@ -1819,6 +1859,8 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     l->page[0].size = memop_size(l->memop);
     l->page[1].addr = 0;
     l->page[1].size = 0;
+    l->page[0].redo = false;
+    l->page[1].redo = false;
 
     /* Lookup and recognize exceptions from the first page. */
     mmu_lookup1(cpu, &l->page[0], l->memop, l->mmu_idx, type, ra);
@@ -1867,6 +1909,20 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     }
 
     return crosspage;
+}
+
+/*
+ * After a store through mmu_lookup() is made: invalidate again what it wrote
+ * to pages with code, now that it is in memory. See notdirty_write().
+ */
+static inline void mmu_redo(CPUState *cpu, MMULookupLocals *l)
+{
+    for (int i = 0; i < 2; i++) {
+        if (unlikely(l->page[i].redo)) {
+            tb_invalidate_phys_range_fast(cpu, l->page[i].redo_start,
+                                          l->page[i].size, 0);
+        }
+    }
 }
 
 /*
@@ -1957,7 +2013,7 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     hostaddr = (void *)((uintptr_t)addr + tlbe->addend);
 
     if (unlikely(tlb_addr & TLB_NOTDIRTY)) {
-        notdirty_write(cpu, addr, size, full, retaddr);
+        notdirty_write(cpu, addr, size, full, retaddr, true);
     }
 
     if (unlikely(tlb_addr & TLB_WATCHPOINT)) {
@@ -2776,6 +2832,7 @@ static void do_st1_mmu(CPUState *cpu, vaddr addr, uint8_t val,
     tcg_debug_assert(!crosspage);
 
     do_st_1(cpu, &l.page[0], val, l.mmu_idx, ra);
+    mmu_redo(cpu, &l);
 }
 
 static void do_st2_mmu(CPUState *cpu, vaddr addr, uint16_t val,
@@ -2789,6 +2846,7 @@ static void do_st2_mmu(CPUState *cpu, vaddr addr, uint16_t val,
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
     if (likely(!crosspage)) {
         do_st_2(cpu, &l.page[0], val, l.mmu_idx, l.memop, ra);
+        mmu_redo(cpu, &l);
         return;
     }
 
@@ -2799,6 +2857,7 @@ static void do_st2_mmu(CPUState *cpu, vaddr addr, uint16_t val,
     }
     do_st_1(cpu, &l.page[0], a, l.mmu_idx, ra);
     do_st_1(cpu, &l.page[1], b, l.mmu_idx, ra);
+    mmu_redo(cpu, &l);
 }
 
 static void do_st4_mmu(CPUState *cpu, vaddr addr, uint32_t val,
@@ -2811,6 +2870,7 @@ static void do_st4_mmu(CPUState *cpu, vaddr addr, uint32_t val,
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
     if (likely(!crosspage)) {
         do_st_4(cpu, &l.page[0], val, l.mmu_idx, l.memop, ra);
+        mmu_redo(cpu, &l);
         return;
     }
 
@@ -2820,6 +2880,7 @@ static void do_st4_mmu(CPUState *cpu, vaddr addr, uint32_t val,
     }
     val = do_st_leN(cpu, &l.page[0], val, l.mmu_idx, l.memop, ra);
     (void) do_st_leN(cpu, &l.page[1], val, l.mmu_idx, l.memop, ra);
+    mmu_redo(cpu, &l);
 }
 
 static void do_st8_mmu(CPUState *cpu, vaddr addr, uint64_t val,
@@ -2832,6 +2893,7 @@ static void do_st8_mmu(CPUState *cpu, vaddr addr, uint64_t val,
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
     if (likely(!crosspage)) {
         do_st_8(cpu, &l.page[0], val, l.mmu_idx, l.memop, ra);
+        mmu_redo(cpu, &l);
         return;
     }
 
@@ -2841,6 +2903,7 @@ static void do_st8_mmu(CPUState *cpu, vaddr addr, uint64_t val,
     }
     val = do_st_leN(cpu, &l.page[0], val, l.mmu_idx, l.memop, ra);
     (void) do_st_leN(cpu, &l.page[1], val, l.mmu_idx, l.memop, ra);
+    mmu_redo(cpu, &l);
 }
 
 static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
@@ -2868,6 +2931,7 @@ static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
             }
             store_atom_16(cpu, ra, l.page[0].haddr, l.memop, val);
         }
+        mmu_redo(cpu, &l);
         return;
     }
 
@@ -2885,6 +2949,7 @@ static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
         }
         do_st_8(cpu, &l.page[0], a, l.mmu_idx, mop8, ra);
         do_st_8(cpu, &l.page[1], b, l.mmu_idx, mop8, ra);
+        mmu_redo(cpu, &l);
         return;
     }
 
@@ -2899,6 +2964,7 @@ static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
         b = do_st16_leN(cpu, &l.page[0], val, l.mmu_idx, l.memop, ra);
         do_st_leN(cpu, &l.page[1], b, l.mmu_idx, l.memop, ra);
     }
+    mmu_redo(cpu, &l);
 }
 
 #include "ldst_common.c.inc"

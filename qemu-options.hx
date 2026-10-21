@@ -2994,7 +2994,8 @@ DEF("netdev", HAS_ARG, QEMU_OPTION_netdev,
     "         [,ipv6=on|off][,ipv6-net=addr[/int]][,ipv6-host=addr]\n"
     "         [,restrict=on|off][,hostname=host][,dhcpstart=addr]\n"
     "         [,dns=addr][,ipv6-dns=addr][,dnssearch=domain][,domainname=domain]\n"
-    "         [,tftp=dir][,tftp-server-name=name][,bootfile=f][,hostfwd=rule][,guestfwd=rule]"
+    "         [,tftp=dir][,tftp-server-name=name][,bootfile=f][,hostfwd=rule][,guestfwd=rule]\n"
+    "         [,mtu=bytes][,offload=on|off]"
 #ifndef _WIN32
                                              "[,smb=dir[,smbserver=addr]]\n"
 #endif
@@ -3438,6 +3439,29 @@ SRST
         (RFC2132 option 66). This can be used to advise the guest to
         load boot files or configurations from a different server than
         the host address.
+
+    ``mtu=bytes``
+        The largest IP packet the user mode network stack sends to the
+        guest, and the largest IPv6 packet it accepts from it, from 68 to
+        65521; the default is 1500.
+        Its TCP segments grow with it, so a guest moving bulk data makes
+        far fewer trips through its network stack. The guest's interface
+        MTU must not be larger, and should match: give the NIC the same
+        value with ``host_mtu`` where it has one (virtio-net does), or
+        set it in the guest.
+
+    ``offload=on|off``
+        Let the NIC hand its checksum and TCP segmentation offloads to
+        the user mode network stack, as it does to a tap device with
+        ``vnet_hdr=on``: the guest leaves its TCP and UDP checksums
+        unfinished and sends TCP data in pieces of up to 64 KiB, and
+        QEMU finishes them in native code, cutting IPv6 ones into
+        segments. Frames the stack sends are marked as already
+        checksummed when the guest accepts that. Use it with
+        virtio-net: e1000e, igb and vmxnet3 carry the header too, but
+        UDP they are asked to segment is dropped. Other NICs are
+        unaffected. Default is off. A snapshot taken with it on can
+        only be loaded with it on.
 
     ``bootfile=file``
         When using the user mode network stack, broadcast file as the

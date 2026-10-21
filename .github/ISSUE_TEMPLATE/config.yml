@@ -1,0 +1,12 @@
+blank_issues_enabled: false
+contact_links:
+  - name: The tctiSH App
+    url: https://github.com/tctiSH/tctiSH/issues
+    about: >
+      The terminal, setting up JIT, the loopback VPN, the guest image and anything else about the
+      app itself belong in the tctiSH tracker, as does a problem you are not sure comes from QEMU
+      itself.
+  - name: Upstream QEMU
+    url: https://gitlab.com/qemu-project/qemu/-/issues
+    about: >
+      A bug that upstream QEMU also has, with the same guest and command line, belongs upstream.

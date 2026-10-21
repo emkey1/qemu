@@ -951,7 +951,7 @@ static inline void tlb_set_dirty1_locked(CPUTLBEntry *tlb_entry,
 
 /* update the TLB corresponding to virtual page vaddr
    so that it is no longer dirty */
-static void tlb_set_dirty(CPUState *cpu, vaddr addr)
+static void tlb_set_dirty(CPUState *cpu, vaddr addr, ram_addr_t ram_addr)
 {
     int mmu_idx;
 
@@ -959,6 +959,11 @@ static void tlb_set_dirty(CPUState *cpu, vaddr addr)
 
     addr &= TARGET_PAGE_MASK;
     qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    /* As in tlb_set_page_full(), against tlb_protect_code(). */
+    if (physical_memory_is_clean(ram_addr)) {
+        qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+        return;
+    }
     for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
         tlb_set_dirty1_locked(tlb_entry(cpu, mmu_idx, addr), addr);
     }
@@ -1034,7 +1039,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     hwaddr iotlb, xlat, sz, paddr_page;
     vaddr addr_page;
     int asidx, wp_flags, prot;
-    bool is_ram, is_romd;
+    bool is_ram, is_romd, check_clean = false;
 
     assert_cpu_is_self(cpu);
 
@@ -1085,8 +1090,8 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         if (prot & PAGE_WRITE) {
             if (section->readonly) {
                 write_flags |= TLB_DISCARD_WRITE;
-            } else if (physical_memory_is_clean(iotlb)) {
-                write_flags |= TLB_NOTDIRTY;
+            } else {
+                check_clean = true;
             }
         }
     } else {
@@ -1117,6 +1122,15 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
      * is unlikely to be contended.
      */
     qemu_spin_lock(&tlb->c.lock);
+
+    /*
+     * Look at the page under the lock: tlb_protect_code() clears the page's
+     * bit and then takes this lock to flag our entries, so either it finds
+     * the entry we add here or we find the bit cleared.
+     */
+    if (check_clean && physical_memory_is_clean(iotlb)) {
+        write_flags |= TLB_NOTDIRTY;
+    }
 
     /* Note that the tlb is no longer clean.  */
     tlb->c.dirty |= 1 << mmu_idx;
@@ -1454,7 +1468,7 @@ static bool notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
     /* We remove the notdirty callback only if the code has been flushed. */
     if (!physical_memory_is_clean(ram_addr)) {
         trace_memory_notdirty_set_dirty(mem_vaddr);
-        tlb_set_dirty(cpu, mem_vaddr);
+        tlb_set_dirty(cpu, mem_vaddr, ram_addr);
     }
 
     return redo;

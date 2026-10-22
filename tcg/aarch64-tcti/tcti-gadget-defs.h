@@ -42,6 +42,15 @@ QEMU_BUILD_BUG_ON(TCTI_TLB_FAST_OFS(TCTI_TLB_FAST_MMU_INDICES - 1) < -512);
 /* A guest address shifted right by this, and masked, is its entry's offset. */
 #define TCTI_TLB_INDEX_SHIFT (TCTI_TLB_PAGE_BITS - CPU_TLB_ENTRY_BITS)
 
+/*
+ * The word every TB checks at its start, negative when an exit has been
+ * requested: see gen_tb_start(). The goto_tb gadgets read it with LDUR.
+ */
+#define TCTI_EXIT_REQUEST_OFS                                           \
+    ((int)(offsetof(CPUState, neg.icount_decr.u32) - sizeof(CPUState)))
+
+QEMU_BUILD_BUG_ON(TCTI_EXIT_REQUEST_OFS < -256);
+
 /* One LDP loads a CPUTLBDescFast's mask and table, in this order. */
 QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, mask) != 0);
 QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, table) != 8);

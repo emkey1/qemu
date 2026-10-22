@@ -849,7 +849,7 @@ def vector_math_dn_immediate(name, operation, immediate_range, filter=lambda x: 
 # Gadget definitions.
 #
 
-START_COLLECTION("misc")
+START_COLLECTION("misc", needs_defs=True)
 
 # Call a C language helper function by address.
 simple("call",
@@ -985,17 +985,50 @@ simple("br",
     "ldr x28, [x28]"
 )
 
+# goto_tb: continue with the stream word's target, which
+# tb_target_set_jmp_target() patches, unless an exit has been requested. Then
+# run the code after the word instead: the TB's exit_tb for this jump, which
+# returns to the main loop. A linked target is entered past its own exit
+# check, so every goto_tb has to make it. The check reads the same word as
+# tb_exit_check, but branches: an exit is rarely requested, so the dispatch
+# need not wait for the load.
+GOTO_TB = (
+    "ldr w24, [x14, %[exit_ofs]]",
+    "ldr x27, [x28], #8",
+    "tbnz w24, #31, 1f",
+    "mov x28, x27",
+    "1:",
+)
+GOTO_TB_OPERANDS = '[exit_ofs] "i" (TCTI_EXIT_REQUEST_OFS)'
+
+simple("goto_tb", *GOTO_TB, operands=GOTO_TB_OPERANDS)
+
 # A goto_tb right after an addi_env, as nearly every TB leaves: the guest pc
-# moved on by a constant, then the branch to the next TB, in one gadget.
-# Every register is dead at a goto_tb, so it needs no register variants. The
-# stream holds addi_env's offset and immediate, then br's target, which
-# tb_target_set_jmp_target() patches. See tcg_out_goto_tb().
-simple("addi_env_br",
+# moved on by a constant, then the jump to the next TB, in one gadget. Every
+# register is dead at a goto_tb, so it needs no register variants. The stream
+# holds addi_env's offset and immediate, then goto_tb's target. See
+# tcg_out_goto_tb().
+simple("addi_env_goto_tb",
     "ldp x26, x27, [x28], #16",
     "ldr x24, [x14, x26]",
     "add x24, x24, x27",
     "str x24, [x14, x26]",
-    "ldr x28, [x28]"
+    *GOTO_TB,
+    operands=GOTO_TB_OPERANDS
+)
+
+# The same with an sti32_env just before, as x86 stores cc_op when a TB
+# leaves: the stream starts with sti32_env's word.
+simple("sti32_addi_env_goto_tb",
+    "ldp x26, x27, [x28], #16",
+    "asr x24, x26, #32",
+    "str w26, [x14, x24]",
+    "ldr x24, [x14, x27]",
+    "ldr x26, [x28], #8",
+    "add x24, x24, x26",
+    "str x24, [x14, x27]",
+    *GOTO_TB,
+    operands=GOTO_TB_OPERANDS
 )
 
 # goto_ptr: continue with the gadget stream whose address is in a register --
@@ -1006,7 +1039,9 @@ with_d("goto_ptr", "mov x28, Xd")
 
 # The exit check at the start of every TB: a 32-bit load from env into Wd
 # and a branch if it is negative, as one gadget instead of a load and a
-# brcondi. The stream holds the env offset, then the branch target.
+# brcondi. The stream holds the env offset, then the branch target. Only
+# the main loop and goto_ptr run it: a linked goto_tb skips it, as
+# tcti_goto_tb_entry() relies on this layout.
 with_d("tb_exit_check",
     "ldp x26, x27, [x28], #16",
     "ldr Wd, [x14, x26]",

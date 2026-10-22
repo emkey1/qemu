@@ -237,12 +237,34 @@ static void tcg_out_immediate(TCGContext *s, tcg_target_ulong v)
     tcg_out64(s, v);
 }
 
+/*
+ * Where a goto_tb to the stream at addr continues: past the exit check a TB
+ * starts with, if it has one, as the goto_tb gadgets make the check
+ * themselves. The check is three stream words: a tb_exit_check gadget, the
+ * offset of the word it reads, and its branch target. Anything else, such as
+ * a TB without the check or a jump's own exit_tb, runs from the start.
+ */
+static uintptr_t tcti_goto_tb_entry(uintptr_t addr)
+{
+    const uint64_t *stream = (const uint64_t *)addr;
+
+    if (stream[1] != (uint64_t)(int64_t)TCTI_EXIT_REQUEST_OFS) {
+        return addr;
+    }
+    for (int r = 0; r < TCG_TARGET_GP_REGS; r++) {
+        if (stream[0] == (uintptr_t)gadget_tb_exit_check[r]) {
+            return addr + 3 * sizeof(uint64_t);
+        }
+    }
+    return addr;
+}
+
 void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
                               uintptr_t jmp_rx, uintptr_t jmp_rw)
 {
     /* Get a pointer to our immediate, which exists after a single pointer. */
     uintptr_t immediate_addr = jmp_rw;
-    uintptr_t addr = tb->jmp_target_addr[n];
+    uintptr_t addr = tcti_goto_tb_entry(tb->jmp_target_addr[n]);
 
     /* Patch it to be match our target address. */
     qatomic_set((uint64_t *)immediate_addr, addr);
@@ -932,12 +954,28 @@ static __thread struct {
 } tcti_last_addi_env;
 
 /*
+ * The last 32-bit constant stored to env, x86's cc_op as a TB leaves, for
+ * tcg_out_goto_tb() to join with an addi_env after it. word is sti32_env's
+ * stream word.
+ */
+static __thread struct {
+    tcg_insn_unit *start, *end;
+    uint64_t word;
+} tcti_last_sti32;
+
+/*
  * Every fusion moves code_ptr back to the start of what it replaces. A note
  * of something emitted before could then match code_ptr by chance, so each
- * rewind forgets them all; fusing is never needed for correctness.
+ * rewind forgets them all; fusing is never needed for correctness. A 32-bit
+ * constant stored just before the rewound code stays: what it notes is
+ * untouched, and the addi_env that a goto_tb joins it with is itself made
+ * by rewinding.
  */
 static void tcti_rewind(TCGContext *s, tcg_insn_unit *to)
 {
+    if (tcti_last_sti32.end != to) {
+        tcti_last_sti32.end = NULL;
+    }
     s->code_ptr = to;
     tcti_env_args.n = 0;
     tcti_last_env_ld32.end = NULL;
@@ -946,6 +984,18 @@ static void tcti_rewind(TCGContext *s, tcg_insn_unit *to)
     tcti_last_movi32.end = NULL;
     tcti_last_addi_env.end = NULL;
     tcti_last_zero_q.end = NULL;
+}
+
+/*
+ * Write sti32_env's stream word, for a store of a 32-bit constant to env
+ * whose gadget was emitted from start, and note the store.
+ */
+static void tcti_note_sti32(TCGContext *s, tcg_insn_unit *start, uint64_t word)
+{
+    tcg_out64(s, word);
+    tcti_last_sti32.start = start;
+    tcti_last_sti32.end = s->code_ptr;
+    tcti_last_sti32.word = word;
 }
 
 /*
@@ -1043,19 +1093,31 @@ static void tcg_out_goto_tb(TCGContext *s, int which)
      */
 
     /*
-     * Emit our gadget: as one with the addi_env just before, if there is one.
+     * Emit our gadget: as one with the addi_env just before, if there is one,
+     * and with the 32-bit constant stored before that, if there is one.
+     * Registers are all dead here, so a movi_st32_env's write to one can go.
      */
     if (add->end == s->code_ptr &&
         !tcti_label_within(s, add->start, s->code_ptr)) {
+        typeof(tcti_last_sti32) *sti = &tcti_last_sti32;
         intptr_t offset = add->offset;
         tcg_target_long imm = add->imm;
 
-        tcti_rewind(s, add->start);
-        tcg_out_gadget(s, gadget_addi_env_br);
+        if (sti->end == add->start &&
+            !tcti_label_within(s, sti->start, s->code_ptr)) {
+            uint64_t word = sti->word;
+
+            tcti_rewind(s, sti->start);
+            tcg_out_gadget(s, gadget_sti32_addi_env_goto_tb);
+            tcg_out64(s, word);
+        } else {
+            tcti_rewind(s, add->start);
+            tcg_out_gadget(s, gadget_addi_env_goto_tb);
+        }
         tcg_out64(s, offset);
         tcg_out64(s, imm);
     } else {
-        tcg_out_gadget(s, gadget_br);
+        tcg_out_gadget(s, gadget_goto_tb);
     }
 
     /*
@@ -1649,10 +1711,11 @@ static void tcg_out_st(TCGContext *s, TCGType type, TCGReg arg, TCGReg arg1,
         arg2 == (int32_t)arg2 &&
         !tcti_label_within(s, tcti_last_movi32.start, s->code_ptr)) {
         uint32_t value = tcti_last_movi32.value;
+        tcg_insn_unit *start = tcti_last_movi32.start;
 
-        tcti_rewind(s, tcti_last_movi32.start);
+        tcti_rewind(s, start);
         tcg_out_unary_gadget(s, gadget_movi_st32_env, arg);
-        tcg_out64(s, value | (uint64_t)arg2 << 32);
+        tcti_note_sti32(s, start, value | (uint64_t)arg2 << 32);
         return;
     }
     if (type == TCG_TYPE_I32) {
@@ -1671,13 +1734,15 @@ static const TCGOutOpStore outop_st = {
 static inline bool tcg_out_sti(TCGContext *s, TCGType type, TCGArg val,
                                TCGReg base, intptr_t ofs)
 {
+    tcg_insn_unit *start = s->code_ptr;
+
     if (base != TCG_AREG0 || ofs != (int32_t)ofs) {
         return false;
     }
     switch (type) {
     case TCG_TYPE_I32:
         tcg_out_gadget(s, gadget_sti32_env);
-        tcg_out64(s, (uint32_t)val | (uint64_t)ofs << 32);
+        tcti_note_sti32(s, start, (uint32_t)val | (uint64_t)ofs << 32);
         return true;
     case TCG_TYPE_I64:
         tcg_out_gadget(s, gadget_sti64_env);
@@ -2710,6 +2775,7 @@ static void tcg_out_tb_start(TCGContext *s)
     tcti_env_rmw.end = NULL;
     tcti_last_movi32.end = NULL;
     tcti_last_addi_env.end = NULL;
+    tcti_last_sti32.end = NULL;
     tcti_last_zero_q.end = NULL;
 }
 
@@ -2725,6 +2791,7 @@ static void tcti_insn_start(TCGContext *s)
     tcti_env_rmw.end = NULL;
     tcti_last_movi32.end = NULL;
     tcti_last_addi_env.end = NULL;
+    tcti_last_sti32.end = NULL;
     tcti_last_zero_q.end = NULL;
 }
 

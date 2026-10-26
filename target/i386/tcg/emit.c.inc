@@ -2015,7 +2015,10 @@ static void gen_EMMS(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_ENTER(DisasContext *s, X86DecodedInsn *decode)
 {
-   gen_enter(s, decode->op[1].imm, decode->op[2].imm);
+    /* The frame size is an unsigned 16-bit count of bytes, as for RET. */
+    uint16_t size = decode->op[1].imm;
+
+    gen_enter(s, size, decode->op[2].imm);
 }
 
 static void gen_EXTRQ_i(DisasContext *s, X86DecodedInsn *decode)

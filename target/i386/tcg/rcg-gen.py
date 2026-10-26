@@ -1555,6 +1555,10 @@ def stack_cases():
     yield Case("pop ax", 16, a=0, stack=True)
     yield Case("push qword ptr [rsp+8]", 64, stack=True)
     yield Case("pop qword ptr [rsp+8]", 64, stack=True)
+    # ENTER, whose frame size is unsigned, at level 0: a deeper level would
+    # copy frame pointers from RBP, which holds no address here.
+    yield Case("enter 8, 0", 64, stack=True)
+    yield Case("enter 0x8000, 0", 64, stack=True)
 
 
 def branch_cases():
@@ -1581,7 +1585,8 @@ def branch_cases():
         yield Case(f"{set_target}; jmp {text}; 1: ud2; 2: {done}", 64,
                    mem=True, base=base, index=index, base_value=bv,
                    index_value=iv)
-    for adjust in (None, 0, 8, 16):
+    # RET's count is unsigned: 0x8000 and 0xfff8 free 32 KiB and 64 KiB.
+    for adjust in (None, 0, 8, 16, 0x8000, 0xfff8):
         ret = "ret" if adjust is None else f"ret {adjust}"
         yield Case(f"lea rsi, [rip+2f]; push rsi; {ret}; 1: ud2; "
                    f"2: mov esi, 0; mov qword ptr [rsp-{8 + (adjust or 0)}], 0",

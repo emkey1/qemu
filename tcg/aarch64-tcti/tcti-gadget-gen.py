@@ -42,7 +42,8 @@ TCG_REGISTER_NUMBERS = list(range(TCG_REGISTER_COUNT))
 HOST_REGISTER = {n: n for n in TCG_REGISTER_NUMBERS}
 HOST_REGISTER.update({8: 19, 9: 20, 10: 21, 11: 22, 12: 23})
 
-# Helper that provides each of the AArch64 condition codes of interest.
+# Helper that provides each of the AArch64 condition codes of interest, each
+# next to its inverse.
 ARCH_CONDITION_CODES = ["eq", "ne", "lt", "ge", "le", "gt", "lo", "hs", "ls", "hi"]
 
 # The list of vector size codes supported on this platform.
@@ -829,7 +830,9 @@ with_d("tb_exit_check",
     "ldp x26, x27, [x28], #16",
     "ldr Wd, [x14, x26]",
     "tst Wd, Wd",
-    "csel x28, x27, x28, lt"
+    "b.ge 1f",
+    "mov x28, x27",
+    "1:"
 )
 
 # Exit from a translation buffer execution.
@@ -851,7 +854,11 @@ simple("mb_ld",  "dmb ishld")
 
 
 
-for condition in ARCH_CONDITION_CODES:
+for i, condition in enumerate(ARCH_CONDITION_CODES):
+    # A branch around the move, not a CSEL into x28: the gadgets
+    # after go on as predicted instead of waiting for the condition.
+    # The branch is on the inverse, which is next to the condition.
+    inverse = ARCH_CONDITION_CODES[i ^ 1]
 
     START_COLLECTION("setcond")
 
@@ -889,7 +896,7 @@ for condition in ARCH_CONDITION_CODES:
         # ... and our conditional branch, which selectively sets w28 (our
         # "gadget pointer")
         # to the new location, if required.
-        f"csel x28, x27, x28, {condition}"
+        f"b.{inverse} 1f", "mov x28, x27", "1:"
     )
 
     # Branches iff a given comparison is true.
@@ -904,7 +911,7 @@ for condition in ARCH_CONDITION_CODES:
         # ... and our conditional branch, which selectively sets w28 (our
         # "gadget pointer")
         # to the new location, if required.
-        f"csel x28, x27, x28, {condition}"
+        f"b.{inverse} 1f", "mov x28, x27", "1:"
     )
 
     # The same against a constant from the stream, which precedes the
@@ -914,13 +921,13 @@ for condition in ARCH_CONDITION_CODES:
         "ldr x26, [x28], #8",
         "ldr x27, [x28], #8",
         "subs wzr, Wn, w26",
-        f"csel x28, x27, x28, {condition}"
+        f"b.{inverse} 1f", "mov x28, x27", "1:"
     )
     with_dn(f'brcondi_i64_{condition}',
         "ldr x26, [x28], #8",
         "ldr x27, [x28], #8",
         "subs xzr, Xn, x26",
-        f"csel x28, x27, x28, {condition}"
+        f"b.{inverse} 1f", "mov x28, x27", "1:"
     )
 
 

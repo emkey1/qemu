@@ -153,6 +153,10 @@ const TCGCPUOps x86_tcg_ops = {
     .guest_default_memory_order = TCG_MO_ALL & ~TCG_MO_ST_LD,
     .initialize = tcg_x86_init,
     .translate_code = x86_translate_code,
+#ifdef X86_RCG_STREAM
+    .rcg_translate_code = x86_rcg_translate_code,
+    .rcg_pc_offset = offsetof(CPUX86State, eip),
+#endif
     .get_tb_cpu_state = x86_get_tb_cpu_state,
     .synchronize_from_tb = x86_cpu_synchronize_from_tb,
     .restore_state_to_opc = x86_restore_state_to_opc,

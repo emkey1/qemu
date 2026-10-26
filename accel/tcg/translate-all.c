@@ -22,6 +22,7 @@
 #include "trace.h"
 #include "disas/disas.h"
 #include "tcg/tcg.h"
+#include "accel/tcg/rcg-stream.h"
 #include "tcg/tcg-apple-jit.h"
 #include "exec/mmap-lock.h"
 #include "tb-internal.h"
@@ -232,6 +233,25 @@ void page_init(void)
     page_table_config_init();
 }
 
+#ifdef TCG_HAVE_RCG_STREAM
+/*
+ * Whether to offer this TB to the front end's RCG stream translator: RCG is
+ * active, and no plugin wants TCGOps to put its calls in.
+ */
+static bool rcg_stream_wanted(CPUState *cs)
+{
+    if (!tcg_rcg_active() || !cs->cc->tcg_ops->rcg_translate_code) {
+        return false;
+    }
+#ifdef CONFIG_PLUGIN
+    if (test_bit(QEMU_PLUGIN_EV_VCPU_TB_TRANS, cs->plugin_state->event_mask)) {
+        return false;
+    }
+#endif
+    return true;
+}
+#endif
+
 /*
  * Isolate the portion of code gen which can setjmp/longjmp.
  * Return the size of the generated code, or negative on error.
@@ -248,6 +268,17 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
     tcg_func_start(tcg_ctx);
 
     CPUState *cs = env_cpu(env);
+#ifdef TCG_HAVE_RCG_STREAM
+    if (rcg_stream_wanted(cs)) {
+        ret = cs->cc->tcg_ops->rcg_translate_code(cs, tb, max_insns,
+                                                  pc, host_pc);
+        if (ret != 0) {
+            /* The stream's size, or -1 for a full code buffer. */
+            return ret;
+        }
+        trace_rcg_stream_declined(pc);
+    }
+#endif
     tcg_ctx->cpu = cs;
     cs->cc->tcg_ops->translate_code(cs, tb, max_insns, pc, host_pc);
 
@@ -310,6 +341,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     tb->cs_base = s.cs_base;
     tb->flags = s.flags;
     tb->cflags = s.cflags;
+    tb->rcg_stream = 0;
     tb_set_page_addr0(tb, phys_pc);
     tb_set_page_addr1(tb, -1);
     if (phys_pc != -1) {

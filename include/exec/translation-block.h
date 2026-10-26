@@ -96,6 +96,13 @@ struct TranslationBlock {
     uint16_t size;
     uint16_t icount;
 
+    /*
+     * Set when the TB's code is a stream of RCG's gadgets
+     * (accel/tcg/rcg-stream.c) rather than the TCG backend's output. The
+     * two are entered differently and are never linked to each other.
+     */
+    uint8_t rcg_stream;
+
     struct tb_tc tc;
 
     /*

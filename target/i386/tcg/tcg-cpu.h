@@ -20,6 +20,12 @@
 #define TCG_CPU_H
 
 #include "cpu.h"
+#include "accel/tcg/rcg-stream.h"
+
+/* RCG's alternate structure, for 64-bit code (rcg-stream-translate.c). */
+#if defined(TCG_HAVE_RCG_STREAM) && defined(TARGET_X86_64)
+#define X86_RCG_STREAM 1
+#endif
 
 #define XSAVE_FCW_FSW_OFFSET    0x000
 #define XSAVE_FTW_FOP_OFFSET    0x004
@@ -83,5 +89,10 @@ extern const TCGCPUOps x86_tcg_ops;
 bool tcg_cpu_realizefn(CPUState *cs, Error **errp);
 
 int x86_mmu_index_pl(CPUX86State *env, unsigned pl);
+
+#ifdef X86_RCG_STREAM
+int x86_rcg_translate_code(CPUState *cs, TranslationBlock *tb,
+                           int *max_insns, vaddr pc, void *host_pc);
+#endif
 
 #endif /* TCG_CPU_H */

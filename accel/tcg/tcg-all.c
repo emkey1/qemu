@@ -184,9 +184,6 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 #endif
 #ifdef TCG_HAVE_RCG
     tcg_rcg_enabled = s->rcg;
-    if (s->rcg) {
-        warn_report("rcg=on does nothing yet: no front end uses RCG");
-    }
 #endif
     tcg_init(s->tb_size * MiB, s->splitwx_enabled, max_threads);
 

@@ -25,6 +25,12 @@ system_ss.add_all(tcg_ss)
 # tb_cpu_state() in cpu-exec.c.
 specific_ss.add(files('cpu-exec.c'))
 
+# RCG's alternate structure, TBs that are streams of RCG's gadgets: under
+# TCTI, in system emulation (rcg-stream.h).
+if get_option('tcg_threaded_interpreter') or get_option('tcg_hybrid') != 'disabled'
+  system_ss.add(files('rcg-stream.c'))
+endif
+
 user_ss.add(files(
   'user-exec.c',
   'user-exec-stub.c',

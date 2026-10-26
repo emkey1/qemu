@@ -66,6 +66,20 @@ struct TCGCPUOps {
     void (*translate_code)(CPUState *cpu, TranslationBlock *tb,
                            int *max_insns, vaddr pc, void *host_pc);
     /**
+     * @rcg_translate_code: Translate guest instructions to a stream of
+     * RCG's gadgets (accel/tcg/rcg-stream.h), bypassing TCGOps.
+     *
+     * Optional, and only consulted while tcg_rcg_active(). Called before
+     * @translate_code with the same arguments. Returns the size of the
+     * stream in bytes when it has translated at least one instruction
+     * (tb->size and tb->icount are then set), 0 to leave this TB to
+     * @translate_code, or -1 if the code buffer is full.
+     */
+    int (*rcg_translate_code)(CPUState *cpu, TranslationBlock *tb,
+                              int *max_insns, vaddr pc, void *host_pc);
+    /* Offset of the guest program counter from CPUArchState, for streams. */
+    size_t rcg_pc_offset;
+    /**
      * @get_tb_cpu_state: Extract CPU state for a TCG #TranslationBlock
      *
      * Fill in all data required to select or compile a TranslationBlock.

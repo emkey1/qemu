@@ -19,12 +19,15 @@ body.
 The same tables give the x86-64 system tests that check RCG against TCG,
 which run every form over awkward values and fault in the middle of every
 memory form. This writes the cases of rcg-insns.c or rcg-faults.c (in
-tests/tcg/x86_64/system) to a file, and with --check renders every gadget's
-body and checks what it names:
+tests/tcg/x86_64/system) to a file, with --check renders every gadget's
+body and checks what it names, and with --stream-gadgets writes the
+gadgets in the harness of the alternate structure (StreamHarness) and the
+tables its translator picks them from:
 
     rcg-gen.py --insn-tests FILE
     rcg-gen.py --fault-tests FILE
     rcg-gen.py --check
+    rcg-gen.py --stream-gadgets DIR
 
 Only 64-bit code is covered, without LOCK; anything else is left to TCG.
 """
@@ -1111,6 +1114,214 @@ def check():
 
 
 #
+# The stream harness: the alternate structure, TBs that are streams of RCG's
+# gadgets alone (accel/tcg/rcg-stream.c).
+#
+
+
+class StreamHarness(Harness):
+    """ A gadget in a stream: the stream is the gadget's address, then its
+    operand words, then the next gadget's address, and so on. The stream
+    pointer, x28, is at the first operand word while the gadget runs, and
+    leaving moves it past the words and the next gadget's address, then
+    branches to that gadget.
+
+    The stream's core keeps its state in registers a C call keeps (env in
+    x20; rcg-stream.h has the rest), none of them the memory templates' TMP,
+    so a slow path saves nothing of the core's. Its return address is the
+    stream pointer: the core records where each guest insn's words end, as
+    TCG records where its code for each ends, so cputlb unwinds a fault to
+    the insn's eip and cc_op as it does in TCG's TBs.
+
+    A Jcc's taken branch leaves the TB: its words are followed by the pc
+    delta and slot that the core's goto takes, and the translator puts the
+    not-taken way after those. """
+
+    env = "x20"
+    save = ()
+    restore = ()
+
+    def __init__(self, spec):
+        self.words = len(spec.words)
+        self.pop = self.words + (2 if spec.kind == "jcc" else 0)
+        # A gadget that calls no helper loads the next gadget's address
+        # first, in a register no body names, so that the dispatch's target
+        # is known sooner.
+        self.early = not getattr(spec, "accesses_memory", False)
+
+    def enter(self, regs):
+        lines = [f"ldr x16, [x28, #{8 * self.pop}]"] if self.early else []
+        for i in range(0, len(regs) - 1, 2):
+            lines.append(f"ldp {regs[i]}, {regs[i + 1]}, [x28, #{8 * i}]")
+        if len(regs) % 2:
+            lines.append(f"ldr {regs[-1]}, [x28, #{8 * (len(regs) - 1)}]")
+        return lines
+
+    def leave(self):
+        load = [] if self.early else [f"ldr x16, [x28, #{8 * self.pop}]"]
+        return [*load, f"add x28, x28, #{8 * self.pop + 8}", "br x16"]
+
+    def branch(self, arm):
+        return [f"b.{ARM_INVERT[arm]} 90f",
+                f"ldp x9, x10, [x28, #{8 * self.words}]",
+                "b _rcg_stream_goto_tail",
+                "90:"]
+
+
+WIDTH_INDEX = {8: 0, 16: 1, 32: 2, 64: 3}
+SHAPE_INDEX = {shape: i for i, shape in enumerate(EA_SHAPES)}
+
+
+def stream_slot(spec):
+    """ The table the translator finds spec's gadget in, and its index
+    there. Widths index by WIDTH_INDEX and shapes by SHAPE_INDEX; a memory
+    operand's shape is followed by whether it has a segment base and whether
+    the gadget is the ordered twin. """
+    if isinstance(spec, CondSpec):
+        cls = CC_CLASSES.index((spec.cls, spec.cc_width))
+        if spec.kind == "cmov":
+            return "cmov", (WIDTH_INDEX[spec.cmov_width], cls, spec.cond)
+        return spec.kind, (cls, spec.cond)
+    kind, form, width = spec.kind, spec.form, WIDTH_INDEX[spec.width]
+    mem = ((SHAPE_INDEX[spec.shape], int(spec.seg), int(spec.ordered))
+           if spec.has_mem else None)
+    if kind in ("alu", "mov"):
+        op = (ALU_OPS.index(spec.op),) if kind == "alu" else ()
+        if mem:
+            return kind + "_m", (*op, ("rm", "mr", "mi").index(form), width,
+                                 *mem)
+        return kind + "_r", (*op, ("rr", "ri").index(form), width)
+    if kind == "zero":
+        return "zero", (width,)
+    if kind == "lea":
+        return "lea", (width, SHAPE_INDEX[spec.shape])
+    if kind in ("extend", "unary", "shift"):
+        if spec.op is ROTATE_OP:
+            return "ror", (width,)
+        ops = {"extend": EXTEND_OPS, "unary": UNARY_OPS,
+               "shift": SHIFT_OPS}[kind]
+        if mem:
+            return kind + "_m", (ops.index(spec.op), width, *mem)
+        return kind + "_r", (ops.index(spec.op), width)
+    if mem:
+        return kind + "_m", mem
+    if kind == "jmp":
+        return "jmp_r", ()
+    if kind in ("push", "call"):
+        forms = ("r", "i") if kind == "push" else ("i", "r")
+        return kind, (forms.index(form), int(spec.ordered))
+    return kind, (int(spec.ordered),)
+
+
+def stream_file(spec):
+    """ Which of the generated files spec's gadget goes in: a few, so that
+    the compile parallelises. """
+    if isinstance(spec, CondSpec):
+        return "cond"
+    if spec.kind == "alu":
+        return "alu_" + spec.op.name
+    if spec.kind in ("mov", "extend", "unary", "shift"):
+        return spec.kind
+    return "misc"
+
+
+STREAM_FILES = ("alu_add", "alu_sub", "alu_and", "alu_or", "alu_xor",
+                "alu_cmp", "alu_test", "mov", "extend", "unary", "shift",
+                "misc", "cond")
+
+
+def stream_gadget(spec):
+    """ The C source of spec's gadget in the stream harness. """
+    lines = body(spec, StreamHarness(spec))
+    used = sorted(set(re.findall(r"%\[(\w+)\]", "\n".join(lines))))
+    proto = f"__attribute__((naked)) void rcg_stream_{spec.name}(void)"
+    out = [proto + ";", proto, "{", "    asm("]
+    out += [f'        "{line}\\n"' for line in lines]
+    if used:
+        out.append("        :: " + ", ".join(
+            f'[{op}] "i" ({BODY_OPERANDS[op]})' for op in used))
+    return out + ["    );", "}", ""]
+
+
+def write_stream_gadgets(outdir):
+    """ Writes the stream harness's gadgets, rcg_stream_FILE.c for each of
+    STREAM_FILES, and rcg_stream_gadgets.c and .h: the tables the translator
+    picks gadgets from, the enumerations that index them, and the lazy-flags
+    facts it needs. """
+    header = "/* Generated by rcg-gen.py --stream-gadgets. Do not edit. */\n"
+    files = {name: open(os.path.join(outdir, f"rcg_stream_{name}.c"), "w")
+             for name in STREAM_FILES}
+    for f in files.values():
+        print(header + '\n#include "qemu/osdep.h"\n#include "cpu.h"\n'
+              '#include "tcti-gadget-defs.h"\n'
+              '#include "rcg_stream_gadgets.h"\n', file=f)
+
+    tables = {}
+    for spec in [*specs(), *cond_specs()]:
+        print("\n".join(stream_gadget(spec)), file=files[stream_file(spec)])
+        table, index = stream_slot(spec)
+        entries = tables.setdefault(table, {})
+        assert index not in entries, spec.name
+        entries[index] = spec.name
+    for f in files.values():
+        f.close()
+
+    dims = {}
+    for table, entries in tables.items():
+        n = len(next(iter(entries)))
+        dims[table] = "".join(f"[{max(i[k] for i in entries) + 1}]"
+                              for k in range(n)) or "[1]"
+
+    def enum(prefix, names):
+        return [f"#define RCG_STREAM_{prefix}_{name.upper()} {i}"
+                for i, name in enumerate(names)]
+
+    h = [header, "#ifndef RCG_STREAM_GADGETS_H", "#define RCG_STREAM_GADGETS_H",
+         "", "typedef void (*RcgStreamGadget)(void);", "",
+         "/* The tables' indices, as rcg-gen.py's tables order them. */",
+         *enum("ALU", (op.name for op in ALU_OPS)),
+         *enum("EXTEND", (op.name for op in EXTEND_OPS)),
+         *enum("UNARY", (op.name for op in UNARY_OPS)),
+         *enum("SHIFT", (op.name for op in SHIFT_OPS)),
+         *enum("SHAPE", EA_SHAPES),
+         *enum("CC", (cc_name(cls, width) for cls, width in CC_CLASSES)),
+         "",
+         "/* The lazy-flags state each op leaves at 8 bits (add the width's",
+         " * MemOp), or -1 for one that leaves the state alone. */",
+         "extern const int rcg_stream_alu_cc[];",
+         "extern const int rcg_stream_unary_cc[];",
+         "extern const int rcg_stream_shift_cc[];", ""]
+    h += [f"extern const RcgStreamGadget rcg_stream_{table}{dims[table]};"
+          for table in sorted(tables)]
+    h += ["", "#endif"]
+    with open(os.path.join(outdir, "rcg_stream_gadgets.h"), "w") as f:
+        print("\n".join(h), file=f)
+
+    def cc_base(cc):
+        return f"CC_OP_{cc}B" if cc else "-1"
+
+    c = [header, '#include "qemu/osdep.h"', '#include "cpu.h"',
+         '#include "rcg_stream_gadgets.h"', ""]
+    c += [f"QEMU_BUILD_BUG_ON({a});" for a in BODY_ASSUMPTIONS]
+    c += ["", "const int rcg_stream_alu_cc[] = { " +
+          ", ".join(cc_base(op.cc) for op in ALU_OPS) + " };",
+          "const int rcg_stream_unary_cc[] = { " +
+          ", ".join(cc_base(op.cc) for op in UNARY_OPS) + " };",
+          "const int rcg_stream_shift_cc[] = { " +
+          ", ".join(cc_base(op.cc) for op in SHIFT_OPS) + " };", ""]
+    for entries in tables.values():
+        c += [f"void rcg_stream_{name}(void);" for name in entries.values()]
+    for table in sorted(tables):
+        c += ["", f"const RcgStreamGadget rcg_stream_{table}{dims[table]} = {{"]
+        for index, name in sorted(tables[table].items()):
+            at = "".join(f"[{i}]" for i in index) or "[0]"
+            c.append(f"    {at} = rcg_stream_{name},")
+        c.append("};")
+    with open(os.path.join(outdir, "rcg_stream_gadgets.c"), "w") as f:
+        print("\n".join(c), file=f)
+
+
+#
 # The tests: x86-64 code for each form, run over awkward values.
 #
 
@@ -1698,8 +1909,12 @@ def main():
                         help="write rcg-faults.c's cases to FILE")
     parser.add_argument("--check", action="store_true",
                         help="render every gadget's body and check it")
+    parser.add_argument("--stream-gadgets", metavar="DIR",
+                        help="write the stream harness's gadgets and tables "
+                             "to DIR")
     args = parser.parse_args()
-    if not (args.insn_tests or args.fault_tests or args.check):
+    if not (args.insn_tests or args.fault_tests or args.check or
+            args.stream_gadgets):
         parser.error("nothing to do")
 
     if args.check:
@@ -1710,6 +1925,8 @@ def main():
     if args.fault_tests:
         with open(args.fault_tests, "w") as out:
             write_cases(fault_cases(), out, "rcg_fault_")
+    if args.stream_gadgets:
+        write_stream_gadgets(args.stream_gadgets)
 
 
 if __name__ == "__main__":

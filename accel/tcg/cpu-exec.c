@@ -72,6 +72,7 @@ static inline TCGTBCPUState tb_cpu_state(CPUState *cpu)
 #include "tb-context.h"
 #include "tb-internal.h"
 #include "internal-common.h"
+#include "accel/tcg/rcg-stream.h"
 #if !defined(CONFIG_USER_ONLY)
 #include "accel/tcg/iommu.h"
 #endif
@@ -438,7 +439,8 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
     }
 
     tb = tb_lookup(cpu, s);
-    if (tb == NULL) {
+    if (tb == NULL || tb->rcg_stream) {
+        /* An RCG stream is not entered from TCG's code: rcg-stream.h. */
         return tcg_code_gen_epilogue;
     }
 
@@ -481,7 +483,23 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     }
 
     qemu_thread_jit_execute();
-    ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
+#ifdef TCG_HAVE_RCG_STREAM
+    if (itb->rcg_stream) {
+        CPUArchState *env = cpu_env(cpu);
+        const RcgStreamCPU rcg = {
+            .exit_request = &cpu->neg.icount_decr.u32,
+            .pc = (void *)env + cpu->cc->tcg_ops->rcg_pc_offset,
+            .tb_jmp_cache = cpu->tb_jmp_cache,
+            .breakpoints = &cpu->breakpoints,
+        };
+
+        ret = rcg_stream_exec(env, tb_ptr, &rcg);
+        trace_rcg_stream_exec(itb, ret);
+    } else
+#endif
+    {
+        ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
+    }
     cpu->neg.can_do_io = true;
     qemu_plugin_disable_mem_helpers(cpu);
     /*
@@ -656,9 +674,64 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
     uintptr_t jmp_rx = (uintptr_t)tb->tc.ptr + offset;
     uintptr_t jmp_rw = jmp_rx - tcg_splitwx_diff;
 
+    if (tb->rcg_stream) {
+        /* A stream's jump is this word, which rcg_stream_goto reads. */
+        qatomic_set(&tb->jmp_target_addr[n], addr);
+        return;
+    }
     tb->jmp_target_addr[n] = addr;
     tb_target_set_jmp_target(c_tb, n, jmp_rx, jmp_rw);
 }
+
+#ifdef TCG_HAVE_RCG_STREAM
+/*
+ * A stream's direct jump to a TB that may not be linked to (one of two
+ * pages, whose second may be mapped elsewhere tomorrow): rather than come
+ * back here each time, the jump goes to the stream's own stub that looks
+ * the TB up, which rcg_stream_finish() put after the stubs of its slots.
+ */
+static void rcg_stream_slot_to_lookup(TranslationBlock *tb, int n)
+{
+    uint16_t r0 = tb->jmp_reset_offset[0], r1 = tb->jmp_reset_offset[1];
+    uint16_t last = r0 == TB_JMP_OFFSET_INVALID ? r1 :
+                    r1 == TB_JMP_OFFSET_INVALID ? r0 : MAX(r0, r1);
+
+    if (n > 1 || tb->jmp_reset_offset[n] == TB_JMP_OFFSET_INVALID ||
+        qatomic_read(&tb->jmp_dest[n])) {
+        return;
+    }
+    tb_set_jmp_target(tb, n, (uintptr_t)tb->tc.ptr + last +
+                             2 * sizeof(uint64_t));
+}
+
+/*
+ * helper_lookup_tb_ptr for a stream: the stream to go on in, or NULL to
+ * return to the main loop. Only another stream will do.
+ */
+const void *rcg_stream_lookup_tb_ptr(CPUArchState *env)
+{
+    CPUState *cpu = env_cpu(env);
+    TranslationBlock *tb;
+
+    cpu->neg.can_do_io = true;
+
+    TCGTBCPUState s = tb_cpu_state(cpu);
+    s.cflags = curr_cflags(cpu);
+
+    if (check_for_breakpoints(cpu, s.pc, &s.cflags)) {
+        cpu_loop_exit(cpu);
+    }
+
+    tb = tb_lookup(cpu, s);
+    if (tb == NULL || !tb->rcg_stream) {
+        return NULL;
+    }
+    if (qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
+        log_cpu_exec(s.pc, cpu, tb);
+    }
+    return tb->tc.ptr;
+}
+#endif
 
 static inline void tb_add_jump(TranslationBlock *tb, int n,
                                TranslationBlock *tb_next)
@@ -1037,11 +1110,19 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * for the second page can change.
              */
             if (tb_page_addr1(tb) != -1) {
+#ifdef TCG_HAVE_RCG_STREAM
+                if (last_tb && last_tb->rcg_stream && tb->rcg_stream) {
+                    rcg_stream_slot_to_lookup(last_tb, tb_exit);
+                }
+#endif
                 last_tb = NULL;
             }
 #endif
-            /* See if we can patch the calling TB. */
-            if (last_tb) {
+            /*
+             * See if we can patch the calling TB. A TCG TB and an RCG
+             * stream cannot jump into each other.
+             */
+            if (last_tb && last_tb->rcg_stream == tb->rcg_stream) {
                 tb_add_jump(last_tb, tb_exit, tb);
             }
 

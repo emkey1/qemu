@@ -37,6 +37,39 @@ QEMU_OPTS+=-device isa-debugcon,chardev=output -device isa-debug-exit,iobase=0xf
 # tlb-next-page uses memory up to 194 MiB.
 run-tlb-next-page: QEMU_OPTS := -m 256M $(QEMU_OPTS)
 
+# The RCG tests' cases come from the tables RCG's gadgets are made from,
+# with the data addresses rcg-test.h defines. Making rcg-insns.h also checks
+# every gadget's body.
+RCG_GEN=$(SRC_PATH)/target/i386/tcg/rcg-gen.py
+RCG_GEN_DEPS=$(RCG_GEN) $(SRC_PATH)/tcg/aarch64-tcti/tcti_memory.py \
+	$(X64_SYSTEM_SRC)/rcg-test.h
+CLEANFILES += rcg-insns.h rcg-faults.h
+
+rcg-insns.h: $(RCG_GEN_DEPS)
+	$(call quiet-command, $(PYTHON) $< --check --insn-tests $@, GEN, $@)
+rcg-faults.h: $(RCG_GEN_DEPS)
+	$(call quiet-command, $(PYTHON) $< --fault-tests $@, GEN, $@)
+
+rcg-insns: rcg-insns.h rcg-test.h
+rcg-faults: rcg-faults.h rcg-test.h
+rcg-insns rcg-faults: CFLAGS += -I.
+
+# RCG_MEM, as rcg-test.h explains.
+RCG_MEM=$(shell sed -n 's/^\#define RCG_MEM \(0x[0-9a-f]*\)$$/\1/p' \
+	$(X64_SYSTEM_SRC)/rcg-test.h)
+rcg-insns rcg-faults: LDFLAGS += -Wl,--defsym=rcg_mem=$(RCG_MEM)
+
+# rcg-insns prints a hash of each case's results, which must match TCG's,
+# held in rcg-insns.ref. It runs for about two minutes under TCTI on an M2
+# Max, so it gets longer than the default timeout.
+run-rcg-insns: TIMEOUT=600
+run-rcg-insns: rcg-insns
+	$(call run-test, $<, \
+	  $(QEMU) -monitor none -display none \
+		  -chardev file$(COMMA)path=$<.out$(COMMA)id=output \
+		  $(QEMU_OPTS) $<)
+	$(call diff-out, $<, $(X64_SYSTEM_SRC)/rcg-insns.ref)
+
 ifeq ($(CONFIG_PLUGIN),y)
 run-plugin-patch-target-with-libpatch.so:		\
 	PLUGIN_ARGS=$(COMMA)target=ffc0$(COMMA)patch=9090$(COMMA)use_hwaddr=true

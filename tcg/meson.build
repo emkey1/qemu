@@ -47,9 +47,11 @@ if get_option('tcg_threaded_interpreter') or get_option('tcg_hybrid') != 'disabl
     tcti_outputs += ['tcti_@0@_gadgets.c'.format(c), 'tcti_@0@_gadgets.h'.format(c)]
   endforeach
   tcti_gadget_gen = files(meson.project_source_root() / 'tcg' / 'aarch64-tcti' / 'tcti-gadget-gen.py')
+  tcti_memory = files(meson.project_source_root() / 'tcg' / 'aarch64-tcti' / 'tcti_memory.py')
   tcti_gadgets = custom_target('tcti-gadgets',
                                output: tcti_outputs,
                                input: tcti_gadget_gen,
+                               depend_files: tcti_memory,
                                command: [python, '@INPUT@', '@OUTDIR@'])
   tcg_ss.add(declare_dependency(sources: tcti_gadgets))
 endif

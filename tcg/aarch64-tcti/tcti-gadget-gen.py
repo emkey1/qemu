@@ -9,6 +9,16 @@ import sys
 import itertools
 import re
 
+# The guest-memory templates, which RCG's generator uses too. They are
+# imported from beside this script, without leaving bytecode in the source
+# tree.
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tcti_memory import (C_CALL_EPILOGUE, C_CALL_PROLOGUE,  # noqa: E402
+                         QEMU_TLB_FAST_MMU_INDICES, create_tlb_fastpath,
+                         tlb_operands, load as guest_load,
+                         store as guest_store)
+
 # Epilogue code follows at the end of each gadget, and handles continuing execution.
 EPILOGUE = (
     # Load our next gadget address from our bytecode stream, advancing it.
@@ -37,17 +47,6 @@ ARCH_CONDITION_CODES = ["eq", "ne", "lt", "ge", "le", "gt", "lo", "hs", "ls", "h
 
 # The list of vector size codes supported on this platform.
 VECTOR_SIZES = ['16b', '8b', '4h', '8h', '2s', '4s', '2d']
-
-# The MMU indices we create TLB fast-path gadgets for. Each gadget loads its
-# CPUTLBDescFast from a fixed offset from env, and that offset depends on the
-# MMU index and on the layout of CPUNegativeOffsetState, so the offset is
-# computed by the C compiler (TCTI_TLB_FAST_OFS, in tcti-gadget-defs.h) rather
-# than written down here. An access to any other index takes the slow path.
-#
-# 0-5 are x86's kernel, user and no-SMAP modes, in 64- and 32-bit flavours:
-# everything generated code uses. This must match TCTI_TLB_FAST_MMU_INDICES in
-# tcti-gadget-defs.h.
-QEMU_TLB_FAST_MMU_INDICES = range(6)
 
 # Statistics.
 gadgets      = 0
@@ -458,133 +457,12 @@ def with_d(name, *lines):
     with_single(name, 'd', *lines)
 
 
-# Assembly code for saving our machine state before entering the C runtime.
-C_CALL_PROLOGUE = [
-    "stp x14, x15, [sp, #-16]!",
-    "stp x28, lr,  [sp, #-16]!",
-]
-
-# Assembly code for restoring our machine state after leaving the C runtime.
-C_CALL_EPILOGUE = [
-    "ldp x28, lr,  [sp], #16",
-    "ldp x14, x15, [sp], #16",
-]
-
-
-def create_tlb_fastpath(is_write, miss_label="0", size=8, align=None):
-    """ Creates a set of instructions that perform a soft-MMU TLB lookup.
-
-    This is used for `qemu_ld`/qemu_st` instructions; to emit a prologue that
-    hopefully helps us skip a slow call into the C runtime when a Guest Virtual
-    -> Host Virtual mapping is in the softmmu's TLB.
-
-    This "fast-path" prelude behaves as follows:
-        - If a TLB entry is found for the address stored in Xn, then x27
-          is stored to an "addend" that can be added to the guest virtual addres
-          to get the host virtual address (the address in our local memory space).
-        - If a TLB entry isn't found, it branches to the "miss_label" (by default, 0:),
-          so address lookup can be handled by the fastpath.
-
-    align, if given, is the alignment in bytes the access must have: an
-    address without it also branches to the miss label, where the helper
-    raises the fault, and an aligned access cannot cross a page. Otherwise the
-    hit takes all size bytes from Xn to be on the page.
-
-    QEMU's constants, the TLB's layout among them, are the gadget's asm
-    operands, which tlb_operands() gives for the same is_write and align.
-
-    Clobbers x24, and x26; provides output in x27.
-    """
-
-    fast_path = [
-        # Load env_tlb(env)->f[mmu_idx].{mask,table} into {x26,x27}. The
-        # offset is the gadget's asm operand; see tlb_operands().
-        "ldp x26, x27, [x14, %[tlb_ofs]]",
-
-        # Extract the TLB index from the address into X26.
-        "and x26, x26, Xn, lsr %[tlb_shift]", # Xn = addr register
-
-        # Add the tlb_table pointer, creating the CPUTLBEntry address into X27.
-        "add x27, x27, x26",
-
-        # Load the tlb comparator into X26, and the fast path addend into X27.
-        "ldr x26, [x27, %[tlb_cmp]]",
-        "ldr x27, [x27, %[tlb_addend]]",
-
-    ]
-
-    if align:
-        fast_path.extend([
-            # Store the page mask part of the address into X24, and the bits
-            # below the alignment, which must be clear for a hit.
-            "and x24, Xn, %[tlb_page_mask]",
-
-            # Compare the masked address with the TLB value.
-            "cmp x26, x24",
-
-            # If we're not equal, this isn't a TLB hit. Jump to our miss handler.
-            f"b.ne {miss_label}f",
-        ])
-    else:
-        fast_path.extend([
-            # If we're not aligned, add in our alignment value to ensure we don't
-            # don't straddle the end of a page.
-            f"add x24, Xn, #{size - 1}",
-
-            # Store the page mask part of the address into X24.
-            "and x24, x24, %[tlb_page_mask]",
-
-            # Compare the masked address with the TLB value.
-            "cmp x26, x24",
-
-            # If we're not equal, this isn't a TLB hit. Jump to our miss handler.
-            f"b.ne {miss_label}f",
-        ])
-
-    return fast_path
-
-
-
-def tlb_operands(mmu_idx, is_write, align=None):
-    """ The asm operand list for a fast-path gadget serving mmu_idx, with the
-    is_write and align its create_tlb_fastpath() was given. Each value is
-    worked out by the C compiler from QEMU's own definitions. """
-    comparator = "addr_write" if is_write else "addr_read"
-    page_mask = "TCTI_TLB_PAGE_MASK"
-    if (align or 1) > 1:
-        page_mask += f" | {align - 1}"
-    return ", ".join([
-        f'[tlb_ofs] "i" (TCTI_TLB_FAST_OFS({mmu_idx}))',
-        '[tlb_shift] "i" (TCTI_TLB_INDEX_SHIFT)',
-        f'[tlb_cmp] "i" (offsetof(CPUTLBEntry, {comparator}))',
-        '[tlb_addend] "i" (offsetof(CPUTLBEntry, addend))',
-        f'[tlb_page_mask] "i" ({page_mask})',
-    ])
-
-
-def granule_check(size, align=None):
-    """ For an ordered access of size bytes, with the alignment align
-    already checked if given: branches to the slow path if it crosses a
-    16-byte boundary, where an LDAPR or STLR faults even with LSE2. That is,
-    if (addr & 15) > 16 - size. """
-    if size == 1 or (align or 1) >= size:
-        return []
-    return [
-        "and x26, Xn, #15",
-        f"cmp x26, #{16 - size}",
-        "b.hi 0f",
-    ]
-
-
 def ld_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None,
-        align=None, force_slowpath=False, ordered=None):
+        align=None, force_slowpath=False, ordered=None, size=None):
     """ Creates a thunk into our C runtime for a QEMU LD operation.
 
-    align is as for create_tlb_fastpath(). ordered, if given, is the access
-    size in bytes: the fast path is then the given LDAPR sequence (on x27,
-    the host address), after a check that the access does not cross a 16-byte
-    boundary unless align says it cannot, and the slow path orders the
-    helper's plain load after it, as an LDAPR would be. """
+    align, ordered and size are as for tcti_memory.load(), which builds the
+    gadget. """
 
     # A slow-path gadget serves every MMU index, so there is just the one;
     # otherwise there is one per index with a fast path.
@@ -600,62 +478,16 @@ def ld_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None,
             gadget_name = f"{name}_{suffix}_i32" if is_32b else f"{name}_{suffix}_i64"
             postscript = () if immediate else ("add x28, x28, #8",)
 
-            # If we have a pure-assembly fast path, start our gadget with it.
-            if fastpath and not force_slowpath:
-                fastpath_ops = [
-                    # Create a fastpath that jumps to miss_lable on a TLB miss,
-                    # or sets x27 to the TLB addend on a TLB hit.
-                    *create_tlb_fastpath(is_write=False, align=align),
-                    # LDAPR is FEAT_LRCPC (ARMv8.3), past what we may be built for.
-                    *(granule_check(ordered, align)
-                      + ["add x27, x27, Xn", ".arch_extension rcpc"] if ordered else []),
+            # The operation info comes from an immediate32, or from the
+            # stream.
+            oi = (f"mov   {{}}, #{immediate}" if (immediate is not None)
+                  else "ldr   {}, [x28], #8")
 
-                    # On a hit, we can just perform an appropriate load...
-                    *fastpath,
-
-                    # Run our patch-up post-script, if we have one.
-                    *postscript,
-
-                    # ... and then we're done!
-                    *EPILOGUE,
-                ]
-            # Otherwise, we'll save arguments for our slow path.
-            else:
-                fastpath_ops = []
-
-            #
-            # If we're not taking our fast path, we'll call into our C runtime to
-            # take the slow path.
-            #
             with_dn(gadget_name,
-                    *fastpath_ops,
-
-                "0:",
-                    "mov x27, Xn",
-
-                    # Save our registers in preparation for entering a C call.
-                    *C_CALL_PROLOGUE,
-
-                    # Per our calling convention:
-                    # - Move our architectural environment into x0, from x14.
-                    # - Move our target address into x1. [Placed in x27 below.]
-                    # - Move our operation info into x2, from an immediate32.
-                    # - Move the next bytecode pointer into x3, from x28.
-                    "mov   x0, x14",
-                    "mov   x1, x27",
-                    (f"mov   x2, #{immediate}" if (immediate is not None)
-                     else "ldr   x2, [x28], #8"),
-                    "mov   x3, x28",
-
-                    # Perform our actual core code.
-                    f"bl _{slowpath_helper}",
-
-                    # Temporarily store our result in a register that won't get trashed.
-                    "mov x27, x0",
-
-                    # Restore our registers after our C call.
-                    *C_CALL_EPILOGUE,
-                    *(["dmb ishld"] if ordered else []),
+                    *guest_load(fastpath, slowpath_helper, oi,
+                                align=align, ordered=ordered, size=size,
+                                fast=fastpath and not force_slowpath,
+                                on_hit=[*postscript, *EPILOGUE]),
 
                     # Finally, call our postscript...
                     *postscript,
@@ -667,11 +499,11 @@ def ld_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None,
 
 
 def st_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None,
-        align=None, force_slowpath=False, ordered=None):
+        align=None, force_slowpath=False, ordered=None, size=None):
     """ Creates a thunk into our C runtime for a QEMU ST operation.
 
-    align and ordered are as for ld_thunk, with STLR; the slow path orders
-    the helper's plain store after earlier stores, as an STLR would be. """
+    align, ordered and size are as for tcti_memory.store(), which builds the
+    gadget. """
 
     # As for ld_thunk.
     indices = [None] if force_slowpath else QEMU_TLB_FAST_MMU_INDICES
@@ -686,65 +518,16 @@ def st_thunk(name, fastpath_32b, fastpath_64b, slowpath_helper, immediate=None,
             gadget_name = f"{name}_{suffix}_i32" if is_32b else f"{name}_{suffix}_i64"
             postscript = () if immediate else ("add x28, x28, #8",)
 
-            # If we have a pure-assembly fast path, start our gadget with it.
-            if fastpath and not force_slowpath:
-                fastpath_ops = [
+            # As for ld_thunk.
+            oi = (f"mov  {{}}, #{immediate}" if (immediate is not None)
+                  else "ldr   {}, [x28], #8")
 
-                    # Create a fastpath that jumps to miss_lable on a TLB miss,
-                    # or sets x27 to the TLB addend on a TLB hit.
-                    *create_tlb_fastpath(is_write=True, align=align),
-                    *(granule_check(ordered, align)
-                      + ["add x27, x27, Xn"] if ordered else []),
-
-                    # On a hit, we can just perform an appropriate load...
-                    *fastpath,
-
-                    # Run our patch-up post-script, if we have one.
-                    *postscript,
-
-                    # ... and then we're done!
-                    *EPILOGUE,
-                ]
-            else:
-                fastpath_ops = []
-
-
-            #
-            # If we're not taking our fast path, we'll call into our C runtime to
-            # take the slow path.
-            #
             with_dn(gadget_name,
-                    *fastpath_ops,
-
-                "0:",
-                    # Move our arguments into registers that we're not actively using.
-                    # This ensures that they won't be trounced by our calling convention
-                    # if this is reading values from x0-x4.
-                    "mov w27, Wd" if is_32b else "mov x27, Xd",
-                    "mov x26, Xn",
-
-                    # Save our registers in preparation for entering a C call.
-                    *C_CALL_PROLOGUE,
-
-                    # Per our calling convention:
-                    # - Move our architectural environment into x0, from x14.
-                    # - Move our target address into x1. [Moved into x26 above].
-                    # - Move our target value into x2. [Moved into x27 above].
-                    # - Move our operation info into x3, from an immediate32.
-                    # - Move the next bytecode pointer into x4, from x28.
-                    "mov   x0, x14",
-                    "mov   x1, x26",
-                    "mov   x2, x27",
-                    (f"mov  x3, #{immediate}" if (immediate is not None)
-                     else "ldr   x3, [x28], #8"),
-                    "mov   x4, x28",
-                    *(["dmb ishst"] if ordered else []),
-
-                    # Perform our actual core code.
-                    f"bl _{slowpath_helper}",
-
-                    # Restore our registers after our C call.
-                    *C_CALL_EPILOGUE,
+                    *guest_store(fastpath, slowpath_helper, oi,
+                                 "Wd" if is_32b else "Xd", align=align,
+                                 ordered=ordered, size=size,
+                                 fast=fastpath and not force_slowpath,
+                                 on_hit=[*postscript, *EPILOGUE]),
 
                     # Finally, call our postscript.
                     *postscript,
@@ -1392,7 +1175,11 @@ for ordered in (False, True):
             START_COLLECTION(f"qemu_ld_{variant}_{signedness}_le",
                              needs_defs=not is_slowpath)
             for op, helper, size, plain32, plain64, ord32, ord64 in ops:
+                # The size lets tcti_memory check that the alignment covers
+                # the access. The unaligned gadgets keep the default, which
+                # checks a page crossing as for 8 bytes, whatever the size.
                 ld_thunk(f"qemu_ld_{op}_{variant}", align=size if is_aligned else None,
+                    size=size if is_aligned else None,
                     slowpath_helper=helper,
                     fastpath_32b=ord32 if ordered else plain32,
                     fastpath_64b=ord64 if ordered else plain64,
@@ -1421,7 +1208,9 @@ for ordered in (False, True):
 
         START_COLLECTION(f"qemu_st_{variant}_le", needs_defs=not is_slowpath)
         for op, helper, size, plain, ord32, ord64 in ST_OPS:
+            # As for the loads.
             st_thunk(f"qemu_st_{op}_{variant}", align=size if is_aligned else None,
+                size=size if is_aligned else None,
                 slowpath_helper=helper,
                 fastpath_32b=[ord32] if ordered else [plain],
                 fastpath_64b=[ord64] if ordered else [plain],

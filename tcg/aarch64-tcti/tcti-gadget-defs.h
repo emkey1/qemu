@@ -24,7 +24,7 @@
 
 /*
  * The MMU indices that have TLB fast-path gadgets, which are 0 to this minus
- * one. Must match QEMU_TLB_FAST_MMU_INDICES in tcti-gadget-gen.py.
+ * one. Must match QEMU_TLB_FAST_MMU_INDICES in tcti_memory.py.
  */
 #define TCTI_TLB_FAST_MMU_INDICES 6
 

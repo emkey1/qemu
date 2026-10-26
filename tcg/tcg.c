@@ -60,6 +60,7 @@
 #include "tcg/perf.h"
 #include "tcg-has.h"
 #include "tcg/hybrid.h"
+#include "tcg/rcg.h"
 #include "exec/tb-flush.h"
 #include "qapi/error.h"
 #ifdef CONFIG_USER_ONLY
@@ -194,6 +195,10 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
 #ifdef CONFIG_TCG_HYBRID_RUNTIME
 /* Set once, from -accel tcg,tcti=, before tcg_init(). */
 bool tcg_hybrid_tcti;
+#endif
+
+#ifdef TCG_HAVE_RCG
+bool tcg_rcg_enabled;
 #endif
 
 TCGContext tcg_init_ctx;

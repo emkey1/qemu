@@ -29,6 +29,7 @@
 #include "exec/icount.h"
 #include "tcg/startup.h"
 #include "tcg/hybrid.h"
+#include "tcg/rcg.h"
 #include "tcg/tcg.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -58,6 +59,9 @@ struct TCGState {
     unsigned long tb_size;
 #ifdef CONFIG_TCG_HYBRID_RUNTIME
     bool tcti;
+#endif
+#ifdef TCG_HAVE_RCG
+    bool rcg;
 #endif
 };
 typedef struct TCGState TCGState;
@@ -178,6 +182,12 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
      */
     tcg_hybrid_tcti = s->tcti;
 #endif
+#ifdef TCG_HAVE_RCG
+    tcg_rcg_enabled = s->rcg;
+    if (s->rcg) {
+        warn_report("rcg=on does nothing yet: no front end uses RCG");
+    }
+#endif
     tcg_init(s->tb_size * MiB, s->splitwx_enabled, max_threads);
 
     /*
@@ -276,6 +286,20 @@ static void tcg_set_tcti(Object *obj, bool value, Error **errp)
 }
 #endif
 
+#ifdef TCG_HAVE_RCG
+static bool tcg_get_rcg(Object *obj, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+    return s->rcg;
+}
+
+static void tcg_set_rcg(Object *obj, bool value, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+    s->rcg = value;
+}
+#endif
+
 static bool tcg_get_one_insn_per_tb(Object *obj, Error **errp)
 {
     TCGState *s = TCG_STATE(obj);
@@ -320,6 +344,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "tcti",
         "Run translated code with TCTI, the threaded interpreter, rather "
         "than as native code");
+#endif
+
+#ifdef TCG_HAVE_RCG
+    object_class_property_add_bool(oc, "rcg", tcg_get_rcg, tcg_set_rcg);
+    object_class_property_set_description(oc, "rcg",
+        "Under TCTI, run each guest instruction that has a dedicated "
+        "gadget as that one gadget");
 #endif
 
     object_class_property_add_bool(oc, "one-insn-per-tb",

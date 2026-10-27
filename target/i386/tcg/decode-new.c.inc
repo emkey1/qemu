@@ -3100,6 +3100,11 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         gen_helper_enter_mmx(tcg_env);
     }
 
+    /* Under TCTI, RCG may emit one gadget for the whole instruction. */
+    if (rcg_translate(s, &decode)) {
+        return;
+    }
+
     if (decode.e.special != X86_SPECIAL_NoLoadEA &&
         (decode.op[0].has_ea || decode.op[1].has_ea || decode.op[2].has_ea)) {
         gen_lea_modrm(s, &decode);

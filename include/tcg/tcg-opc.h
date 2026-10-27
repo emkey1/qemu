@@ -33,6 +33,23 @@ DEF(set_label, 0, 0, 1, TCG_OPF_BB_END | TCG_OPF_NOT_PRESENT)
 /* variable number of parameters */
 DEF(call, 0, 0, 3, TCG_OPF_CALL_CLOBBER | TCG_OPF_NOT_PRESENT)
 
+/* Where TCG_HAVE_RCG is defined; see tcg/rcg.h. */
+#if defined(CONFIG_TCG_THREADED_INTERPRETER) || \
+    defined(CONFIG_TCG_HYBRID_RUNTIME)
+/*
+ * An RCG gadget, its operand words, their count and TCG_RICH_* flags, then
+ * the globals it writes and those it reads; see tcg_gen_rich().
+ */
+DEF(rich, 0, 0, 4, TCG_OPF_CALL_CLOBBER | TCG_OPF_NOT_PRESENT |
+    TCG_OPF_SIDE_EFFECTS)
+/*
+ * As rich, then the label the gadget branches to if its condition holds;
+ * see tcg_gen_rich_br().
+ */
+DEF(rich_br, 0, 0, 5, TCG_OPF_BB_END | TCG_OPF_COND_BRANCH |
+    TCG_OPF_CALL_CLOBBER | TCG_OPF_NOT_PRESENT | TCG_OPF_SIDE_EFFECTS)
+#endif
+
 DEF(br, 0, 0, 1, TCG_OPF_BB_END | TCG_OPF_NOT_PRESENT)
 DEF(brcond, 0, 2, 2, TCG_OPF_BB_END | TCG_OPF_COND_BRANCH | TCG_OPF_INT)
 

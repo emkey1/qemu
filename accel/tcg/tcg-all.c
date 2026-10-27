@@ -60,6 +60,9 @@ struct TCGState {
 #ifdef CONFIG_TCG_HYBRID_RUNTIME
     bool tcti;
 #endif
+#ifdef TCG_HAVE_TCTI
+    bool tcti_ordered;
+#endif
 #ifdef TCG_HAVE_RCG
     bool rcg;
 #endif
@@ -88,6 +91,9 @@ static void tcg_accel_instance_init(Object *obj)
     s->splitwx_enabled = -1;
 #else
     s->splitwx_enabled = 0;
+#endif
+#ifdef TCG_HAVE_TCTI
+    s->tcti_ordered = true;
 #endif
 }
 
@@ -182,11 +188,11 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
      */
     tcg_hybrid_tcti = s->tcti;
 #endif
+#ifdef TCG_HAVE_TCTI
+    tcg_tcti_ordered = s->tcti_ordered;
+#endif
 #ifdef TCG_HAVE_RCG
     tcg_rcg_enabled = s->rcg;
-    if (s->rcg) {
-        warn_report("rcg=on does nothing yet: no front end uses RCG");
-    }
 #endif
     tcg_init(s->tb_size * MiB, s->splitwx_enabled, max_threads);
 
@@ -286,6 +292,20 @@ static void tcg_set_tcti(Object *obj, bool value, Error **errp)
 }
 #endif
 
+#ifdef TCG_HAVE_TCTI
+static bool tcg_get_tcti_ordered(Object *obj, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+    return s->tcti_ordered;
+}
+
+static void tcg_set_tcti_ordered(Object *obj, bool value, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+    s->tcti_ordered = value;
+}
+#endif
+
 #ifdef TCG_HAVE_RCG
 static bool tcg_get_rcg(Object *obj, Error **errp)
 {
@@ -344,6 +364,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "tcti",
         "Run translated code with TCTI, the threaded interpreter, rather "
         "than as native code");
+#endif
+
+#ifdef TCG_HAVE_TCTI
+    object_class_property_add_bool(oc, "tcti-ordered",
+        tcg_get_tcti_ordered, tcg_set_tcti_ordered);
+    object_class_property_set_description(oc, "tcti-ordered",
+        "Under TCTI, order guest memory accesses with acquire loads and "
+        "release stores where the host has them, rather than with barriers");
 #endif
 
 #ifdef TCG_HAVE_RCG

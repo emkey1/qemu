@@ -115,6 +115,18 @@ static void tcg_register_jit_int(const void *buf, size_t size,
  */
 #include "tcg-target-protos.h.inc"
 
+#ifdef TCG_HAVE_RCG
+/*
+ * Only TCTI defines these. The hybrid does not rename them, so tcg.c calls
+ * them directly.
+ */
+static void tcg_out_rich(TCGContext *s, const void *gadget,
+                         const uint64_t *words, unsigned nb_words);
+static void tcg_out_rich_br(TCGContext *s, const void *gadget,
+                            const uint64_t *words, unsigned nb_words,
+                            TCGLabel *l);
+#endif
+
 #if !TCG_TARGET_MAYBE_vec
 static inline bool tcg_out_dup_vec(TCGContext *s, TCGType type, unsigned vece,
                                    TCGReg dst, TCGReg src)
@@ -195,6 +207,10 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
 #ifdef CONFIG_TCG_HYBRID_RUNTIME
 /* Set once, from -accel tcg,tcti=, before tcg_init(). */
 bool tcg_hybrid_tcti;
+#endif
+
+#ifdef TCG_HAVE_TCTI
+bool tcg_tcti_ordered = true;
 #endif
 
 #ifdef TCG_HAVE_RCG
@@ -2482,6 +2498,12 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         tcg_debug_assert(type <= TCG_TYPE_REG);
         return true;
 
+#ifdef TCG_HAVE_RCG
+    case INDEX_op_rich:
+    case INDEX_op_rich_br:
+        return tcg_tcti_active();
+#endif
+
     case INDEX_op_qemu_ld2:
     case INDEX_op_qemu_st2:
         tcg_debug_assert(type == TCG_TYPE_I128);
@@ -2997,6 +3019,36 @@ void tcg_dump_ops(TCGContext *s, FILE *f, bool have_prefs)
                 const char *t = tcg_get_arg_str(s, buf, sizeof(buf), arg);
                 col += ne_fprintf(f, ",%s", t);
             }
+#ifdef TCG_HAVE_RCG
+        } else if (c == INDEX_op_rich || c == INDEX_op_rich_br) {
+            unsigned globals = TCGOP_RICH_FIRST(op);
+            unsigned nb = TCGOP_RICHO(op) + TCGOP_RICHI(op);
+            const uint64_t *words = (const uint64_t *)op->args[1];
+
+            /*
+             * The gadget and its words, its flags or label, then the
+             * globals it writes and, after "<-", those it reads. Its
+             * outputs have no register preferences, so nb_oargs is 0 to
+             * print none.
+             */
+            nb_oargs = nb_iargs = 0;
+            col += ne_fprintf(f, " %s %p", def->name, (void *)op->args[0]);
+            for (i = 0; i < op->args[2]; i++) {
+                col += ne_fprintf(f, "%s0x%" PRIx64, i ? " " : "{", words[i]);
+            }
+            col += ne_fprintf(f, "}");
+            if (c == INDEX_op_rich_br) {
+                col += ne_fprintf(f, ",$L%d", arg_label(op->args[4])->id);
+            } else {
+                col += ne_fprintf(f, ",$0x%" TCG_PRIlx, op->args[3]);
+            }
+            for (i = 0; i < nb; i++) {
+                col += ne_fprintf(f, "%s%s",
+                                  i == TCGOP_RICHO(op) ? " <- " : ",",
+                                  tcg_get_arg_str(s, buf, sizeof(buf),
+                                                  op->args[globals + i]));
+            }
+#endif
         } else {
             if (def->flags & TCG_OPF_INT) {
                 col += ne_fprintf(f, " %s_i%d ",
@@ -3587,6 +3639,11 @@ void tcg_op_remove(TCGContext *s, TCGOp *op)
     case INDEX_op_brcond:
         remove_label_use(op, 3);
         break;
+#ifdef TCG_HAVE_RCG
+    case INDEX_op_rich_br:
+        remove_label_use(op, 4);
+        break;
+#endif
     default:
         break;
     }
@@ -3685,6 +3742,11 @@ static void move_label_uses(TCGLabel *to, TCGLabel *from)
         case INDEX_op_brcond:
             op->args[3] = label_arg(to);
             break;
+#ifdef TCG_HAVE_RCG
+        case INDEX_op_rich_br:
+            op->args[4] = label_arg(to);
+            break;
+#endif
         default:
             g_assert_not_reached();
         }
@@ -4213,6 +4275,42 @@ liveness_pass_1(TCGContext *s)
         case INDEX_op_insn_start:
             assert_carry_dead(s);
             break;
+#ifdef TCG_HAVE_RCG
+        case INDEX_op_rich:
+        case INDEX_op_rich_br:
+            assert_carry_dead(s);
+            nb_oargs = TCGOP_RICHO(op);
+            nb_iargs = TCGOP_RICHI(op);
+
+            /*
+             * The gadget reads its inputs from memory and writes its
+             * outputs there whole, so an output's value before it is dead
+             * unless it is an input too. A gadget that may fault needs
+             * every global in memory; rich_br needs what any conditional
+             * branch does. Inputs that die here stay TS_DEAD, so earlier
+             * ops leave them in memory only, as tcg_reg_alloc_rich() frees
+             * no input.
+             */
+            for (int i = 0; i < nb_oargs; i++) {
+                ts = arg_temp(op->args[TCGOP_RICH_FIRST(op) + i]);
+                ts->state = TS_DEAD;
+                la_reset_pref(ts);
+            }
+            if (opc == INDEX_op_rich_br) {
+                la_bb_sync(s, &la, nb_globals, nb_temps);
+            } else if (op->args[3] & TCG_RICH_MAY_FAULT) {
+                la_global_sync(s, nb_globals);
+            }
+            for (int i = nb_oargs; i < nb_oargs + nb_iargs; i++) {
+                ts = arg_temp(op->args[TCGOP_RICH_FIRST(op) + i]);
+                if (ts->state == TS_DEAD) {
+                    la_reset_pref(ts);
+                }
+                ts->state |= TS_MEM;
+            }
+            la_cross_call(s, &la, nb_temps);
+            break;
+#endif
         case INDEX_op_discard:
             /* mark the temporary as dead */
             ts = arg_temp(op->args[0]);
@@ -4506,6 +4604,18 @@ liveness_pass_2(TCGContext *s)
             nb_oargs = def->nb_oargs;
 
             /* Set flags similar to how calls require.  */
+#ifdef TCG_HAVE_RCG
+            if (opc == INDEX_op_rich) {
+                /*
+                 * As in liveness_pass_1: sync_globals before a gadget that
+                 * may fault, else nothing. Its globals are never indirect.
+                 */
+                call_flags = op->args[3] & TCG_RICH_MAY_FAULT
+                             ? TCG_CALL_NO_WRITE_GLOBALS
+                             : TCG_CALL_NO_READ_GLOBALS |
+                               TCG_CALL_NO_WRITE_GLOBALS;
+            } else
+#endif
             if (def->flags & TCG_OPF_COND_BRANCH) {
                 /* Like reading globals: sync_globals */
                 call_flags = TCG_CALL_NO_WRITE_GLOBALS;
@@ -6070,6 +6180,44 @@ static void load_arg_ref(TCGContext *s, unsigned arg_slot, TCGReg ref_base,
     }
 }
 
+#ifdef TCG_HAVE_RCG
+/*
+ * An RCG gadget is not a call, but clobbers the registers a helper call
+ * does. Liveness has put its inputs in memory, and its outputs leave their
+ * registers; an output still in one is synced first only if liveness kept
+ * its value, as before a gadget that may fault.
+ */
+static void tcg_reg_alloc_rich(TCGContext *s, TCGOp *op)
+{
+    TCGRegSet allocated_regs = s->reserved_regs;
+    int nb_oargs = TCGOP_RICHO(op), nb_iargs = TCGOP_RICHI(op);
+    int first = TCGOP_RICH_FIRST(op);
+
+    for (int i = 0; i < nb_oargs + nb_iargs; i++) {
+        temp_sync(s, arg_temp(op->args[first + i]), allocated_regs, 0,
+                  i < nb_oargs);
+    }
+    if (op->opc == INDEX_op_rich_br) {
+        tcg_reg_alloc_cbranch(s, allocated_regs);
+    } else if (op->args[3] & TCG_RICH_MAY_FAULT) {
+        sync_globals(s, allocated_regs);
+    }
+    for (int i = 0; i < TCG_TARGET_NB_REGS; i++) {
+        if (tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
+            tcg_reg_free(s, i, allocated_regs);
+        }
+    }
+    if (op->opc == INDEX_op_rich_br) {
+        tcg_out_rich_br(s, (const void *)op->args[0],
+                        (const uint64_t *)op->args[1], op->args[2],
+                        arg_label(op->args[4]));
+    } else {
+        tcg_out_rich(s, (const void *)op->args[0],
+                     (const uint64_t *)op->args[1], op->args[2]);
+    }
+}
+#endif
+
 static void tcg_reg_alloc_call(TCGContext *s, TCGOp *op)
 {
     const int nb_oargs = TCGOP_CALLO(op);
@@ -6907,6 +7055,13 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             assert_carry_dead(s);
             tcg_reg_alloc_call(s, op);
             break;
+#ifdef TCG_HAVE_RCG
+        case INDEX_op_rich:
+        case INDEX_op_rich_br:
+            assert_carry_dead(s);
+            tcg_reg_alloc_rich(s, op);
+            break;
+#endif
         case INDEX_op_exit_tb:
             tcg_out_exit_tb(s, op->args[0]);
             break;

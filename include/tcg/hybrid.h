@@ -42,4 +42,20 @@ bool tcg_hybrid_switch(bool tcti, Error **errp);
 #define tcg_tcti_active()  false
 #endif
 
+#if defined(CONFIG_TCG_HYBRID_RUNTIME) || \
+    defined(CONFIG_TCG_THREADED_INTERPRETER)
+#define TCG_HAVE_TCTI 1
+
+/*
+ * Set once, from -accel tcg,tcti-ordered=, before any translation. It is
+ * on by default; off makes TCTI order guest accesses with barriers and
+ * plain loads and stores even where the host has LRCPC and LSE2, as on
+ * hosts without them, so that tests can run those gadgets. See
+ * tcg_ldst_ordered().
+ */
+extern bool tcg_tcti_ordered;
+#else
+#define tcg_tcti_ordered  false
+#endif
+
 #endif /* TCG_HYBRID_H */

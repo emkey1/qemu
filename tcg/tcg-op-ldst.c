@@ -127,7 +127,8 @@ bool tcg_ldst_ordered(TCGContext *s)
 {
     TCGBar mo = s->guest_mo & ~TCG_TARGET_DEFAULT_MO;
 
-    return TCG_TARGET_HAS_ordered_ldst && mo && !(mo & TCG_MO_ST_LD);
+    return TCG_TARGET_HAS_ordered_ldst && tcg_tcti_ordered && mo &&
+           !(mo & TCG_MO_ST_LD);
 }
 
 static void tcg_gen_req_mo(TCGBar type)
@@ -141,6 +142,14 @@ static void tcg_gen_req_mo(TCGBar type)
         tcg_gen_mb(type | TCG_BAR_SC);
     }
 }
+
+#ifdef TCG_HAVE_RCG
+bool tcg_gen_rich_mo(TCGBar type)
+{
+    tcg_gen_req_mo(type);
+    return tcg_ldst_ordered(tcg_ctx);
+}
+#endif
 
 static TCGTemp *tci_extend_addr(TCGTemp *addr)
 {

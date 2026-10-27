@@ -19,12 +19,16 @@ body.
 The same tables give the x86-64 system tests that check RCG against TCG,
 which run every form over awkward values and fault in the middle of every
 memory form. This writes the cases of rcg-insns.c or rcg-faults.c (in
-tests/tcg/x86_64/system) to a file, and with --check renders every gadget's
-body and checks what it names:
+tests/tcg/x86_64/system) to a file. --check renders every gadget's body and
+checks what it names, and --gadgets writes TCTI's gadgets and
+rcg-table.c.inc, the translator's table of them, to a directory.
+--coverage checks that the tests ran every gadget (see check_coverage()):
 
     rcg-gen.py --insn-tests FILE
     rcg-gen.py --fault-tests FILE
     rcg-gen.py --check
+    rcg-gen.py --gadgets DIR
+    rcg-gen.py --coverage ordered|plain NM TRACE...
 
 Only 64-bit code is covered, without LOCK; anything else is left to TCG.
 """
@@ -174,7 +178,8 @@ class Shift:
     TCG's ZExtT0 and SExtT0 load it, with cc_dst the result and cc_src the
     value shifted by one less, as gen_SHL and friends leave them. The count
     is a word, which the translator must mask, and a count that masks to 0
-    must be left to TCG: the gadget would shift by it less one. """
+    must be left to TCG: cc_src would be the value shifted by count - 1,
+    that is by -1. """
 
     def __init__(self, name, a64, cc):
         self.name = name
@@ -302,22 +307,46 @@ class Spec:
         return "_".join(parts)
 
     @property
+    def reads_d(self):
+        """ Whether the gadget reads its "d" register as well as writing
+        it. """
+        return self.kind in ("alu", "unary", "shift")
+
+    @property
     def accesses_memory(self):
         # LEA's memory operand is only an address.
         return (self.has_mem and self.kind != "lea"
                 or self.kind in ("push", "pop", "call", "ret"))
 
     @property
+    def loads(self):
+        """ Whether the gadget loads from guest memory: MOV to memory only
+        stores. """
+        if self.kind in ("pop", "ret"):
+            return True
+        return (self.has_mem and self.kind != "lea" and
+                not (self.kind == "mov" and self.form[0] == "m"))
+
+    @property
+    def stores(self):
+        """ Whether the gadget stores to guest memory: CMP and TEST, and a
+        memory source, only load. """
+        if self.kind in ("push", "call"):
+            return True
+        return (self.has_mem and self.form[0] == "m" and
+                (self.kind in ("mov", "unary", "shift") or
+                 self.kind == "alu" and self.op.writes))
+
+    @property
     def words(self):
         """ The gadget's operand words, in the order the translator must give
         them: the destination's, then the source's, then for a memory access
-        the MemOpIdx and
-        the env offset of the MMU index's CPUTLBDescFast (what
-        TCTI_TLB_FAST_OFS() gives). A register operand is its env offset in
-        CPUX86State.regs[]: "d" if it is written, "s" if only read, and "s1"
-        for CMP's and TEST's first operand, which is only read. A memory
-        operand is the words of its shape (ea_words()). An immediate is its
-        value, sign-extended as decode-new extends it.
+        the MemOpIdx and the env offset of the MMU index's CPUTLBDescFast
+        (what TCTI_TLB_FAST_OFS() gives). A register operand is its env
+        offset in CPUX86State.regs[]: "d" if it is written, "s" if only read,
+        and "s1" for CMP's and TEST's first operand, which is only read. A
+        memory operand is the words of its shape (ea_words()). An immediate
+        is its value, sign-extended as decode-new extends it.
 
         CALL's imm is the return address less env's eip, and RET's how far
         it moves RSP. """
@@ -367,7 +396,8 @@ class Spec:
         """ Which of cc_dst, cc_src and cc_src2 the gadget writes, as TCG's
         decode.cc_dst, cc_src and cc_src2 say for the instruction. After a
         "SUB" one, the translator must also keep cc_srcT = cc_dst + cc_src,
-        the original first operand, as TCG's gen_SUB does. """
+        the original first operand, as TCG's gen_SUB does (0 after NEG,
+        which is the same sum). """
         if self.kind == "zero":
             return ("cc_src",)
         if self.kind == "alu":
@@ -528,6 +558,7 @@ class Body:
         self.cold = []
         self.label = 0
         self.used = set()
+        self.reads = set()
 
     def word(self, name):
         return self.word_regs[name]
@@ -646,6 +677,7 @@ class Body:
         AH to BH are left to TCG). """
         self.emit(f"ldr {dest}, [{self.env}, {self.word(word)}]")
         self.define(dest)
+        self.reads.add(word)
 
     def write_reg(self, value, word, width):
         """ The width bits of value to the register whose env offset is in
@@ -891,6 +923,12 @@ def call_body(g, spec):
     if spec.form == "m":
         g.ea(ADDR)
         g.load(R, ADDR, 64)
+        if not spec.ordered:
+            # TCG's barrier before the plain twin orders only earlier
+            # accesses. The push's store does not depend on the load, so
+            # order the two here, as the barrier TCG puts before a store
+            # would.
+            g.emit("dmb ishld")
     elif spec.form == "r":
         g.read_reg(R, "s")
     g.emit(f"ldr {A}, [{env}, %[eip]]", f"add {A}, {A}, {g.word('imm')}",
@@ -1067,6 +1105,9 @@ BODY_OPERANDS = {
 BODY_ASSUMPTIONS = (
     # write_cc() and cond() access both with one STP or LDP.
     "offsetof(CPUX86State, cc_src) != offsetof(CPUX86State, cc_dst) + 8",
+    # cond() tests L and LE on EFLAGS by shifting OF onto SF and SF onto ZF.
+    "CC_O != CC_S << 4",
+    "CC_S != CC_Z << 1",
 )
 
 
@@ -1087,15 +1128,21 @@ class CheckHarness(Harness):
 def check():
     """ Renders every gadget's body, the condition gadgets' included, and
     checks that each names only the asm operands of BODY_OPERANDS and the
-    registers a body may use, and that every branch it makes has a label to
-    go to. Returns how many gadgets were checked. """
+    registers a body may use, that every branch it makes has a label to go
+    to, and that it reads its "d" register only if reads_d says so. Returns
+    how many gadgets were checked. """
     h = CheckHarness()
     allowed = {*h.scratch, h.env, h.retaddr, "x15", "sp", "lr", "xzr"}
     names = set()
     for spec in [*specs(), *cond_specs()]:
         assert spec.name not in names, spec.name
         names.add(spec.name)
-        lines = body(spec, h)
+        g = Body(spec, h)
+        BODIES[spec.kind](g, spec)
+        lines = g.lines()
+        if isinstance(spec, Spec):
+            assert ("d" in g.reads) == (spec.reads_d and "d" in spec.words), \
+                spec.name
         labels = {line[:-1] for line in lines if re.fullmatch(r"\d+:", line)}
         for line in lines:
             if line.startswith("//"):
@@ -1108,6 +1155,312 @@ def check():
             for target in re.findall(r"\b(\d+)[bf]\b", line):
                 assert target in labels, (spec.name, line)
     return len(names)
+
+
+#
+# TCTI's gadgets, and the translator's table of them.
+#
+
+class TctiHarness(Harness):
+    """ TCTI's streams: tcg_out_rich() writes a gadget's address, then its
+    operand words. The gadget loads the words first, so x28, the return
+    address its slow paths pass, points past them. """
+
+    def enter(self, regs):
+        lines = [f"ldp {a}, {b}, [x28], #16"
+                 for a, b in zip(regs[::2], regs[1::2])]
+        if len(regs) % 2:
+            lines.append(f"ldr {regs[-1]}, [x28], #8")
+        return lines
+
+    def leave(self):
+        return ["ldr x27, [x28], #8", "br x27"]
+
+    def branch(self, arm):
+        # tcg_out_rich_br() writes the target after the words. Branching,
+        # rather than a CSEL into x28, lets the gadgets that follow run
+        # ahead on the predicted path instead of waiting for the condition.
+        return ["ldr x27, [x28], #8", f"b.{ARM_INVERT[arm]} 1f",
+                "mov x28, x27", "1:"]
+
+    def assemble(self, words, hot, cold):
+        # A body with no slow path that leaves x27 and x28 alone loads the
+        # next gadget's address before its body, as tcti-gadget-gen.py's
+        # simple() does, so the dispatch target is known sooner.
+        if cold or any(re.search(r"\b[xw]2[78]\b", line) for line in hot):
+            return super().assemble(words, hot, cold)
+        return [*self.enter(words), "ldr x27, [x28], #8", *hot, "br x27"]
+
+
+# The ops and forms as the translator names them, in the table's order.
+OP_NAMES = ("add", "sub", "and", "or", "xor", "cmp", "test", "zero", "mov",
+            "lea", "push", "pop", "movzxb", "movzxw", "movsxb", "movsxw",
+            "movsxd", "not", "neg", "shl", "shr", "sar", "ror", "call", "jmp",
+            "ret")
+FORM_NAMES = ("rr", "rm", "mr", "ri", "mi", "r", "i", "m")
+KIND_NAMES = ("alu", "zero", "mov", "lea", "push", "pop", "extend", "unary",
+              "shift", "call", "jmp", "ret")
+WORD_NAMES = ("d", "s", "s1", "base", "index", "disp", "seg", "imm", "oi",
+              "tlb", "ccop")
+MAX_WORDS = len(WORD_REGS)
+
+# The gadget source files, split by op so they compile in parallel; "other"
+# takes the ops with no file.
+# Must match target/i386/tcg/meson.build.
+GADGET_FILES = ("add", "sub", "and", "or", "xor", "cmp", "test", "mov",
+                "other", "shift", "jcc", "setcc", "cmov")
+
+
+def op_name(spec):
+    return spec.op.name if spec.op else spec.kind
+
+
+def gadget_file(spec):
+    if isinstance(spec, CondSpec):
+        return spec.kind
+    name = op_name(spec)
+    if spec.kind == "shift":
+        return "shift"
+    return name if name in GADGET_FILES else "other"
+
+
+def table_index(spec, nb_shapes):
+    """ Where spec is in its op and form's gadgets, which are indexed by
+    width (MemOp), shape, segment base and memory order. """
+    width = WIDTHS.index(spec.width)
+    shape = EA_SHAPES.index(spec.shape) if spec.has_mem else 0
+    return ((width * nb_shapes + shape) * 2 + spec.seg) * 2 + spec.ordered
+
+
+def write_gadgets(outdir):
+    """ Writes the gadgets, in TCTI's harness, as naked functions, and their
+    table to outdir. """
+    harness = TctiHarness()
+    operands = ", ".join(f'[{k}] "i" ({v})' for k, v in BODY_OPERANDS.items())
+    all_specs = list(specs())
+    conds = list(cond_specs())
+
+    files = {}
+    for name in GADGET_FILES:
+        f = open(os.path.join(outdir, f"rcg_gadgets_{name}.c"), "w")
+        print("/* Automatically generated by rcg-gen.py. Do not edit. */\n",
+              file=f)
+        print('#include "qemu/osdep.h"', file=f)
+        print('#include "cpu.h"', file=f)
+        print('#include "tcti-gadget-defs.h"\n', file=f)
+        files[name] = f
+
+    instructions = 0
+    for spec in all_specs + conds:
+        f = files[gadget_file(spec)]
+        lines = body(spec, harness)
+        instructions += sum(1 for line in lines
+                            if not line.endswith(":") and
+                            not line.startswith("."))
+        print(f"void rcg_gadget_{spec.name}(void);", file=f)
+        print(f"__attribute__((naked)) void rcg_gadget_{spec.name}(void)",
+              file=f)
+        print("{\n    asm(", file=f)
+        for line in lines:
+            print(f'        "{line}\\n"', file=f)
+        print(f"        :: {operands});\n}}\n", file=f)
+    for f in files.values():
+        f.close()
+
+    with open(os.path.join(outdir, "rcg-table.c.inc"), "w") as out:
+        write_table(all_specs, out)
+        write_cond_table(conds, out)
+
+    sys.stderr.write(f"RCG: {len(all_specs) + len(conds)} gadgets with "
+                     f"{instructions} "
+                     f"instructions (~{instructions * 4 // 1024} KiB).\n")
+
+
+def write_cond_table(conds, out):
+    """ The condition gadgets, by the lazy-flags state they read
+    (RCG_CC_*), their condition (the opcode's low four bits), and for CMOVcc
+    the width as a MemOp. """
+    p = lambda *a: print(*a, file=out)
+    p("\n/* The lazy-flags states condition gadgets read: rcg-gen.py's "
+      "CC_CLASSES. */")
+    p("enum {")
+    for cls, width in CC_CLASSES:
+        p(f"    RCG_CC_{cc_name(cls, width).upper()},")
+    p("    RCG_NB_CC,\n};\n")
+    for spec in conds:
+        p(f"void rcg_gadget_{spec.name}(void);")
+    p("")
+    index = {c: i for i, c in enumerate(CC_CLASSES)}
+
+    def entry(spec):
+        return f"rcg_gadget_{spec.name}"
+
+    p("static const void *const rcg_jcc[RCG_NB_CC][16] = {")
+    for spec in conds:
+        if spec.kind == "jcc":
+            p(f"    [{index[(spec.cls, spec.cc_width)]}][{spec.cond}] = "
+              f"{entry(spec)},")
+    p("};\n")
+    p("static const void *const rcg_setcc[RCG_NB_CC][16] = {")
+    for spec in conds:
+        if spec.kind == "setcc":
+            p(f"    [{index[(spec.cls, spec.cc_width)]}][{spec.cond}] = "
+              f"{entry(spec)},")
+    p("};\n")
+    p("static const void *const rcg_cmov[MO_64 + 1][RCG_NB_CC][16] = {")
+    for spec in conds:
+        if spec.kind == "cmov":
+            p(f"    [{MO[spec.cmov_width]}][{index[(spec.cls, spec.cc_width)]}]"
+              f"[{spec.cond}] = {entry(spec)},")
+    p("};")
+
+
+def write_table(all_specs, out):
+    """ The translator's gadget table, by op, form, width, shape, segment
+    base and memory order, with each gadget's words and each op's lazy-flags
+    facts. """
+    p = lambda *a: print(*a, file=out)
+    p("/* Automatically generated by rcg-gen.py. Do not edit. */\n")
+    p("/* What the bodies assume of QEMU's definitions. */")
+    for assumption in BODY_ASSUMPTIONS:
+        p(f"QEMU_BUILD_BUG_ON({assumption});")
+    p("")
+    p("enum {")
+    p("    RCG_W_END,")
+    for w in WORD_NAMES:
+        p(f"    RCG_W_{w.upper()},")
+    p("};")
+    p(f"#define RCG_MAX_WORDS {MAX_WORDS}\n")
+    p("typedef enum RCGOp {")
+    for name in OP_NAMES:
+        p(f"    RCG_OP_{name.upper()},")
+    p("    RCG_NB_OPS,\n} RCGOp;\n")
+    p("typedef enum RCGForm {")
+    for name in FORM_NAMES:
+        p(f"    RCG_FORM_{name.upper()},")
+    p("    RCG_NB_FORMS,\n} RCGForm;\n")
+    p("/* A memory operand's shape; see rcg-gen.py's EA_SHAPES. */")
+    p("typedef enum RCGShape {")
+    for name in EA_SHAPES:
+        p(f"    RCG_EA_{name.upper()},")
+    p("    RCG_NB_SHAPES,\n} RCGShape;\n")
+    p("typedef struct RCGGadget {")
+    p("    const void *gadget;")
+    p("    uint8_t words[RCG_MAX_WORDS];")
+    p("} RCGGadget;\n")
+    p("/* What an op and form's gadgets do to guest memory. */")
+    p("enum {")
+    p("    RCG_LOAD = 1,")
+    p("    RCG_STORE = 2,")
+    p("};\n")
+    p("/*")
+    p(" * An op and form's gadgets, indexed [width][shape][seg][ordered], the")
+    p(" * width as a MemOp; one shape where there is no memory operand.")
+    p(" * access: RCG_LOAD, RCG_STORE or both; 0 if none.")
+    p(" */")
+    p("typedef struct RCGSlot {")
+    p("    const RCGGadget *gadgets;")
+    p("    uint8_t nb_shapes;")
+    p("    uint8_t access;")
+    p("} RCGSlot;\n")
+    p("/* An op's kind: rcg-gen.py's Spec.kind. */")
+    p("typedef enum RCGKind {")
+    for name in KIND_NAMES:
+        p(f"    RCG_KIND_{name.upper()},")
+    p("} RCGKind;\n")
+    p("/* What the translator puts in cc_srcT after an op. */")
+    p("enum {")
+    p("    RCG_SRCT_NONE,")
+    p("    RCG_SRCT_SUM,   /* cc_dst + cc_src, the original first operand */")
+    p("    RCG_SRCT_ZERO,")
+    p("};\n")
+    p("/*")
+    p(" * What the translator needs to know of an op. stack: it moves RSP.")
+    p(" * branch: it ends the TB. Its gadget sets eip, except CALL rel's,")
+    p(" * whose jump TCG emits. src_ot: the source's MemOp where it is not")
+    p(" * the op's (MOVZX, MOVSX and MOVSXD), else -1. reads_d: its gadget")
+    p(" * reads the destination register as well as writing it.")
+    p(" *")
+    p(" * Its lazy flags. cc_op: the CC_OP it leaves, plus the width's MemOp")
+    p(" * if by_width; -1 if none, and for ROR, whose CF and OF the")
+    p(" * translator computes. srcT: what the translator puts in cc_srcT")
+    p(" * after it, as gen_SUB and gen_NEG do. dst, src: whether it writes")
+    p(" * cc_dst and cc_src.")
+    p(" */")
+    p("typedef struct RCGFacts {")
+    p("    RCGKind kind;")
+    p("    bool stack, branch;")
+    p("    int8_t src_ot;")
+    p("    bool reads_d;")
+    p("    int cc_op;")
+    p("    bool by_width;")
+    p("    uint8_t srcT;")
+    p("    bool dst, src;")
+    p("} RCGFacts;\n")
+
+    for spec in all_specs:
+        p(f"void rcg_gadget_{spec.name}(void);")
+    p("")
+
+    slots = {}
+    for spec in all_specs:
+        slots.setdefault((op_name(spec), spec.form), []).append(spec)
+    access = {}
+    for (op, form), group in slots.items():
+        nb_shapes = len(EA_SHAPES) if group[0].has_mem else 1
+        entries = [None] * (len(WIDTHS) * nb_shapes * 4)
+        for spec in group:
+            assert spec.accesses_memory == (spec.loads or spec.stores)
+            entries[table_index(spec, nb_shapes)] = spec
+        # The translator reads these per op and form.
+        kinds = {(spec.loads, spec.stores) for spec in group}
+        assert len(kinds) == 1, (op, form)
+        loads, stores = kinds.pop()
+        access[op, form] = (" | ".join((["RCG_LOAD"] if loads else []) +
+                                       (["RCG_STORE"] if stores else []))
+                            or "0")
+        p(f"static const RCGGadget rcg_{op}_{form}[{len(entries)}] = {{")
+        for i, spec in enumerate(entries):
+            if spec:
+                words = ", ".join(f"RCG_W_{w.upper()}" for w in spec.words)
+                p(f"    [{i}] = {{ rcg_gadget_{spec.name}, {{ {words} }} }},")
+        p("};\n")
+
+    p("static const RCGSlot rcg_slots[RCG_NB_OPS][RCG_NB_FORMS] = {")
+    for (op, form), group in slots.items():
+        nb_shapes = len(EA_SHAPES) if group[0].has_mem else 1
+        p(f"    [RCG_OP_{op.upper()}][RCG_FORM_{form.upper()}] = "
+          f"{{ rcg_{op}_{form}, {nb_shapes}, {access[op, form]} }},")
+    p("};\n")
+
+    p("static const RCGFacts rcg_facts[RCG_NB_OPS] = {")
+    for name in OP_NAMES:
+        spec = next(s for s in all_specs if op_name(s) == name)
+        if spec.kind == "alu":
+            flags = [f"CC_OP_{spec.op.cc}B", True,
+                     "RCG_SRCT_SUM" if spec.op.cc == "SUB" else "RCG_SRCT_NONE"]
+        elif spec.kind == "zero":
+            flags = ["CC_OP_EFLAGS", False, "RCG_SRCT_NONE"]
+        elif spec.kind == "unary" and spec.op.cc:
+            flags = [f"CC_OP_{spec.op.cc}B", True, "RCG_SRCT_ZERO"]
+        elif spec.kind == "shift" and spec.op.cc:
+            flags = [f"CC_OP_{spec.op.cc}B", True, "RCG_SRCT_NONE"]
+        else:
+            flags = [-1, False, "RCG_SRCT_NONE"]
+        flags += ["cc_dst" in spec.cc_writes, "cc_src" in spec.cc_writes]
+        facts = [f"RCG_KIND_{spec.kind.upper()}",
+                 spec.kind in ("push", "pop", "call", "ret"),
+                 spec.kind in ("call", "jmp", "ret"),
+                 MO[spec.op.src] if spec.kind == "extend" else -1,
+                 spec.reads_d] + flags
+        fields = ("kind", "stack", "branch", "src_ot", "reads_d", "cc_op",
+                  "by_width", "srcT", "dst", "src")
+        p(f"    [RCG_OP_{name.upper()}] = {{")
+        for k, f in zip(fields, facts):
+            p(f"        .{k} = " +
+              (str(f).lower() if isinstance(f, bool) else str(f)) + ",")
+        p("    },")
+    p("};")
 
 
 #
@@ -1290,6 +1643,24 @@ def insn_cases():
         yield from rotate_cases(width)
     yield from cond_cases()
     yield from branch_cases()
+    yield from chain_cases()
+
+
+def chain_cases():
+    """ Gadgets after a TCG op in the same TB: one that writes a register
+    the gadget keeps part of, reads or overwrites, and one that sets the
+    flags the gadget sets again. Where the gadget overwrites a value, TCG
+    may drop the op that made it. """
+    for use in ("mov al, bl", "add ax, bx", "movzx ax, bl", "lea ax, [rbx+1]",
+                "setz al", "cmovz rax, rbx", "cmovnz eax, ebx", "add rax, rbx",
+                "mov eax, ebx", "mov rax, rbx", "xor eax, eax", "pop rax"):
+        yield Case(f"bswap rax; {use}", 64, a=0, b=3,
+                   stack=use.startswith("pop"))
+    for setter in ("ror eax, 5", "rol rax, 3", "shl rax, cl", "imul rax, rbx",
+                   "bswap rax"):
+        for use in ("add rax, rbx", "cmp rbx, rax", "xor ebx, ebx",
+                    "sub ebx, eax; setb cl"):
+            yield Case(f"{setter}; {use}", 64, a=0, b=3)
 
 
 def reg_pairs(width):
@@ -1331,6 +1702,20 @@ def memory_cases(name, width, forms, writes):
                         base_value=ADDR32_BASE)
 
 
+def mi_cases(name, width, writes):
+    """ The cases of an mi form for every operand shape and segment
+    override but [rbx+8] without one, where the callers try every
+    immediate. """
+    for shape in EA_SHAPES:
+        for seg in SEGS:
+            if shape == "b" and seg is None:
+                continue
+            text, base, index, bv, iv = memory_operand(width, shape, seg)
+            yield Case(f"{name} {text}, {-0x80}", width, mem=True, base=base,
+                       index=index, base_value=bv, index_value=iv,
+                       writes=writes)
+
+
 def alu_cases(op, width):
     two_ways = op.name != "test"
     for ra, a, rb, b in reg_pairs(width):
@@ -1344,6 +1729,7 @@ def alu_cases(op, width):
         for imm in IMMS[width]:
             yield Case(f"{op.name} {text}, {imm}", width, mem=True,
                        base=base, base_value=bv, writes=op.writes)
+        yield from mi_cases(op.name, width, op.writes)
     # The base register as the other operand too.
     if "rm" in op.forms:
         yield Case(f"{op.name} {reg_name(3, width)}, {text}", width, mem=True,
@@ -1382,6 +1768,7 @@ def mov_cases(width):
         if -2**31 <= imm < 2**31:
             yield Case(f"mov {text}, {imm}", width, mem=True, base=base,
                        base_value=bv, writes=True)
+    yield from mi_cases("mov", width, True)
     if width == 8:
         yield Case("mov ah, bl", 8, a=0, b=3)
         yield Case("mov bl, ah", 8, a=3, b=0)
@@ -1549,8 +1936,9 @@ def stack_cases():
             text, base, index, bv, iv = memory_operand(64, shape, seg)
             yield Case(f"push {text}", 64, mem=True, base=base, index=index,
                        base_value=bv, index_value=iv, stack=True)
-    # Left to TCG: 16-bit pushes and pops, and memory operands addressed
-    # from RSP, which the instruction itself moves.
+    # Left to TCG: 16-bit pushes and pops, and POP to memory, whose address
+    # uses RSP after the pop. PUSH from [rsp+8] is RCG's: its address uses
+    # RSP before the push, as TCG's does.
     yield Case("push ax", 16, a=0, stack=True)
     yield Case("pop ax", 16, a=0, stack=True)
     yield Case("push qword ptr [rsp+8]", 64, stack=True)
@@ -1695,6 +2083,49 @@ def write_cases(cases, out, prefix):
     print("};", file=out)
 
 
+def check_coverage(order, nm, traces):
+    """ Checks that the rcg_insn trace events in traces, from runs of
+    QEMU's x86_64 system emulator, took every gadget the translator can
+    pick under order: "ordered" where tcg_ldst_ordered() holds, which
+    picks the ordered twins, else "plain". nm is nm's listing of that
+    QEMU, from which each trace's ASLR slide is found. Returns whether
+    every gadget ran. """
+    names = {}
+    for line in open(nm):
+        parts = line.split()
+        if len(parts) == 3 and parts[2].lstrip("_").startswith("rcg_gadget_"):
+            names[int(parts[0], 16)] = parts[2].lstrip("_")[11:]
+    taken = set()
+    for path in traces:
+        seen = set()
+        for line in open(path):
+            m = re.search(r"rcg_insn pc 0x[0-9a-f]+ gadget (0x[0-9a-f]+)",
+                          line)
+            if m:
+                seen.add(int(m.group(1), 16))
+        if not seen:
+            continue
+        # The one slide, a whole number of 16 KiB pages, that puts every
+        # gadget taken on a gadget.
+        first = min(seen)
+        slides = [s for s in (first - a for a in names) if s % 0x4000 == 0
+                  and all(g - s in names for g in seen)]
+        if len(slides) != 1:
+            print(f"{path}: cannot place the gadgets taken", file=sys.stderr)
+            return False
+        taken |= {names[g - slides[0]] for g in seen}
+
+    want = {spec.name for spec in list(specs()) + list(cond_specs())
+            if spec.ordered == (order == "ordered") or
+            not getattr(spec, "accesses_memory", False)}
+    missed = sorted(want - taken)
+    for name in missed:
+        print(f"never taken: rcg_gadget_{name}", file=sys.stderr)
+    print(f"RCG: {len(want) - len(missed)} of {len(want)} {order} gadgets "
+          f"taken", file=sys.stderr)
+    return not missed
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--insn-tests", metavar="FILE",
@@ -1703,18 +2134,35 @@ def main():
                         help="write rcg-faults.c's cases to FILE")
     parser.add_argument("--check", action="store_true",
                         help="render every gadget's body and check it")
+    parser.add_argument("--gadgets", metavar="DIR",
+                        help="write the gadgets for TCTI and their table "
+                             "to DIR")
+    parser.add_argument("--coverage", nargs="+", metavar="ARG",
+                        help="ORDER NM TRACE...: check that the traces "
+                             "took every gadget for ORDER (ordered or "
+                             "plain)")
     args = parser.parse_args()
-    if not (args.insn_tests or args.fault_tests or args.check):
+    if not (args.insn_tests or args.fault_tests or args.check or
+            args.gadgets or args.coverage):
         parser.error("nothing to do")
+    if args.coverage and (len(args.coverage) < 3 or
+                          args.coverage[0] not in ("ordered", "plain")):
+        parser.error("--coverage takes ordered|plain NM TRACE...")
 
     if args.check:
         check()
+    if args.gadgets:
+        write_gadgets(args.gadgets)
     if args.insn_tests:
         with open(args.insn_tests, "w") as out:
             write_cases(insn_cases(), out, "rcg_insn_")
     if args.fault_tests:
         with open(args.fault_tests, "w") as out:
             write_cases(fault_cases(), out, "rcg_fault_")
+    if args.coverage:
+        order, nm, *traces = args.coverage
+        if not check_coverage(order, nm, traces):
+            sys.exit(1)
 
 
 if __name__ == "__main__":

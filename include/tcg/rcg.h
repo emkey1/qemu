@@ -15,8 +15,7 @@
 
 #include "tcg/hybrid.h"
 
-#if defined(CONFIG_TCG_THREADED_INTERPRETER) || \
-    defined(CONFIG_TCG_HYBRID_RUNTIME)
+#ifdef TCG_HAVE_TCTI
 #define TCG_HAVE_RCG 1
 
 /* Set once, from -accel tcg,rcg=, before any translation. */

@@ -226,6 +226,26 @@ Function call
        |  *<ret>* optional 32 bit or 64 bit return value
        |  *<params>* optional 32 bit or 64 bit parameters
 
+   * - rich gadget, words, nb_words, flags, *<outs>*, *<ins>*
+
+     - | Only under TCTI. Write the address of 'gadget', an RCG gadget for
+         a whole guest instruction, then the 'nb_words' operand words at
+         'words'.
+       |
+       | The gadget reads *<ins>* from memory, writes all of each of *<outs>*
+         there (a global it writes in part is in *<ins>* too), and clobbers
+         the registers a helper call does. It touches no other global. With TCG_RICH_MAY_FAULT in 'flags', every global is
+         synced first, and the gadget may raise exceptions, which unwind as
+         if from just after its words, within the instruction's code. It
+         writes nothing before its last access that may fault. See
+         ``tcg_gen_rich()``.
+
+   * - rich_br gadget, words, nb_words, 0, label, *<outs>*, *<ins>*
+
+     - | As rich with no flags, then 'label', where the gadget branches if
+         its condition holds. It ends a basic block, as brcond does, and
+         raises no exception. See ``tcg_gen_rich_br()``.
+
 Jumps/Labels
 ------------
 

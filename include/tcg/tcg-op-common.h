@@ -9,6 +9,7 @@
 #define TCG_TCG_OP_COMMON_H
 
 #include "tcg/tcg.h"
+#include "tcg/rcg.h"
 #include "exec/helper-proto-common.h"
 #include "exec/helper-gen-common.h"
 
@@ -44,6 +45,63 @@ static inline void tcg_gen_insn_start(uint64_t pc, uint64_t a1,
 void gen_set_label(TCGLabel *l);
 void tcg_gen_br(TCGLabel *l);
 void tcg_gen_mb(TCGBar);
+
+#ifdef TCG_HAVE_RCG
+/* The gadget may raise an exception: every global must be in memory. */
+#define TCG_RICH_MAY_FAULT  1
+
+/**
+ * tcg_gen_rich() - output an RCG gadget
+ * @gadget: the gadget
+ * @words: its operand words, which are copied
+ * @nb_words: how many
+ * @flags: TCG_RICH_*
+ * @outs: the globals it writes in memory; each is also read, as the gadget
+ *        may write only part of one
+ * @nb_outs: how many
+ * @ins: the globals it reads from memory, other than @outs
+ * @nb_ins: how many
+ *
+ * The gadget does a whole guest instruction. It touches no globals but
+ * those listed, and clobbers the registers a helper call does. Call only
+ * while tcg_rcg_active().
+ */
+void tcg_gen_rich(const void *gadget, const uint64_t *words,
+                  unsigned nb_words, unsigned flags,
+                  TCGv_i64 *outs, unsigned nb_outs,
+                  TCGv_i64 *ins, unsigned nb_ins);
+
+/**
+ * tcg_gen_rich_mo() - order guest memory for an RCG gadget
+ * @type: the TCG_MO_* that TCG ops for the gadget's accesses would need
+ *
+ * Emits the barrier TCG would emit before those accesses and returns
+ * false. Where tcg_ldst_ordered() holds, TCTI uses acquire loads and
+ * release stores instead: this emits nothing and returns true, and the
+ * caller must use the gadget's ordered twin. Either way, the gadget keeps
+ * its accesses in the order TCG's barriers between them would.
+ */
+bool tcg_gen_rich_mo(TCGBar type);
+
+/**
+ * tcg_gen_rich_br() - output an RCG gadget that may branch
+ * @gadget: the gadget
+ * @words: its operand words, which are copied
+ * @nb_words: how many
+ * @l: the label it branches to if its condition holds
+ * @outs: the globals it writes, as for tcg_gen_rich(), of any type
+ * @nb_outs: how many
+ * @ins: the globals it reads from memory, other than @outs
+ * @nb_ins: how many
+ *
+ * As tcg_gen_rich(), but the gadget ends a basic block, as brcond does, so
+ * every global is in memory before it. It raises no exception.
+ */
+void tcg_gen_rich_br(const void *gadget, const uint64_t *words,
+                     unsigned nb_words, TCGLabel *l,
+                     TCGTemp **outs, unsigned nb_outs,
+                     TCGTemp **ins, unsigned nb_ins);
+#endif
 
 /**
  * tcg_gen_exit_tb() - output exit_tb TCG operation

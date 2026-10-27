@@ -763,6 +763,31 @@ static int tcti_inline_fp_form(const TCGInlineFP *fp)
     }
 }
 
+#ifdef TCG_HAVE_RCG
+/*
+ * An RCG gadget, for a whole guest instruction: its address, then the
+ * operand words it loads first (rcg-gen.py's TctiHarness). Its slow paths
+ * unwind from the stream position after the words.
+ */
+static void tcg_out_rich(TCGContext *s, const void *gadget,
+                         const uint64_t *words, unsigned nb_words)
+{
+    tcg_out_gadget(s, gadget);
+    for (unsigned i = 0; i < nb_words; i++) {
+        tcg_out64(s, words[i]);
+    }
+}
+
+/* The same, then the label it branches to, as a brcond gadget takes it. */
+static void tcg_out_rich_br(TCGContext *s, const void *gadget,
+                            const uint64_t *words, unsigned nb_words,
+                            TCGLabel *l)
+{
+    tcg_out_rich(s, gadget, words, nb_words);
+    tcti_out_label(s, l);
+}
+#endif
+
 static void tcg_out_call(TCGContext *s, const tcg_insn_unit *func,
                          const TCGHelperInfo *info)
 {

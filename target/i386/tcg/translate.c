@@ -3385,6 +3385,7 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
     gen_illegal_opcode(s);
 }
 
+#include "rcg.c.inc"
 #include "decode-new.c.inc"
 
 /*

@@ -1,6 +1,7 @@
 # Builds the fork on Apple silicon, as TCTI needs, and runs the TCG system tests
 # for x86_64 and AArch64 guests under each backend of the hybrid: TCTI, then the
-# JIT. A pull request's commits are also checked against QEMU's coding style.
+# JIT, then TCTI with RCG. A pull request's commits are also checked against
+# QEMU's coding style.
 
 name: CI
 
@@ -68,3 +69,7 @@ jobs:
       - name: Test (JIT)
         if: success() || failure()
         run: .github/workflows/ci-check-tcg.sh off
+
+      - name: Test (TCTI with RCG)
+        if: success() || failure()
+        run: .github/workflows/ci-check-tcg.sh rcg

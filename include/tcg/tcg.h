@@ -331,6 +331,14 @@ struct TCGOp {
 #define TCGOP_CALLI(X)    (X)->param1
 #define TCGOP_CALLO(X)    (X)->param2
 
+/*
+ * rich and rich_br: how many globals the op writes and reads. The globals
+ * follow its constant args, 4 for rich and 5 for rich_br.
+ */
+#define TCGOP_RICHO(X)    ((X)->param1)
+#define TCGOP_RICHI(X)    ((X)->param2)
+#define TCGOP_RICH_GLOBALS(X) ((X)->opc == INDEX_op_rich_br ? 5 : 4)
+
 #define TCGOP_TYPE(X)     (X)->param1
 #define TCGOP_FLAGS(X)    (X)->param2
 #define TCGOP_VECE(X)     (X)->param2

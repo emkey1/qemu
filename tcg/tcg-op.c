@@ -305,6 +305,62 @@ void tcg_gen_mb(TCGBar mb_type)
     }
 }
 
+#ifdef TCG_HAVE_RCG
+void tcg_gen_rich_br(const void *gadget, const uint64_t *words,
+                     unsigned nb_words, TCGLabel *l,
+                     TCGTemp **outs, unsigned nb_outs,
+                     TCGTemp **ins, unsigned nb_ins)
+{
+    uint64_t *copy = tcg_malloc(nb_words * sizeof(uint64_t));
+    TCGOp *op;
+
+    tcg_debug_assert(tcg_rcg_active());
+    memcpy(copy, words, nb_words * sizeof(uint64_t));
+    op = tcg_emit_op(INDEX_op_rich_br, 5 + nb_outs + nb_ins);
+    op->args[0] = (uintptr_t)gadget;
+    op->args[1] = (uintptr_t)copy;
+    op->args[2] = nb_words;
+    op->args[3] = 0;
+    op->args[4] = label_arg(l);
+    TCGOP_RICHO(op) = nb_outs;
+    TCGOP_RICHI(op) = nb_ins;
+    for (unsigned i = 0; i < nb_outs + nb_ins; i++) {
+        TCGTemp *ts = i < nb_outs ? outs[i] : ins[i - nb_outs];
+
+        /* Liveness handles neither temps nor indirect globals here. */
+        g_assert(ts->kind == TEMP_GLOBAL && !ts->indirect_reg);
+        op->args[5 + i] = temp_arg(ts);
+    }
+    add_as_label_use(l, op);
+}
+
+void tcg_gen_rich(const void *gadget, const uint64_t *words,
+                  unsigned nb_words, unsigned flags,
+                  TCGv_i64 *outs, unsigned nb_outs,
+                  TCGv_i64 *ins, unsigned nb_ins)
+{
+    uint64_t *copy = tcg_malloc(nb_words * sizeof(uint64_t));
+    TCGOp *op;
+
+    tcg_debug_assert(tcg_rcg_active());
+    memcpy(copy, words, nb_words * sizeof(uint64_t));
+    op = tcg_emit_op(INDEX_op_rich, 4 + nb_outs + nb_ins);
+    op->args[0] = (uintptr_t)gadget;
+    op->args[1] = (uintptr_t)copy;
+    op->args[2] = nb_words;
+    op->args[3] = flags;
+    TCGOP_RICHO(op) = nb_outs;
+    TCGOP_RICHI(op) = nb_ins;
+    for (unsigned i = 0; i < nb_outs + nb_ins; i++) {
+        TCGTemp *ts = tcgv_i64_temp(i < nb_outs ? outs[i] : ins[i - nb_outs]);
+
+        /* As for tcg_gen_rich_br(). */
+        g_assert(ts->kind == TEMP_GLOBAL && !ts->indirect_reg);
+        op->args[4 + i] = temp_arg(ts);
+    }
+}
+#endif
+
 void tcg_gen_plugin_cb(unsigned from)
 {
     tcg_gen_op1(INDEX_op_plugin_cb, 0, from);

@@ -142,6 +142,14 @@ static void tcg_gen_req_mo(TCGBar type)
     }
 }
 
+#ifdef TCG_HAVE_RCG
+bool tcg_gen_rich_mo(TCGBar type)
+{
+    tcg_gen_req_mo(type);
+    return tcg_ldst_ordered(tcg_ctx);
+}
+#endif
+
 static TCGTemp *tci_extend_addr(TCGTemp *addr)
 {
 #if defined(CONFIG_TCG_INTERPRETER) || defined(CONFIG_TCG_THREADED_INTERPRETER) \

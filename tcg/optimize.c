@@ -29,6 +29,7 @@
 #include "tcg/tcg-op-common.h"
 #include "tcg-internal.h"
 #include "tcg/hybrid.h"
+#include "tcg/rcg.h"
 #include "tcg-has.h"
 
 
@@ -1567,6 +1568,27 @@ static bool fold_call(OptContext *ctx, TCGOp *op)
     return true;
 }
 
+#ifdef TCG_HAVE_RCG
+/*
+ * An RCG gadget writes env and guest memory directly: forget what is known
+ * of the globals it writes, and of memory.
+ */
+static void fold_rich(OptContext *ctx, TCGOp *op)
+{
+    for (int i = 0; i < TCGOP_RICHO(op); i++) {
+        TCGTemp *ts = arg_temp(op->args[TCGOP_RICH_GLOBALS(op) + i]);
+
+        init_ts_info(ctx, ts);
+        reset_ts(ctx, ts);
+    }
+    remove_mem_copy_all(ctx);
+    ctx->prev_mb = NULL;
+    if (op->opc == INDEX_op_rich_br) {
+        finish_bb(ctx);
+    }
+}
+#endif
+
 static bool fold_cmp_vec(OptContext *ctx, TCGOp *op)
 {
     /* Canonicalize the comparison to put immediate second. */
@@ -3071,6 +3093,12 @@ void tcg_optimize(TCGContext *s)
             fold_call(&ctx, op);
             continue;
         }
+#ifdef TCG_HAVE_RCG
+        if (opc == INDEX_op_rich || opc == INDEX_op_rich_br) {
+            fold_rich(&ctx, op);
+            continue;
+        }
+#endif
 
         def = &tcg_op_defs[opc];
         init_arguments(&ctx, op, def->nb_oargs + def->nb_iargs);

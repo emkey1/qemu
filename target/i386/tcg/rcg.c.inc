@@ -250,7 +250,7 @@ static bool rcg_translate(DisasContext *s, X86DecodedInsn *decode)
     const RCGSlot *slot;
     const RCGGadget *g;
     uint64_t words[RCG_MAX_WORDS];
-    TCGv outs[4], ins[RCG_MAX_WORDS];
+    TCGv outs[4], ins[RCG_MAX_WORDS], cf = NULL;
     unsigned n, nb_outs = 0, nb_ins = 0;
 
     if (!tcg_rcg_active() || !CODE64(s) || s->aflag != MO_64 ||
@@ -322,11 +322,13 @@ static bool rcg_translate(DisasContext *s, X86DecodedInsn *decode)
     } else if (gen == gen_POP) {
         op = RCG_OP_POP;
         first = &decode->op[0];
-    } else if (gen == gen_NOT || gen == gen_NEG) {
+    } else if (gen == gen_NOT || gen == gen_NEG || gen == gen_INC ||
+               gen == gen_DEC) {
         if (decode->e.special != X86_SPECIAL_HasLock) {
             return false;
         }
-        op = gen == gen_NOT ? RCG_OP_NOT : RCG_OP_NEG;
+        op = gen == gen_NOT ? RCG_OP_NOT : gen == gen_NEG ? RCG_OP_NEG
+           : gen == gen_INC ? RCG_OP_INC : RCG_OP_DEC;
         first = &decode->op[0];
     } else if (gen == gen_SHL || gen == gen_SHR || gen == gen_SAR) {
         /* By an immediate count, or 1; a count in CL is left to TCG. */
@@ -408,7 +410,8 @@ static bool rcg_translate(DisasContext *s, X86DecodedInsn *decode)
             return false;
         }
         form = second ? rcg_form(rcg_kind(s, second), 0) : RCG_FORM_I;
-    } else if (op == RCG_OP_NOT || op == RCG_OP_NEG) {
+    } else if (op == RCG_OP_NOT || op == RCG_OP_NEG || op == RCG_OP_INC ||
+               op == RCG_OP_DEC) {
         ot = first->ot;
         form = rcg_form(rcg_kind(s, first), 0);
     } else if (op == RCG_OP_SHL || op == RCG_OP_SHR || op == RCG_OP_SAR ||
@@ -490,7 +493,7 @@ static bool rcg_translate(DisasContext *s, X86DecodedInsn *decode)
             load = true;
             store = false;
         } else if (op >= RCG_OP_NOT && op <= RCG_OP_SAR) {
-            /* NOT, NEG and the shifts: a read-modify-write. */
+            /* NOT, NEG, INC, DEC and the shifts: a read-modify-write. */
             load = store = true;
         }
         bar |= load ? TCG_MO_LD_LD | TCG_MO_ST_LD : 0;
@@ -579,8 +582,20 @@ static bool rcg_translate(DisasContext *s, X86DecodedInsn *decode)
             g_assert_not_reached();
         }
     }
+    /*
+     * INC and DEC keep CF, which gen_INC and gen_DEC put in cc_src: take it
+     * from the flags state the gadget replaces, and store it after the
+     * gadget, so that a fault in the gadget finds that state as it was.
+     */
+    if (rcg_facts[op].cf) {
+        cf = tcg_temp_new();
+        gen_compute_eflags_c(s, cf);
+    }
     tcg_gen_rich(g->gadget, words, n, memory ? TCG_RICH_MAY_FAULT : 0,
                  outs, nb_outs, ins, nb_ins);
+    if (rcg_facts[op].cf) {
+        tcg_gen_mov_tl(cpu_cc_src, cf);
+    }
 
     if (op == RCG_OP_ROR) {
         rcg_rotate_flags(s, ot, first->n, rotate_left, imm);

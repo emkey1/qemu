@@ -44,8 +44,12 @@
 #else
 #include "system-page-protection.h"
 #include "system/runstate.h"
+#include "qemu/bitmap.h"
 #endif
 #include "trace.h"
+#ifdef CONFIG_AOK_GADGETS
+#include "accel/tcg/aok.h"
+#endif
 
 /* List iterators for lists of tagged pointers in TranslationBlock. */
 #define TB_FOR_EACH_TAGGED(head, tb, n, field)                          \
@@ -195,7 +199,26 @@ struct PageDesc {
     QemuSpin lock;
     /* list of TBs intersecting this ram page */
     uintptr_t first_tb;
+    /*
+     * Which of the page's bytes its TBs were translated from, made once
+     * SMC_BITMAP_USE_THRESHOLD writes have reached the page, and dropped
+     * whenever a TB joins or leaves it (page_bitmap_drop()). With it, a
+     * write beside the code, not into it, costs a look at the bitmap and not
+     * the locking and walk of tb_invalidate_phys_range_fast(). Under @lock.
+     */
+    unsigned long *code_bitmap;
+    unsigned int code_write_count;
 };
+
+/*
+ * Writes to a page with code before it gets a bitmap. Below it a page whose
+ * code is being replaced is spared the bitmap; past it the page is one where
+ * data lives beside code, and every write to it would otherwise lock and walk
+ * all of the page's TBs. ReactOS's boot makes 20 million such writes, 99.9%
+ * of them beside the code: SeaBIOS's page with the stack its handlers run on
+ * (14 million) and its boot loader's (5 million).
+ */
+#define SMC_BITMAP_USE_THRESHOLD 10
 
 void page_table_config_init(void)
 {
@@ -687,6 +710,37 @@ static void page_collection_unlock(struct page_collection *set)
     g_free(set);
 }
 
+/* The page's TBs are changing: its bitmap no longer says where they are. */
+static void page_bitmap_drop(PageDesc *pd)
+{
+    g_free(pd->code_bitmap);
+    pd->code_bitmap = NULL;
+    pd->code_write_count = 0;
+}
+
+/* The bytes of the page that its TBs were translated from. */
+static void page_bitmap_build(PageDesc *pd)
+{
+    TranslationBlock *tb;
+    PageForEachNext n;
+
+    assert_page_locked(pd);
+    pd->code_bitmap = bitmap_new(TARGET_PAGE_SIZE);
+    PAGE_FOR_EACH_TB(unused, unused, pd, tb, n) {
+        tb_page_addr_t start = tb_page_addr0(tb) & ~TARGET_PAGE_MASK;
+        tb_page_addr_t end = start + tb->size;
+
+        /* As in tb_invalidate_phys_page_range__locked(): of two pages, n. */
+        if (n == 0) {
+            end = MIN(end, TARGET_PAGE_SIZE);
+        } else {
+            end = (tb_page_addr0(tb) + tb->size) & ~TARGET_PAGE_MASK;
+            start = 0;
+        }
+        bitmap_set(pd->code_bitmap, start, end - start);
+    }
+}
+
 /* Set to NULL all the 'first_tb' fields in all PageDescs. */
 static void tb_remove_all_1(int level, void **lp)
 {
@@ -701,6 +755,7 @@ static void tb_remove_all_1(int level, void **lp)
         for (i = 0; i < V_L2_SIZE; ++i) {
             page_lock(&pd[i]);
             pd[i].first_tb = (uintptr_t)NULL;
+            page_bitmap_drop(&pd[i]);
             page_unlock(&pd[i]);
         }
     } else {
@@ -731,6 +786,7 @@ static void tb_page_add(PageDesc *p, TranslationBlock *tb, unsigned int n)
 
     tb->page_next[n] = p->first_tb;
     p->first_tb = (uintptr_t)tb | n;
+    page_bitmap_drop(p);
 }
 
 static void tb_record(TranslationBlock *tb)
@@ -758,6 +814,7 @@ static void tb_page_remove(PageDesc *pd, TranslationBlock *tb)
     PAGE_FOR_EACH_TB(unused, unused, pd, tb1, n1) {
         if (tb1 == tb) {
             *pprev = tb1->page_next[n1];
+            page_bitmap_drop(pd);
             return;
         }
         pprev = &tb1->page_next[n1];
@@ -1470,7 +1527,33 @@ void tb_invalidate_phys_range_fast(CPUState *cpu, ram_addr_t start,
 
     if (p) {
         ram_addr_t last = start + len - 1;
-        struct page_collection *pages = page_collection_lock(start, last);
+        struct page_collection *pages;
+        unsigned int nr = start & ~TARGET_PAGE_MASK;
+        bool beside;
+
+        /*
+         * A write that the page's bitmap puts beside its code invalidates
+         * nothing. A page with no TBs left takes the walk below, which finds
+         * none and lets the page's writes go fast again.
+         */
+        page_lock(p);
+        if (p->first_tb && !p->code_bitmap &&
+            ++p->code_write_count >= SMC_BITMAP_USE_THRESHOLD) {
+            page_bitmap_build(p);
+        }
+        beside = p->first_tb && p->code_bitmap &&
+                 find_next_bit(p->code_bitmap, nr + len, nr) >= nr + len;
+        page_unlock(p);
+#ifdef CONFIG_AOK_GADGETS
+        if (unlikely(aok_stats_enabled)) {
+            aok_stats.smc_writes++;
+            aok_stats.smc_beside += beside;
+        }
+#endif
+        if (beside) {
+            return;
+        }
+        pages = page_collection_lock(start, last);
 
         tb_invalidate_phys_page_range__locked(cpu, pages, p,
                                               start, last, ra);

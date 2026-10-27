@@ -137,6 +137,9 @@ static void aok_print_stats(void)
     fprintf(stderr, "aok: %" PRIu64 " pairs fused, %" PRIu64
             " of them forwarding a register\n",
             aok_stats.pairs, aok_stats.pairs_fw);
+    fprintf(stderr, "aok: %" PRIu64 " writes to pages with code, %" PRIu64
+            " of them beside it\n", aok_stats.smc_writes,
+            aok_stats.smc_beside);
 }
 
 static void __attribute__((constructor)) aok_init(void)

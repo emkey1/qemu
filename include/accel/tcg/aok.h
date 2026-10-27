@@ -254,6 +254,11 @@ typedef struct AokStats {
     uint64_t declined_op[128], declined_c;
     /* Pairs fused, and how many of them forward a register. */
     uint64_t pairs, pairs_fw;
+    /*
+     * Writes to pages with code (tb_invalidate_phys_range_fast), and those
+     * the page's bitmap put beside the code.
+     */
+    uint64_t smc_writes, smc_beside;
 } AokStats;
 extern AokStats aok_stats;
 extern bool aok_stats_enabled;

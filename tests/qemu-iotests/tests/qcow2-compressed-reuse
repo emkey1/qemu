@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# group: rw quick
+#
+# Compressed data written where freed compressed data was, in one open image,
+# then read back: the decompressed clusters qcow2 keeps must not answer for it.
+#
+# Copyright (C) 2026 Mike Miller
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+# creator
+owner=emkey1@oneopa.com
+
+seq="$(basename $0)"
+echo "QA output created by $seq"
+
+status=1	# failure is the default!
+
+_cleanup()
+{
+	_cleanup_test_img
+	rm -f "$TEST_DIR/b.bin"
+}
+trap "_cleanup; exit \$status" 0 1 2 3 15
+
+# get standard environment, filters and checks
+. ../common.rc
+. ../common.filter
+
+_supported_fmt qcow2
+_supported_proto file
+# The sizes below are zlib's, and compressed clusters are not in data files
+_unsupported_imgopts 'compression_type' data_file 'cluster_size'
+
+# A (0x11) is compressed into a fresh host cluster, alone (79 bytes), and read,
+# so that it is kept by its place, that cluster's start. A plain cluster
+# (0x44) takes the host cluster after it, so that B, which does not fit after
+# A (65400 random bytes and zeros: about 65491 compressed, of the 65457 left),
+# takes a cluster of its own and not A's tail and the next (a compressed
+# cluster may span two that adjoin), and leaves 45 bytes there. Rewriting
+# guest cluster 0 (0x22) frees A, and its host cluster with it. C (0x33, 79
+# bytes) does not fit in B's cluster, so it takes the first free one: A's,
+# at A's place. Reading C must give C.
+$PYTHON -c "import os, sys; sys.stdout.buffer.write(os.urandom(65400) + bytes(136))" \
+    > "$TEST_DIR/b.bin"
+
+_make_test_img -o cluster_size=64k 4M
+
+$QEMU_IO -c "write -c -P 0x11 0 64k" -c "read -P 0x11 0 4k" \
+         -c "write -P 0x44 192k 64k" \
+         -c "write -c -s $TEST_DIR/b.bin 64k 64k" \
+         -c "write -P 0x22 0 64k" \
+         -c "write -c -P 0x33 128k 64k" \
+         -c "read -P 0x33 128k 64k" -c "read -P 0x22 0 64k" \
+         -c "read -P 0x44 192k 64k" \
+         "$TEST_IMG" | _filter_qemu_io
+
+_check_test_img
+
+# success, all done
+echo "*** done"
+rm -f $seq.full
+status=0

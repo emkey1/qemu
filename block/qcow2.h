@@ -325,6 +325,15 @@ typedef struct Qcow2BitmapHeaderExt {
 
 #define QCOW2_MAX_THREADS 4
 
+/* Room for decompressed clusters (BDRVQcow2State.dcache): at least one. */
+#define QCOW2_DCACHE_BYTES (1 * MiB)
+
+typedef struct Qcow2DecompressedCluster {
+    uint64_t coffset;   /* where its compressed data is; 0 (the header): none */
+    uint64_t used;      /* the cache's clock when it was last read */
+    uint8_t *data;      /* cluster_size bytes */
+} Qcow2DecompressedCluster;
+
 typedef struct BDRVQcow2State {
     int cluster_bits;
     int cluster_size;
@@ -426,6 +435,19 @@ typedef struct BDRVQcow2State {
      * is to convert the image with the desired compression type set.
      */
     Qcow2CompressionType compression_type;
+
+    /*
+     * The clusters qcow2_co_preadv_compressed() decompressed last, by where
+     * their compressed data is. A guest reads a cluster in pieces, and each
+     * piece would otherwise read and decompress all of it again. A
+     * compressed write, the one way new compressed data reaches the file
+     * (perhaps where freed compressed data was), drops them all.
+     */
+    QemuMutex dcache_lock;
+    Qcow2DecompressedCluster *dcache;
+    int dcache_size;
+    uint64_t dcache_clock;
+    uint64_t dcache_gen;        /* counts the drops */
 } BDRVQcow2State;
 
 typedef struct Qcow2COWRegion {

@@ -2047,6 +2047,7 @@ static int qcow2_open(BlockDriverState *bs, QDict *options, int flags,
     /* Initialise locks */
     qemu_co_mutex_init(&s->lock);
     qemu_co_queue_init(&s->cache_clean_timer_exit);
+    qemu_mutex_init(&s->dcache_lock);
 
     assert(!qemu_in_coroutine());
     assert(qemu_get_current_aio_context() == qemu_get_aio_context());
@@ -2881,6 +2882,87 @@ static int GRAPH_RDLOCK qcow2_inactivate(BlockDriverState *bs)
     return result;
 }
 
+/*
+ * Copy out of the cluster decompressed from @coffset, if it is kept. If not,
+ * *@gen is the cache's generation, for qcow2_dcache_keep().
+ */
+static bool qcow2_dcache_read(BDRVQcow2State *s, uint64_t coffset,
+                              int offset_in_cluster, uint64_t bytes,
+                              QEMUIOVector *qiov, size_t qiov_offset,
+                              uint64_t *gen)
+{
+    bool hit = false;
+
+    qemu_mutex_lock(&s->dcache_lock);
+    *gen = s->dcache_gen;
+    for (int i = 0; i < s->dcache_size; i++) {
+        Qcow2DecompressedCluster *e = &s->dcache[i];
+
+        if (e->coffset == coffset) {
+            e->used = ++s->dcache_clock;
+            qemu_iovec_from_buf(qiov, qiov_offset,
+                                e->data + offset_in_cluster, bytes);
+            hit = true;
+            break;
+        }
+    }
+    qemu_mutex_unlock(&s->dcache_lock);
+    return hit;
+}
+
+/*
+ * Keep @data, the cluster decompressed from @coffset, in place of the one
+ * read longest ago. Returns what the caller frees: that one's buffer, or
+ * @data if another read kept the same cluster meanwhile, or if a compressed
+ * write began since the cache's generation was @gen (what was read may be
+ * from before it, at a place it has since filled).
+ */
+static uint8_t *qcow2_dcache_keep(BDRVQcow2State *s, uint64_t coffset,
+                                  uint8_t *data, uint64_t gen)
+{
+    Qcow2DecompressedCluster *e;
+    uint8_t *old;
+
+    qemu_mutex_lock(&s->dcache_lock);
+    if (s->dcache_gen != gen) {
+        qemu_mutex_unlock(&s->dcache_lock);
+        return data;
+    }
+    if (!s->dcache) {
+        s->dcache_size = MAX(1, QCOW2_DCACHE_BYTES / s->cluster_size);
+        s->dcache = g_new0(Qcow2DecompressedCluster, s->dcache_size);
+    }
+    e = &s->dcache[0];
+    for (int i = 0; i < s->dcache_size; i++) {
+        if (s->dcache[i].coffset == coffset) {
+            qemu_mutex_unlock(&s->dcache_lock);
+            return data;
+        }
+        if (s->dcache[i].used < e->used) {
+            e = &s->dcache[i];
+        }
+    }
+    old = e->data;
+    e->data = data;
+    e->coffset = coffset;
+    e->used = ++s->dcache_clock;
+    qemu_mutex_unlock(&s->dcache_lock);
+    return old;
+}
+
+static void qcow2_dcache_drop(BDRVQcow2State *s)
+{
+    qemu_mutex_lock(&s->dcache_lock);
+    for (int i = 0; i < s->dcache_size; i++) {
+        qemu_vfree(s->dcache[i].data);
+    }
+    g_free(s->dcache);
+    s->dcache = NULL;
+    s->dcache_size = 0;
+    s->dcache_gen++;
+    qemu_mutex_unlock(&s->dcache_lock);
+}
+
 static void coroutine_mixed_fn GRAPH_RDLOCK
 qcow2_do_close(BlockDriverState *bs, bool close_data_file)
 {
@@ -2907,6 +2989,9 @@ qcow2_do_close(BlockDriverState *bs, bool close_data_file)
     g_free(s->image_data_file);
     g_free(s->image_backing_file);
     g_free(s->image_backing_format);
+
+    qcow2_dcache_drop(s);
+    qemu_mutex_destroy(&s->dcache_lock);
 
     if (close_data_file && has_data_file(bs)) {
         GLOBAL_STATE_CODE();
@@ -2964,6 +3049,7 @@ qcow2_co_invalidate_cache(BlockDriverState *bs, Error **errp)
     /* Re-initialize objects initialized in qcow2_open() */
     qemu_co_mutex_init(&s->lock);
     qemu_co_queue_init(&s->cache_clean_timer_exit);
+    qemu_mutex_init(&s->dcache_lock);
 
     options = qdict_clone_shallow(bs->options);
 
@@ -4924,6 +5010,9 @@ qcow2_co_pwritev_compressed_part(BlockDriverState *bs,
         return -ENOTSUP;
     }
 
+    /* Its data may land where freed compressed data was: see dcache. */
+    qcow2_dcache_drop(s);
+
     if (bytes == 0) {
         /*
          * align end of file to a sector boundary to ease reading with
@@ -4987,8 +5076,14 @@ qcow2_co_preadv_compressed(BlockDriverState *bs,
     uint64_t coffset;
     uint8_t *buf, *out_buf;
     int offset_in_cluster = offset_into_cluster(s, offset);
+    uint64_t gen;
 
     qcow2_parse_compressed_l2_entry(bs, l2_entry, &coffset, &csize);
+
+    if (qcow2_dcache_read(s, coffset, offset_in_cluster, bytes,
+                          qiov, qiov_offset, &gen)) {
+        return 0;
+    }
 
     buf = g_try_malloc(csize);
     if (!buf) {
@@ -5009,6 +5104,7 @@ qcow2_co_preadv_compressed(BlockDriverState *bs,
     }
 
     qemu_iovec_from_buf(qiov, qiov_offset, out_buf + offset_in_cluster, bytes);
+    out_buf = qcow2_dcache_keep(s, coffset, out_buf, gen);
 
 fail:
     qemu_vfree(out_buf);

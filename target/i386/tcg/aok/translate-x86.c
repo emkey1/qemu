@@ -254,6 +254,13 @@ QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fpuc) != AOK_X86_ENV_FPUC);
 QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fptags) != AOK_X86_ENV_FPTAGS);
 QEMU_BUILD_BUG_ON(sizeof(((CPUX86State *)0)->fptags) != 8);
 QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fpregs) != AOK_X86_ENV_FPREGS);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fpop) != AOK_X86_ENV_FPOP);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fpcs) != AOK_X86_ENV_FPOP + 2);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fpds) != AOK_X86_ENV_FPOP + 4);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fpip) != AOK_X86_ENV_FPIP);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fpdp) != AOK_X86_ENV_FPDP);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, segs[R_CS].selector) !=
+                  AOK_X86_ENV_CS_SEL);
 QEMU_BUILD_BUG_ON(sizeof(FPReg) != 16);
 QEMU_BUILD_BUG_ON(offsetof(floatx80, low) != 0 || offsetof(floatx80, high) != 8);
 QEMU_BUILD_BUG_ON(CC_OP_EFLAGS != AOK_CC_OP_EFLAGS);
@@ -340,6 +347,7 @@ typedef struct Insn {
     bool rex, w;
     int rr, rx, rb;         /* REX.R, REX.X and REX.B, as 0 or 8 */
     int seg;
+    int sreg;               /* the last es, cs, ss or ds prefix, or -1 */
     int mod, reg, rm;
     Mem m;
 } Insn;
@@ -1376,30 +1384,38 @@ void aok_x86_helper_cpuid(CPUX86State *env, uint64_t pc, uint64_t a, uint64_t b)
     helper_cpuid(env);
 }
 
-/* xsave (xsaveopt with @opt) at @addr, of the components edx:eax asks for. */
-void aok_x86_helper_xsave(CPUX86State *env, uint64_t pc, uint64_t opt, uint64_t b,
-                          uint64_t addr);
-void aok_x86_helper_xsave(CPUX86State *env, uint64_t pc, uint64_t opt, uint64_t b,
-                          uint64_t addr)
+/*
+ * xsave (xsaveopt with @opt) at @addr, of the components edx:eax asks for;
+ * @rexw: xsave64's image.
+ */
+void aok_x86_helper_xsave(CPUX86State *env, uint64_t pc, uint64_t opt,
+                          uint64_t rexw, uint64_t addr);
+void aok_x86_helper_xsave(CPUX86State *env, uint64_t pc, uint64_t opt,
+                          uint64_t rexw, uint64_t addr)
 {
     uint64_t rfbm = deposit64(env->regs[R_EAX], 32, 32, env->regs[R_EDX]);
 
     x86_sync(env, pc);
     if (opt) {
-        helper_xsaveopt(env, addr, rfbm);
+        helper_xsaveopt(env, addr, rfbm, rexw);
     } else {
-        helper_xsave(env, addr, rfbm);
+        helper_xsave(env, addr, rfbm, rexw);
     }
 }
 
-/* xrstor at the address in the first temporary; then the main loop. */
-void aok_x86_helper_xrstor(CPUX86State *env, uint64_t pc, uint64_t a, uint64_t len);
-void aok_x86_helper_xrstor(CPUX86State *env, uint64_t pc, uint64_t a, uint64_t len)
+/*
+ * xrstor (xrstor64 with @rexw) at the address in the first temporary; then
+ * the main loop.
+ */
+void aok_x86_helper_xrstor(CPUX86State *env, uint64_t pc, uint64_t rexw,
+                           uint64_t len);
+void aok_x86_helper_xrstor(CPUX86State *env, uint64_t pc, uint64_t rexw,
+                           uint64_t len)
 {
     uint64_t rfbm = deposit64(env->regs[R_EAX], 32, 32, env->regs[R_EDX]);
 
     x86_sync(env, pc);
-    helper_xrstor(env, env->aok_tmp[0], rfbm);
+    helper_xrstor(env, env->aok_tmp[0], rfbm, rexw);
     env->eip = pc + len;
 }
 
@@ -3392,11 +3408,13 @@ static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
                 /* xrstor: what may change the TB's flags, then the main loop */
                 emit_ea(c, d);
                 E1(c->c64 ? G(lea_ea64) : G(lea_ea32), T0);
-                E4(G(call_c_exit), aok_x86_helper_xrstor, c->off, 0, c->len);
+                E4(G(call_c_exit), aok_x86_helper_xrstor, c->off, d->w != 0,
+                   c->len);
                 return END;
             }
             emit_ea(c, d);
-            E4(G(call_c_ea), aok_x86_helper_xsave, c->off, (d->reg & 7) == 6, 0);
+            E4(G(call_c_ea), aok_x86_helper_xsave, c->off, (d->reg & 7) == 6,
+               d->w != 0);
             c->hf = HF_NONE;
             return NEXT;
         }
@@ -3888,6 +3906,41 @@ static Gadget x87_reg(unsigned b, unsigned reg, unsigned rm, uint64_t *imm)
     }
 }
 
+/*
+ * A waiting x87 gadget's second word, for x87h_note (x87-host.S), which
+ * leaves the insn's address and opcode as the last instruction's (fpcs,
+ * fpip, fpop): the opcode, and bit 15 to say so; 0 for a control insn,
+ * which leaves them as they were. A memory form's also has its operand's
+ * offset and segment (fpdp, fpds): where in env that segment's selector is
+ * (bits 16-31), the base to take from the address (32-47: fs's, gs's, or
+ * the eight zero bytes), and bit 14 in 32-bit code, whose offsets wrap at
+ * 32 bits. The segment is the one the access uses, as an AMD Ryzen records
+ * it: an es, cs, ss or ds prefix counts in 32-bit code only, and with
+ * neither that nor fs or gs, a base of esp or ebp (r12 and r13 are not) is
+ * ss's.
+ */
+QEMU_BUILD_BUG_ON(SEGBASE(R_GS) > 0xffff || ZERO > 0xffff);
+
+static uint64_t x87_note(Ctx *c, const Insn *d, unsigned b)
+{
+    uint64_t note = 0x8000 | (b & 7) << 8 | d->mod << 6 | (d->reg & 7) << 3 |
+                    (d->rm & 7);
+    int seg = R_DS;
+
+    if (d->mod == 3) {
+        return note;
+    }
+    if (d->m.seg >= 0) {
+        seg = d->m.seg;
+    } else if (!c->c64 && d->sreg >= 0) {
+        seg = d->sreg;
+    } else if (d->m.base == R_ESP || d->m.base == R_EBP) {
+        seg = R_SS;
+    }
+    return note | (uint64_t)SEGSEL(seg) << 16 | (c->c64 ? 0 : 0x4000) |
+           (uint64_t)(d->m.seg >= 0 ? SEGBASE(d->m.seg) : ZERO) << 32;
+}
+
 static int x87(Ctx *c, Insn *d, const uint8_t *code, unsigned b)
 {
     unsigned reg, rm;
@@ -3919,7 +3972,7 @@ static int x87(Ctx *c, Insn *d, const uint8_t *code, unsigned b)
             return UNKNOWN;
         }
         emit_ea(c, d);
-        E1(m->g[c->mb], word(c, m->sz));
+        E2(m->g[c->mb], word(c, m->sz), x87_note(c, d, b));
         c->hf = HF_NONE;
         return NEXT;
     }
@@ -3940,7 +3993,8 @@ static int x87(Ctx *c, Insn *d, const uint8_t *code, unsigned b)
         E0(G(flush_cc));                        /* fcmov reads cc_src */
         c->cc = CC_OP_EFLAGS;
     }
-    E1(g, imm | (uint64_t)c->off << 32);
+    E2(g, imm | (uint64_t)c->off << 32,
+       g == G(x87_fnclex) ? 0 : x87_note(c, d, b));
     c->hf = HF_NONE;
     if (g == G(x87_comi_rr) || g == G(x87_ucomi_rr)) {
         c->cc = CC_OP_EFLAGS;
@@ -3972,10 +4026,11 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
             d->rep = true;
             d->repne = false;
             continue;
-        case 0x26:          /* es, cs, ss, ds: nothing in 64-bit code */
-        case 0x2e:
-        case 0x36:
+        case 0x26:          /* es, cs, ss, ds: nothing in 64-bit code, and */
+        case 0x2e:          /* bases of 0 in flat 32-bit code, where only */
+        case 0x36:          /* the x87's data selector sees them */
         case 0x3e:
+            d->sreg = (b >> 3) & 3;
             continue;
         case 0x64:
             d->seg = R_FS;
@@ -4224,7 +4279,7 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
         if (!c->x87) {
             return UNKNOWN;
         }
-        E1(G(x87_fwait), (uint64_t)c->off << 32);
+        E2(G(x87_fwait), (uint64_t)c->off << 32, 0);
         c->hf = HF_NONE;
         return NEXT;
     case 0xd8 ... 0xdf:
@@ -4586,7 +4641,7 @@ static int insn1(Ctx *c, Insn *d, const uint8_t *code)
 /* The same, of the insn at @code, which has bytes up to @end. */
 static int insn(Ctx *c, const uint8_t *code, const uint8_t *end)
 {
-    Insn d = { .p = code, .end = end, .seg = -1, .c64 = c->c64 };
+    Insn d = { .p = code, .end = end, .seg = -1, .sreg = -1, .c64 = c->c64 };
     int r = insn1(c, &d, code);
 
     /* Unknown because it ran into the end of the page? */

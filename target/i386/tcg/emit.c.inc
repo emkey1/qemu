@@ -2080,7 +2080,7 @@ static void gen_FXRSTOR(DisasContext *s, X86DecodedInsn *decode)
     if ((s->flags & HF_EM_MASK) || (s->flags & HF_TS_MASK)) {
         gen_NM_exception(s);
     } else {
-        gen_helper_fxrstor(tcg_env, s->A0);
+        gen_helper_fxrstor(tcg_env, s->A0, tcg_constant_i32(REX_W(s)));
     }
 }
 
@@ -2089,7 +2089,7 @@ static void gen_FXSAVE(DisasContext *s, X86DecodedInsn *decode)
     if ((s->flags & HF_EM_MASK) || (s->flags & HF_TS_MASK)) {
         gen_NM_exception(s);
     } else {
-        gen_helper_fxsave(tcg_env, s->A0);
+        gen_helper_fxsave(tcg_env, s->A0, tcg_constant_i32(REX_W(s)));
     }
 }
 
@@ -4838,7 +4838,7 @@ static void gen_XRSTOR(DisasContext *s, X86DecodedInsn *decode)
     TCGv_i64 features = tcg_temp_new_i64();
 
     tcg_gen_concat_tl_i64(features, cpu_regs[R_EAX], cpu_regs[R_EDX]);
-    gen_helper_xrstor(tcg_env, s->A0, features);
+    gen_helper_xrstor(tcg_env, s->A0, features, tcg_constant_i32(REX_W(s)));
     if (s->cpuid_7_0_ebx_features & CPUID_7_0_EBX_MPX) {
         /*
          * XRSTOR is how MPX is enabled, which changes how
@@ -4853,7 +4853,7 @@ static void gen_XSAVE(DisasContext *s, X86DecodedInsn *decode)
     TCGv_i64 features = tcg_temp_new_i64();
 
     tcg_gen_concat_tl_i64(features, cpu_regs[R_EAX], cpu_regs[R_EDX]);
-    gen_helper_xsave(tcg_env, s->A0, features);
+    gen_helper_xsave(tcg_env, s->A0, features, tcg_constant_i32(REX_W(s)));
 }
 
 static void gen_XSAVEOPT(DisasContext *s, X86DecodedInsn *decode)
@@ -4861,5 +4861,5 @@ static void gen_XSAVEOPT(DisasContext *s, X86DecodedInsn *decode)
     TCGv_i64 features = tcg_temp_new_i64();
 
     tcg_gen_concat_tl_i64(features, cpu_regs[R_EAX], cpu_regs[R_EDX]);
-    gen_helper_xsave(tcg_env, s->A0, features);
+    gen_helper_xsave(tcg_env, s->A0, features, tcg_constant_i32(REX_W(s)));
 }

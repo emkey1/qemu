@@ -843,6 +843,7 @@ static void do_fninit(CPUX86State *env)
 {
     env->fpus = 0;
     env->fpstt = 0;
+    env->fpop = 0;
     env->fpcs = 0;
     env->fpds = 0;
     env->fpip = 0;
@@ -2643,7 +2644,17 @@ void helper_frstor(CPUX86State *env, target_ulong ptr, int data32)
 
 #define XO(X)  offsetof(X86XSaveArea, X)
 
-static void do_xsave_fpu(X86Access *ac, target_ulong ptr)
+/*
+ * The last instruction's and operand's addresses as FXSAVE, XSAVE and their
+ * REX.W forms (@rexw) store them: offset and selector, or (64-bit) all of
+ * the address and no selector.
+ */
+static uint64_t fpu_ptr_image(uint64_t off, uint16_t sel, bool rexw)
+{
+    return rexw ? off : (uint32_t)off | (uint64_t)sel << 32;
+}
+
+static void do_xsave_fpu(X86Access *ac, target_ulong ptr, bool rexw)
 {
     CPUX86State *env = ac->env;
     int fpus, fptag, i;
@@ -2659,16 +2670,20 @@ static void do_xsave_fpu(X86Access *ac, target_ulong ptr)
     access_stw(ac, ptr + XO(legacy.fsw), fpus);
     access_stw(ac, ptr + XO(legacy.ftw), fptag ^ 0xff);
     /*
-     * The opcode, like the pointers below, as AMD's processors keep them:
-     * only while an exception is pending, zero otherwise.
+     * The opcode and the pointers, as AMD's processors keep them: only while
+     * an exception is pending, zero otherwise.
      */
-    access_stw(ac, ptr + XO(legacy.fpop), env->fpus & FPUS_SE ? env->fpop : 0);
-
-    /* In 32-bit mode this is eip, sel, dp, sel.
-       In 64-bit mode this is rip, rdp.
-       But in either case we don't write actual data, just zeros.  */
-    access_stq(ac, ptr + XO(legacy.fpip), 0); /* eip+sel; rip */
-    access_stq(ac, ptr + XO(legacy.fpdp), 0); /* edp+sel; rdp */
+    if (env->fpus & FPUS_SE) {
+        access_stw(ac, ptr + XO(legacy.fpop), env->fpop);
+        access_stq(ac, ptr + XO(legacy.fpip),
+                   fpu_ptr_image(env->fpip, env->fpcs, rexw));
+        access_stq(ac, ptr + XO(legacy.fpdp),
+                   fpu_ptr_image(env->fpdp, env->fpds, rexw));
+    } else {
+        access_stw(ac, ptr + XO(legacy.fpop), 0);
+        access_stq(ac, ptr + XO(legacy.fpip), 0);
+        access_stq(ac, ptr + XO(legacy.fpdp), 0);
+    }
 
     addr = ptr + XO(legacy.fpregs);
 
@@ -2792,11 +2807,11 @@ static void do_xsave_pkru(X86Access *ac, target_ulong ptr)
     access_stq(ac, ptr, ac->env->pkru);
 }
 
-static void do_fxsave(X86Access *ac, target_ulong ptr)
+static void do_fxsave(X86Access *ac, target_ulong ptr, bool rexw)
 {
     CPUX86State *env = ac->env;
 
-    do_xsave_fpu(ac, ptr);
+    do_xsave_fpu(ac, ptr, rexw);
     if (env->cr[4] & CR4_OSFXSR_MASK) {
         do_xsave_mxcsr(ac, ptr);
         /* Fast FXSAVE leaves out the XMM registers */
@@ -2808,7 +2823,7 @@ static void do_fxsave(X86Access *ac, target_ulong ptr)
     }
 }
 
-void helper_fxsave(CPUX86State *env, target_ulong ptr)
+void helper_fxsave(CPUX86State *env, target_ulong ptr, uint32_t rexw)
 {
     uintptr_t ra = GETPC();
     X86Access ac;
@@ -2820,7 +2835,7 @@ void helper_fxsave(CPUX86State *env, target_ulong ptr)
 
     access_prepare(&ac, env, ptr, sizeof(X86LegacyXSaveArea),
                    MMU_DATA_STORE, ra);
-    do_fxsave(&ac, ptr);
+    do_fxsave(&ac, ptr, rexw);
 }
 
 static uint64_t get_xinuse(CPUX86State *env)
@@ -2838,12 +2853,12 @@ static uint64_t get_xinuse(CPUX86State *env)
 }
 
 static void do_xsave_access(X86Access *ac, target_ulong ptr, uint64_t rfbm,
-                            uint64_t inuse, uint64_t opt)
+                            uint64_t inuse, uint64_t opt, bool rexw)
 {
     uint64_t old_bv, new_bv;
 
     if (opt & XSTATE_FP_MASK) {
-        do_xsave_fpu(ac, ptr);
+        do_xsave_fpu(ac, ptr, rexw);
     }
     if (rfbm & XSTATE_SSE_MASK) {
         /* Note that saving MXCSR is not suppressed by XSAVEOPT.  */
@@ -2894,7 +2909,7 @@ static void do_xsave_chk(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 }
 
 static void do_xsave(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
-                     uint64_t inuse, uint64_t opt, uintptr_t ra)
+                     uint64_t inuse, uint64_t opt, bool rexw, uintptr_t ra)
 {
     X86Access ac;
     unsigned size;
@@ -2907,24 +2922,27 @@ static void do_xsave(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
     size = xsave_area_size(opt, false);
 
     access_prepare(&ac, env, ptr, size, MMU_DATA_STORE, ra);
-    do_xsave_access(&ac, ptr, rfbm, inuse, opt);
+    do_xsave_access(&ac, ptr, rfbm, inuse, opt, rexw);
 }
 
-void helper_xsave(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
+void helper_xsave(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
+                  uint32_t rexw)
 {
-    do_xsave(env, ptr, rfbm, get_xinuse(env), rfbm, GETPC());
+    do_xsave(env, ptr, rfbm, get_xinuse(env), rfbm, rexw, GETPC());
 }
 
-void helper_xsaveopt(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
+void helper_xsaveopt(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
+                     uint32_t rexw)
 {
     uint64_t inuse = get_xinuse(env);
-    do_xsave(env, ptr, rfbm, inuse, inuse, GETPC());
+    do_xsave(env, ptr, rfbm, inuse, inuse, rexw, GETPC());
 }
 
-static void do_xrstor_fpu(X86Access *ac, target_ulong ptr)
+static void do_xrstor_fpu(X86Access *ac, target_ulong ptr, bool rexw)
 {
     CPUX86State *env = ac->env;
     int i, fpuc, fpus, fptag;
+    uint64_t ip, dp;
     target_ulong addr;
 
     fpuc = access_ldw(ac, ptr + XO(legacy.fcw));
@@ -2937,6 +2955,25 @@ static void do_xrstor_fpu(X86Access *ac, target_ulong ptr)
     fptag ^= 0xff;
     for (i = 0; i < 8; i++) {
         env->fptags[i] = ((fptag >> i) & 1);
+    }
+
+    /*
+     * The opcode and the pointers, whatever ES says. The REX.W form's are 48
+     * bits, sign-extended, and leave no selectors.
+     */
+    env->fpop = access_ldw(ac, ptr + XO(legacy.fpop)) & 0x7ff;
+    ip = access_ldq(ac, ptr + XO(legacy.fpip));
+    dp = access_ldq(ac, ptr + XO(legacy.fpdp));
+    if (rexw) {
+        env->fpip = sextract64(ip, 0, 48);
+        env->fpdp = sextract64(dp, 0, 48);
+        env->fpcs = 0;
+        env->fpds = 0;
+    } else {
+        env->fpip = (uint32_t)ip;
+        env->fpdp = (uint32_t)dp;
+        env->fpcs = ip >> 32;
+        env->fpds = dp >> 32;
     }
 
     addr = ptr + XO(legacy.fpregs);
@@ -3085,11 +3122,11 @@ static void do_xrstor_pkru(X86Access *ac, target_ulong ptr)
     ac->env->pkru = access_ldq(ac, ptr);
 }
 
-static void do_fxrstor(X86Access *ac, target_ulong ptr)
+static void do_fxrstor(X86Access *ac, target_ulong ptr, bool rexw)
 {
     CPUX86State *env = ac->env;
 
-    do_xrstor_fpu(ac, ptr);
+    do_xrstor_fpu(ac, ptr, rexw);
     if (env->cr[4] & CR4_OSFXSR_MASK) {
         do_xrstor_mxcsr(ac, ptr);
         /* Fast FXRSTOR leaves out the XMM registers */
@@ -3101,7 +3138,7 @@ static void do_fxrstor(X86Access *ac, target_ulong ptr)
     }
 }
 
-void helper_fxrstor(CPUX86State *env, target_ulong ptr)
+void helper_fxrstor(CPUX86State *env, target_ulong ptr, uint32_t rexw)
 {
     uintptr_t ra = GETPC();
     X86Access ac;
@@ -3119,7 +3156,7 @@ void helper_fxrstor(CPUX86State *env, target_ulong ptr)
          ~MXCSR_MASK)) {
         raise_exception_ra(env, EXCP0D_GPF, ra);
     }
-    do_fxrstor(&ac, ptr);
+    do_fxrstor(&ac, ptr, rexw);
 }
 
 static bool valid_xrstor_header(X86Access *ac, uint64_t *pxsbv,
@@ -3147,13 +3184,13 @@ static bool valid_xrstor_header(X86Access *ac, uint64_t *pxsbv,
 }
 
 static void do_xrstor(X86Access *ac, target_ulong ptr,
-                      uint64_t rfbm, uint64_t xstate_bv)
+                      uint64_t rfbm, uint64_t xstate_bv, bool rexw)
 {
     CPUX86State *env = ac->env;
 
     if (rfbm & XSTATE_FP_MASK) {
         if (xstate_bv & XSTATE_FP_MASK) {
-            do_xrstor_fpu(ac, ptr);
+            do_xrstor_fpu(ac, ptr, rexw);
         } else {
             do_fninit(env);
             memset(env->fpregs, 0, sizeof(env->fpregs));
@@ -3221,7 +3258,8 @@ static void do_xrstor(X86Access *ac, target_ulong ptr,
 
 #undef XO
 
-void helper_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
+void helper_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
+                   uint32_t rexw)
 {
     uintptr_t ra = GETPC();
     X86Access ac;
@@ -3250,7 +3288,7 @@ void helper_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
         access_prepare(&ac, env, ptr, size_ext, MMU_DATA_LOAD, ra);
     }
 
-    do_xrstor(&ac, ptr, rfbm, xstate_bv);
+    do_xrstor(&ac, ptr, rfbm, xstate_bv, rexw);
 }
 
 #if defined(CONFIG_USER_ONLY)
@@ -3287,7 +3325,7 @@ void cpu_x86_fxsave(CPUX86State *env, void *host, size_t len)
     };
 
     assert(ac.size <= len);
-    do_fxsave(&ac, 0);
+    do_fxsave(&ac, 0, env->hflags & HF_CS64_MASK);
 }
 
 void cpu_x86_fxrstor(CPUX86State *env, void *host, size_t len)
@@ -3299,7 +3337,7 @@ void cpu_x86_fxrstor(CPUX86State *env, void *host, size_t len)
     };
 
     assert(ac.size <= len);
-    do_fxrstor(&ac, 0);
+    do_fxrstor(&ac, 0, env->hflags & HF_CS64_MASK);
 }
 
 void cpu_x86_xsave(CPUX86State *env, void *host, size_t len, uint64_t rfbm)
@@ -3316,7 +3354,8 @@ void cpu_x86_xsave(CPUX86State *env, void *host, size_t len, uint64_t rfbm)
     assert((rfbm & ~env->xcr0) == 0);
     ac.size = xsave_area_size(rfbm, false);
     assert(ac.size <= len);
-    do_xsave_access(&ac, 0, rfbm, get_xinuse(env), rfbm);
+    do_xsave_access(&ac, 0, rfbm, get_xinuse(env), rfbm,
+                    env->hflags & HF_CS64_MASK);
 }
 
 bool cpu_x86_xrstor(CPUX86State *env, void *host, size_t len, uint64_t rfbm)
@@ -3338,7 +3377,7 @@ bool cpu_x86_xrstor(CPUX86State *env, void *host, size_t len, uint64_t rfbm)
     if (!valid_xrstor_header(&ac, &xstate_bv, 0)) {
         return false;
     }
-    do_xrstor(&ac, 0, rfbm, xstate_bv);
+    do_xrstor(&ac, 0, rfbm, xstate_bv, env->hflags & HF_CS64_MASK);
     return true;
 }
 #endif

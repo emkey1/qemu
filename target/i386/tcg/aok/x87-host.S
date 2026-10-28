@@ -33,8 +33,16 @@
 /* Where a store's converted value goes first: aok_tmp, through x2. */
 x87_wp .req x2
 
+/*
+ * A register form's end: its word, and the note's (x87h_note, below), which
+ * it leaves.
+ */
 .macro gret_nomem pop=0
-    gret \pop
+    .if \pop != 1
+    .error "an x87 gadget has its word and the note's"
+    .endif
+    x87h_note 0
+    gret 2
 .endm
 
 .macro x87_ld_fsw r
@@ -78,6 +86,46 @@ x87_wp .req x2
     tbz w8, #7, .Lx87w\@
     bl x87h_mf
 .Lx87w\@:
+.endm
+
+/*
+ * What an insn that has run leaves as the last x87 instruction's (fpop, fpcs,
+ * fpip; a memory form's MEM also fpds and fpdp): translate-x86.c's
+ * x87_note() made the gadget's second word for this, 0 for a control insn,
+ * which leaves nothing. A memory form's address is still in x1; its offset
+ * is the address less the segment's base (fs's or gs's; the zero word for
+ * the rest), wrapped at 32 bits in 32-bit code (bit 14). At the gadget's
+ * end, after any fault, where x9-x13 are free.
+ */
+.macro x87h_note mem
+    ldr x9, [_ip, #8]
+    .if \mem == 0
+    tbz x9, #15, .Lx87n\@
+    .endif
+    ldr x10, [_ip]
+    add x10, _pc, x10, lsr #32
+    ldrh w11, [_cpu, #AOK_X86_ENV_CS_SEL]
+    str x10, [_cpu, #AOK_X86_ENV_FPIP]
+    .if \mem
+    ubfx x12, x9, #16, #16
+    lsr x13, x9, #32
+    ldrh w12, [_cpu, x12]
+    ldr x13, [_cpu, x13]
+    sub x13, x1, x13
+    tbz x9, #14, .Lx87d\@
+    mov w13, w13
+.Lx87d\@:
+    str x13, [_cpu, #AOK_X86_ENV_FPDP]
+    and x9, x9, #0x7ff
+    orr x9, x9, x11, lsl #16
+    orr x9, x9, x12, lsl #32
+    str x9, [_cpu, #AOK_X86_ENV_FPOP]
+    .else
+    and w9, w9, #0x7ff
+    orr w9, w9, w11, lsl #16
+    str w9, [_cpu, #AOK_X86_ENV_FPOP]
+    .endif
+.Lx87n\@:
 .endm
 
 /* FCOMI's flags, from w9: the lazy state becomes them (CC_OP_EFLAGS). */
@@ -158,7 +206,8 @@ x87_fcmov_all x87_fcmov, x87h_flag
     x87_wait
 .endm
 .macro x87m_ret arch
-    gret 1
+    x87h_note 1
+    gret 2
 .endm
 
 .macro x87m_rprep arch, bits, id

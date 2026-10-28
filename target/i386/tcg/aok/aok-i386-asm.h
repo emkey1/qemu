@@ -43,6 +43,16 @@
 #define AOK_X86_ENV_FPREGS  0x310
 
 /*
+ * What the last x87 instruction leaves: its opcode, then the code and data
+ * selectors (fpop, fpcs, fpds: two bytes each, in one eight-byte word), its
+ * address (fpip) and its operand's (fpdp). And cs's selector (segs[R_CS]).
+ */
+#define AOK_X86_ENV_FPOP    0x390
+#define AOK_X86_ENV_FPIP    0x398
+#define AOK_X86_ENV_FPDP    0x3a0
+#define AOK_X86_ENV_CS_SEL  0x168
+
+/*
  * The vector state (aok/vec): xmm_regs[32] (a ZMMReg of 64 bytes each, the
  * XMM bytes first), MXCSR, the opmasks k0-k7, and the frames' scratch area.
  */

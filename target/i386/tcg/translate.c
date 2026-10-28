@@ -2262,7 +2262,8 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         TCGv_i32 t32;
         TCGv_i64 t64;
 
-        tcg_gen_mov_tl(last_addr, ea);
+        /* the offset, as wide as the address: FXSAVE64 stores all of it */
+        tcg_gen_ext_tl(last_addr, ea, s->aflag);
         gen_lea_v_seg(s, ea, decode->mem.def_seg, s->override);
 
         switch (op) {
@@ -2491,7 +2492,6 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                  */
                 translator_io_start(&s->base);
                 gen_helper_fwait(tcg_env);
-                update_fip = false;
                 break;
             default:
                 goto illegal_op;
@@ -2641,8 +2641,9 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         case 0x1c:
             switch (rm) {
             case 0: /* feni (287 only, just do nop here) */
-                break;
             case 1: /* fdisi (287 only, just do nop here) */
+            case 4: /* fsetpm (287 only, just do nop here) */
+                update_fip = false;
                 break;
             case 2: /* fclex */
                 gen_helper_fclex(tcg_env);
@@ -2651,8 +2652,6 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             case 3: /* fninit */
                 gen_helper_fninit(tcg_env);
                 update_fip = false;
-                break;
-            case 4: /* fsetpm (287 only, just do nop here) */
                 break;
             default:
                 goto illegal_op;
@@ -2728,11 +2727,12 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             break;
         case 0x3c: /* df/4 */
             switch (rm) {
-            case 0:
+            case 0: /* fnstsw ax */
                 t32 = tcg_temp_new_i32();
                 gen_helper_fnstsw(t32, tcg_env);
                 tcg_gen_extu_i32_tl(s->T0, t32);
                 gen_op_mov_reg_v(s, MO_16, R_EAX, s->T0);
+                update_fip = false;
                 break;
             default:
                 goto illegal_op;
@@ -2766,6 +2766,10 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         }
     }
 
+    /*
+     * Every insn but the control ones (FNOP is not one) leaves its address
+     * and its opcode, the ModRM byte after the low three bits of the first.
+     */
     if (update_fip) {
         TCGv_i32 t32 = tcg_temp_new_i32();
         tcg_gen_ld_i32(t32, tcg_env,
@@ -2774,6 +2778,8 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
                          offsetof(CPUX86State, fpcs));
         tcg_gen_st_tl(eip_cur_tl(s),
                       tcg_env, offsetof(CPUX86State, fpip));
+        tcg_gen_st16_i32(tcg_constant_i32((b & 7) << 8 | modrm),
+                         tcg_env, offsetof(CPUX86State, fpop));
     }
     return;
 

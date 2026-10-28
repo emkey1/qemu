@@ -1376,30 +1376,38 @@ void aok_x86_helper_cpuid(CPUX86State *env, uint64_t pc, uint64_t a, uint64_t b)
     helper_cpuid(env);
 }
 
-/* xsave (xsaveopt with @opt) at @addr, of the components edx:eax asks for. */
-void aok_x86_helper_xsave(CPUX86State *env, uint64_t pc, uint64_t opt, uint64_t b,
-                          uint64_t addr);
-void aok_x86_helper_xsave(CPUX86State *env, uint64_t pc, uint64_t opt, uint64_t b,
-                          uint64_t addr)
+/*
+ * xsave (xsaveopt with @opt) at @addr, of the components edx:eax asks for;
+ * @rexw: xsave64's image.
+ */
+void aok_x86_helper_xsave(CPUX86State *env, uint64_t pc, uint64_t opt,
+                          uint64_t rexw, uint64_t addr);
+void aok_x86_helper_xsave(CPUX86State *env, uint64_t pc, uint64_t opt,
+                          uint64_t rexw, uint64_t addr)
 {
     uint64_t rfbm = deposit64(env->regs[R_EAX], 32, 32, env->regs[R_EDX]);
 
     x86_sync(env, pc);
     if (opt) {
-        helper_xsaveopt(env, addr, rfbm);
+        helper_xsaveopt(env, addr, rfbm, rexw);
     } else {
-        helper_xsave(env, addr, rfbm);
+        helper_xsave(env, addr, rfbm, rexw);
     }
 }
 
-/* xrstor at the address in the first temporary; then the main loop. */
-void aok_x86_helper_xrstor(CPUX86State *env, uint64_t pc, uint64_t a, uint64_t len);
-void aok_x86_helper_xrstor(CPUX86State *env, uint64_t pc, uint64_t a, uint64_t len)
+/*
+ * xrstor (xrstor64 with @rexw) at the address in the first temporary; then
+ * the main loop.
+ */
+void aok_x86_helper_xrstor(CPUX86State *env, uint64_t pc, uint64_t rexw,
+                           uint64_t len);
+void aok_x86_helper_xrstor(CPUX86State *env, uint64_t pc, uint64_t rexw,
+                           uint64_t len)
 {
     uint64_t rfbm = deposit64(env->regs[R_EAX], 32, 32, env->regs[R_EDX]);
 
     x86_sync(env, pc);
-    helper_xrstor(env, env->aok_tmp[0], rfbm);
+    helper_xrstor(env, env->aok_tmp[0], rfbm, rexw);
     env->eip = pc + len;
 }
 
@@ -3392,11 +3400,13 @@ static int insn_0f(Ctx *c, Insn *d, const uint8_t *code, int sz)
                 /* xrstor: what may change the TB's flags, then the main loop */
                 emit_ea(c, d);
                 E1(c->c64 ? G(lea_ea64) : G(lea_ea32), T0);
-                E4(G(call_c_exit), aok_x86_helper_xrstor, c->off, 0, c->len);
+                E4(G(call_c_exit), aok_x86_helper_xrstor, c->off, d->w != 0,
+                   c->len);
                 return END;
             }
             emit_ea(c, d);
-            E4(G(call_c_ea), aok_x86_helper_xsave, c->off, (d->reg & 7) == 6, 0);
+            E4(G(call_c_ea), aok_x86_helper_xsave, c->off, (d->reg & 7) == 6,
+               d->w != 0);
             c->hf = HF_NONE;
             return NEXT;
         }

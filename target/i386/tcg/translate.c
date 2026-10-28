@@ -35,6 +35,7 @@
 #include "decode-new.h"
 
 #include "exec/log.h"
+#include "tcg/lookup-key.h"
 
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
@@ -3518,6 +3519,14 @@ void tcg_x86_init(void)
     }
 
     x86_register_inline_fp();
+
+    /* x86_tb_cpu_state() in 64-bit code, for a back end's lookup. */
+    tcg_lookup_key.flags_ofs = offsetof(CPUX86State, hflags);
+    tcg_lookup_key.extra_ofs = offsetof(CPUX86State, eflags);
+    tcg_lookup_key.extra_mask = IOPL_MASK | TF_MASK | RF_MASK | VM_MASK |
+                                AC_MASK;
+    tcg_lookup_key.mode = HF_CS64_MASK;
+    tcg_lookup_key.pc_ofs = offsetof(CPUX86State, eip);
 }
 
 static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)

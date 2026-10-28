@@ -4276,13 +4276,15 @@ liveness_pass_1(TCGContext *s)
             /*
              * The gadget reads its globals from memory and writes its
              * outputs there. As it may write only part of an output, each
-             * output is synced first and left in memory only. A gadget
-             * that may fault needs every global in memory; rich_br needs
-             * what any conditional branch does.
+             * output is synced first and left in memory only, unless the
+             * gadget writes all of it: then the value before is dead. A
+             * gadget that may fault needs every global in memory; rich_br
+             * needs what any conditional branch does.
              */
             for (int i = 0; i < nb_oargs; i++) {
                 ts = arg_temp(op->args[TCGOP_RICH_GLOBALS(op) + i]);
-                ts->state = TS_DEAD | TS_MEM;
+                ts->state = op->args[3] & TCG_RICH_WHOLE(i)
+                            ? TS_DEAD : TS_DEAD | TS_MEM;
                 la_reset_pref(ts);
             }
             if (opc == INDEX_op_rich_br) {
@@ -6176,7 +6178,8 @@ static void load_arg_ref(TCGContext *s, unsigned arg_slot, TCGReg ref_base,
 /*
  * An RCG gadget is not a call, but clobbers the registers a helper call
  * does. Liveness has put its globals in memory, and those it writes leave
- * their registers.
+ * their registers; one it writes whole is not stored first, unless the
+ * gadget may fault.
  */
 static void tcg_reg_alloc_rich(TCGContext *s, TCGOp *op)
 {
@@ -6185,8 +6188,14 @@ static void tcg_reg_alloc_rich(TCGContext *s, TCGOp *op)
     int first = TCGOP_RICH_GLOBALS(op);
 
     for (int i = 0; i < nb_oargs + nb_iargs; i++) {
-        temp_sync(s, arg_temp(op->args[first + i]), allocated_regs, 0,
-                  i < nb_oargs);
+        TCGTemp *ts = arg_temp(op->args[first + i]);
+
+        if (i < nb_oargs && (op->args[3] & TCG_RICH_WHOLE(i)) &&
+            !(op->args[3] & TCG_RICH_MAY_FAULT)) {
+            temp_dead(s, ts);
+        } else {
+            temp_sync(s, ts, allocated_regs, 0, i < nb_oargs);
+        }
     }
     if (op->opc == INDEX_op_rich_br) {
         tcg_reg_alloc_cbranch(s, allocated_regs);

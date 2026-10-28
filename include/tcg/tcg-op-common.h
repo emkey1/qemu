@@ -49,6 +49,11 @@ void tcg_gen_mb(TCGBar);
 #ifdef TCG_HAVE_RCG
 /* The gadget may raise an exception: every global must be in memory. */
 #define TCG_RICH_MAY_FAULT  1
+/*
+ * The gadget writes all of outs[i] and does not read it, so the value
+ * before is dead: a register holding it need not be stored first.
+ */
+#define TCG_RICH_WHOLE(i)   (2u << (i))
 
 /**
  * tcg_gen_rich() - output an RCG gadget
@@ -57,7 +62,7 @@ void tcg_gen_mb(TCGBar);
  * @nb_words: how many
  * @flags: TCG_RICH_*
  * @outs: the globals it writes in memory; each is also read, as the gadget
- *        may write only part of one
+ *        may write only part of one, unless its TCG_RICH_WHOLE() is set
  * @nb_outs: how many
  * @ins: the globals it reads from memory, other than @outs
  * @nb_ins: how many

@@ -84,9 +84,13 @@ static uint64_t rcg_reg(int n)
     return offsetof(CPUX86State, regs[n]);
 }
 
-/* Adds g to list unless list or other already holds it. */
+/*
+ * Adds g to list unless list or other already holds it. If other, the
+ * globals the gadget writes, holds it, the gadget reads that one too, and
+ * it loses its TCG_RICH_WHOLE() in *whole.
+ */
 static void rcg_note(TCGv *list, unsigned *n, TCGv g, TCGv *other,
-                     unsigned nb_other)
+                     unsigned nb_other, unsigned *whole)
 {
     for (unsigned i = 0; i < *n; i++) {
         if (list[i] == g) {
@@ -95,6 +99,7 @@ static void rcg_note(TCGv *list, unsigned *n, TCGv g, TCGv *other,
     }
     for (unsigned i = 0; i < nb_other; i++) {
         if (other[i] == g) {
+            *whole &= ~TCG_RICH_WHOLE(i);
             return;
         }
     }
@@ -251,7 +256,7 @@ static bool rcg_translate(DisasContext *s, X86DecodedInsn *decode)
     const RCGGadget *g;
     uint64_t words[RCG_MAX_WORDS];
     TCGv outs[4], ins[RCG_MAX_WORDS], cf = NULL;
-    unsigned n, nb_outs = 0, nb_ins = 0;
+    unsigned n, nb_outs = 0, nb_ins = 0, whole = 0;
 
     if (!tcg_rcg_active() || !CODE64(s) || s->aflag != MO_64 ||
         (s->prefix & PREFIX_LOCK) || s->base.plugin_enabled) {
@@ -508,7 +513,13 @@ static bool rcg_translate(DisasContext *s, X86DecodedInsn *decode)
     g += ordered;
     tcg_debug_assert(g->gadget);
 
-    /* The globals it writes. tcg_gen_rich() also reads each one. */
+    /*
+     * The globals it writes. tcg_gen_rich() also reads each one, but those
+     * in whole: eip after JMP and RET, the flags state, and a register that
+     * MOV, LEA, POP, MOVZX, MOVSX or the zeroing XOR write at 32 or 64 bits
+     * (the others read theirs, or write only part of it). Noting what the
+     * gadget reads takes away any of these it reads as well.
+     */
     if (op == RCG_OP_PUSH || op == RCG_OP_POP || op == RCG_OP_CALL ||
         op == RCG_OP_RET) {
         outs[nb_outs++] = cpu_regs[R_ESP];
@@ -517,17 +528,29 @@ static bool rcg_translate(DisasContext *s, X86DecodedInsn *decode)
         /* Read for the return address; gen_JMP writes it after. */
         ins[nb_ins++] = cpu_eip;
     } else if (op == RCG_OP_CALL || op == RCG_OP_JMP || op == RCG_OP_RET) {
+        /* CALL reads it for the return address. */
+        whole |= op != RCG_OP_CALL ? TCG_RICH_WHOLE(nb_outs) : 0;
         outs[nb_outs++] = cpu_eip;
     }
     for (n = 0; n < RCG_MAX_WORDS && g->words[n] != RCG_W_END; n++) {
         if (g->words[n] == RCG_W_D) {
-            rcg_note(outs, &nb_outs, cpu_regs[first->n], NULL, 0);
+            unsigned i = nb_outs;
+
+            rcg_note(outs, &nb_outs, cpu_regs[first->n], NULL, 0, NULL);
+            if (nb_outs > i && ot >= MO_32 &&
+                (op == RCG_OP_MOV || op == RCG_OP_LEA ||
+                 op == RCG_OP_POP || op == RCG_OP_ZERO ||
+                 (op >= RCG_OP_MOVZXB && op <= RCG_OP_MOVSXD))) {
+                whole |= TCG_RICH_WHOLE(i);
+            }
         }
     }
     if (rcg_facts[op].dst) {
+        whole |= TCG_RICH_WHOLE(nb_outs);
         outs[nb_outs++] = cpu_cc_dst;
     }
     if (rcg_facts[op].src) {
+        whole |= TCG_RICH_WHOLE(nb_outs);
         outs[nb_outs++] = cpu_cc_src;
     }
 
@@ -541,24 +564,25 @@ static bool rcg_translate(DisasContext *s, X86DecodedInsn *decode)
             break;
         case RCG_W_S1:
             words[n] = rcg_reg(first->n);
-            rcg_note(ins, &nb_ins, cpu_regs[first->n], outs, nb_outs);
+            rcg_note(ins, &nb_ins, cpu_regs[first->n], outs, nb_outs, &whole);
             break;
         case RCG_W_S:
             words[n] = rcg_reg(second->n);
-            rcg_note(ins, &nb_ins, cpu_regs[second->n], outs, nb_outs);
+            rcg_note(ins, &nb_ins, cpu_regs[second->n], outs, nb_outs, &whole);
             break;
         case RCG_W_BASE:
             if (a->base == -2) {
                 words[n] = offsetof(CPUX86State, eip);
-                rcg_note(ins, &nb_ins, cpu_eip, outs, nb_outs);
+                rcg_note(ins, &nb_ins, cpu_eip, outs, nb_outs, &whole);
             } else {
                 words[n] = rcg_reg(a->base);
-                rcg_note(ins, &nb_ins, cpu_regs[a->base], outs, nb_outs);
+                rcg_note(ins, &nb_ins, cpu_regs[a->base], outs, nb_outs,
+                         &whole);
             }
             break;
         case RCG_W_INDEX:
             words[n] = rcg_reg(a->index);
-            rcg_note(ins, &nb_ins, cpu_regs[a->index], outs, nb_outs);
+            rcg_note(ins, &nb_ins, cpu_regs[a->index], outs, nb_outs, &whole);
             break;
         case RCG_W_DISP:
             /* With CF_PCREL, cpu_eip holds the eip at pc_save. */
@@ -567,7 +591,7 @@ static bool rcg_translate(DisasContext *s, X86DecodedInsn *decode)
             break;
         case RCG_W_SEG:
             words[n] = offsetof(CPUX86State, segs[seg].base);
-            rcg_note(ins, &nb_ins, cpu_seg_base[seg], outs, nb_outs);
+            rcg_note(ins, &nb_ins, cpu_seg_base[seg], outs, nb_outs, &whole);
             break;
         case RCG_W_IMM:
             words[n] = imm;
@@ -591,7 +615,8 @@ static bool rcg_translate(DisasContext *s, X86DecodedInsn *decode)
         cf = tcg_temp_new();
         gen_compute_eflags_c(s, cf);
     }
-    tcg_gen_rich(g->gadget, words, n, memory ? TCG_RICH_MAY_FAULT : 0,
+    tcg_gen_rich(g->gadget, words, n,
+                 (memory ? TCG_RICH_MAY_FAULT : 0) | whole,
                  outs, nb_outs, ins, nb_ins);
     if (rcg_facts[op].cf) {
         tcg_gen_mov_tl(cpu_cc_src, cf);

@@ -2727,11 +2727,12 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
             break;
         case 0x3c: /* df/4 */
             switch (rm) {
-            case 0:
+            case 0: /* fnstsw ax */
                 t32 = tcg_temp_new_i32();
                 gen_helper_fnstsw(t32, tcg_env);
                 tcg_gen_extu_i32_tl(s->T0, t32);
                 gen_op_mov_reg_v(s, MO_16, R_EAX, s->T0);
+                update_fip = false;
                 break;
             default:
                 goto illegal_op;

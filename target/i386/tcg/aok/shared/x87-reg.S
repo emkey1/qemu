@@ -121,8 +121,13 @@ x87_com_rr ucom, 0
     x87_st_valid w11
     add w9, w9, 1
     bfi w8, w9, 11, 3
+    // C1 stays as it was, whatever the SDM says, but for a stack fault
 4:  bic w7, w7, X87_C1
-    bl x87_put_fsw
+    tst w7, X87_SF
+    b.ne 5f
+    and w10, w8, X87_C1
+    orr w7, w7, w10
+5:  bl x87_put_fsw
     gret_nomem 1
 .endm
 x87_comi_rr comi, 1

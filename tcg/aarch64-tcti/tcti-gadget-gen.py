@@ -698,7 +698,9 @@ def lookup_way(fail):
         f"b.ne {fail}",
     ]
 
-simple("lookup_tb",
+def lookup_tb(name, result):
+    """ The gadget, leaving the TB's code or the helper's result in result. """
+    simple(name,
     "ldp x27, x16, [x28], #16",
     # What curr_cflags() and check_for_breakpoints() look at.
     "ldp x1, x2, [x16, %[lk_one]]",
@@ -746,7 +748,7 @@ simple("lookup_tb",
     "ldr x3, [x16, %[lk_io]]",
     "mov w0, #1",
     "strb w0, [x14, x3]",
-    "ldr x0, [x2, %[tb_tc_ptr]]",
+    f"ldr {result}, [x2, %[tb_tc_ptr]]",
     *EPILOGUE,
     "9:",
     "mov x0, x14",
@@ -755,7 +757,7 @@ simple("lookup_tb",
     "blr x27",
     "mov x27, x0",
     *C_CALL_EPILOGUE,
-    "mov x0, x27",
+    f"mov {result}, x27",
     operands=", ".join([
         '[lk_flags] "i" (TCTI_LK(flags_ofs))',
         '[lk_masks] "i" (TCTI_LK(extra_mask))',
@@ -773,6 +775,11 @@ simple("lookup_tb",
         '[tb_flags] "i" (offsetof(TranslationBlock, flags))',
         '[tb_tc_ptr] "i" (offsetof(TranslationBlock, tc.ptr))',
     ]))
+
+lookup_tb("lookup_tb", "x0")
+# lookup_tb and a goto_ptr of its result, in one: the stream goes on at the
+# code it found, or at the helper's result, tcg_code_gen_epilogue on a miss.
+lookup_tb("lookup_tb_goto_ptr", "x28")
 
 # The inline float fast path (tcg/tcg-inline-fp.h): a registered SSE float
 # helper's operation done here on NEON, under the conditions that make it

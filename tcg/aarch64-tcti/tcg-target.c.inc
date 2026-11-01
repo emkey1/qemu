@@ -725,6 +725,18 @@ static void tcti_note_env_arg(TCGContext *s, tcg_insn_unit *start,
     tcti_env_args.n = n + 1;
 }
 
+/* The lookup_tb gadget last written: goto_ptr may join it. */
+static __thread struct {
+    tcg_insn_unit *start, *end;
+} tcti_last_lookup;
+
+static void tcti_out_lookup(TCGContext *s, const void *gadget)
+{
+    tcg_out_gadget(s, gadget);
+    tcg_out64(s, (uintptr_t)helper_lookup_tb_ptr);
+    tcg_out64(s, (uintptr_t)&tcg_lookup_key);
+}
+
 static const void *const tcti_call_env[TCTI_ENV_ARGS] = {
     gadget_call_env0, gadget_call_env1, gadget_call_env2, gadget_call_env3,
     gadget_call_env4, gadget_call_env5, gadget_call_env6, gadget_call_env7,
@@ -868,9 +880,9 @@ static void tcg_out_call(TCGContext *s, const tcg_insn_unit *func,
         if (first >= 0 && top == 0 && offset[0] == 0) {
             tcti_rewind(s, tcti_env_args.e[first].start);
         }
-        tcg_out_gadget(s, gadget_lookup_tb);
-        tcg_out64(s, (uintptr_t)func);
-        tcg_out64(s, (uintptr_t)&tcg_lookup_key);
+        tcti_last_lookup.start = s->code_ptr;
+        tcti_out_lookup(s, gadget_lookup_tb);
+        tcti_last_lookup.end = s->code_ptr;
         return;
     }
 
@@ -1051,6 +1063,7 @@ static void tcti_rewind(TCGContext *s, tcg_insn_unit *to)
     }
 #endif
     s->code_ptr = to;
+    tcti_last_lookup.end = NULL;
     tcti_env_args.n = 0;
     tcti_last_env_ld32.end = NULL;
     tcti_last_env_ldst64.end = NULL;
@@ -1240,6 +1253,13 @@ static void tcg_out_goto_tb(TCGContext *s, int which)
  */
 static void tcg_out_goto_ptr(TCGContext *s, TCGReg a0)
 {
+    /* The result of the lookup_tb gadget just before: one gadget does both. */
+    if (a0 == TCG_REG_R0 && tcti_last_lookup.end == s->code_ptr &&
+        !tcti_label_within(s, tcti_last_lookup.start, s->code_ptr)) {
+        tcti_rewind(s, tcti_last_lookup.start);
+        tcti_out_lookup(s, gadget_lookup_tb_goto_ptr);
+        return;
+    }
     tcg_out_unary_gadget(s, gadget_goto_ptr, a0);
 }
 

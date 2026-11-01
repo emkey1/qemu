@@ -64,8 +64,9 @@ QEMU_BUILD_BUG_ON(sizeof_field(CPUTLBEntry, addend) != 8);
 
 /*
  * The lookup_tb gadget's constants: a TCGLookupKey field's offset, which it
- * loads in pairs; tb_jmp_cache_hash_func() for 4 KiB pages; and the
- * TranslationBlock fields it compares, flags and cflags in one LDP.
+ * loads in pairs; tb_jmp_cache_hash_func() for 4 KiB pages; the
+ * TranslationBlock fields it compares, flags and cflags in one LDP; and a
+ * CPUState field's offset from env, which it moves into a register.
  */
 #define TCTI_LK(field) ((int)offsetof(TCGLookupKey, field))
 #define TCTI_LK_HASH_SHIFT (TCG_LOOKUP_PAGE_BITS - TCG_LOOKUP_JC_BITS / 2)
@@ -73,11 +74,16 @@ QEMU_BUILD_BUG_ON(sizeof_field(CPUTLBEntry, addend) != 8);
     ((1 << TCG_LOOKUP_JC_BITS) - (1 << (TCG_LOOKUP_JC_BITS / 2)))
 #define TCTI_LK_ADDR_MASK ((1 << (TCG_LOOKUP_JC_BITS / 2)) - 1)
 
-QEMU_BUILD_BUG_ON(TCTI_LK(extra_ofs) != TCTI_LK(flags_ofs) + 8);
 QEMU_BUILD_BUG_ON(TCTI_LK(mode) != TCTI_LK(extra_mask) + 8);
-QEMU_BUILD_BUG_ON(TCTI_LK(cflags_ofs) != TCTI_LK(pc_ofs) + 8);
-QEMU_BUILD_BUG_ON(TCTI_LK(bp_ofs) != TCTI_LK(sstep_ofs) + 8);
 QEMU_BUILD_BUG_ON(TCTI_LK(loglevel) != TCTI_LK(one_insn_per_tb) + 8);
+#define TCTI_CPU_OFS(field)                                             \
+    ((int)(offsetof(CPUState, field) - sizeof(CPUState)))
+
+QEMU_BUILD_BUG_ON(sizeof(CPUState) > 0x10000);
+QEMU_BUILD_BUG_ON(sizeof_field(CPUState, tcg_cflags) != 4);
+QEMU_BUILD_BUG_ON(sizeof_field(CPUState, singlestep_flags) != 4);
+QEMU_BUILD_BUG_ON(SSTEP_ENABLE != 1);
+QEMU_BUILD_BUG_ON(sizeof_field(CPUState, neg.can_do_io) != 1);
 QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, cflags) !=
                   offsetof(TranslationBlock, flags) + 4);
 QEMU_BUILD_BUG_ON(sizeof_field(TranslationBlock, cs_base) != 8);

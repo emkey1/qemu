@@ -678,10 +678,12 @@ for n in range(8):
 
 # helper_lookup_tb_ptr(env)'s common case, done here (include/tcg/lookup-key.h):
 # the target's state from env, the two ways of the jump cache, and on a hit
-# can_do_io set and the TB's code in x0, as the helper returns it. Anything
-# the helper would treat otherwise -- one_insn_per_tb, a log bit,
-# single-stepping, a breakpoint, a mode the key does not describe -- and a
-# miss call it. The stream holds the helper, then the key's address.
+# can_do_io set and the TB's code as the helper returns it. Anything the helper
+# would treat otherwise -- one_insn_per_tb, a log bit, single-stepping, a
+# breakpoint, a mode the key does not describe -- and a miss call it. The stream
+# holds the helper, the key's address, then the key's flags_ofs, extra_ofs and
+# pc_ofs, so that those need no load from the key; CPUState's fields, relative
+# to env, are constants here.
 def lookup_way(fail):
     """ The lines that check the jump cache entry at x3 against the state
     (flags w1, pc x4, cflags w5), leaving its TB in x2. """
@@ -702,34 +704,36 @@ def lookup_tb(name, result):
     """ The gadget, leaving the TB's code or the helper's result in result. """
     simple(name,
     "ldp x27, x16, [x28], #16",
+    "ldp x1, x2, [x28], #16",
+    "ldr x4, [x28], #8",
     # What curr_cflags() and check_for_breakpoints() look at.
-    "ldp x1, x2, [x16, %[lk_one]]",
-    "ldrb w1, [x1]",
-    "ldr w2, [x2]",
-    "ldr x3, [x16, %[lk_logmask]]",
-    "tst w2, w3",
-    "ccmp w1, #0, #0, eq",
+    "ldp x3, x5, [x16, %[lk_one]]",
+    "ldrb w3, [x3]",
+    "ldr w5, [x5]",
+    "ldr x6, [x16, %[lk_logmask]]",
+    "tst w5, w6",
+    "ccmp w3, #0, #0, eq",
     "b.ne 9f",
-    "ldp x1, x2, [x16, %[lk_sstep]]",
-    "ldr w1, [x14, x1]",
-    "ldr x2, [x14, x2]",
-    "tst w1, #1",
-    "ccmp x2, #0, #0, eq",
+    "mov x3, %[sstep]",
+    "mov x5, %[bps]",
+    "ldr w3, [x14, x3]",
+    "ldr x5, [x14, x5]",
+    "tst w3, #1",
+    "ccmp x5, #0, #0, eq",
     "b.ne 9f",
     # The state: flags, pc and cflags.
-    "ldp x1, x2, [x16, %[lk_flags]]",
-    "ldp x3, x4, [x16, %[lk_masks]]",
+    "ldp x3, x5, [x16, %[lk_masks]]",
     "ldr w1, [x14, x1]",
     "ldr w2, [x14, x2]",
-    "tst w1, w4",
+    "tst w1, w5",
     "b.eq 9f",
     "and w2, w2, w3",
     "orr w1, w1, w2",
-    "ldp x4, x5, [x16, %[lk_pc]]",
     "ldr x4, [x14, x4]",
+    "mov x5, %[cflags]",
     "ldr w5, [x14, x5]",
     # The entry, as tb_jmp_cache_hash_func() finds it, and its partner.
-    "ldr x6, [x16, %[lk_jc]]",
+    "mov x6, %[jc]",
     "ldr x6, [x14, x6]",
     "eor x7, x4, x4, lsr #%[shift]",
     "lsr x2, x7, #%[shift]",
@@ -745,7 +749,7 @@ def lookup_tb(name, result):
     "add x3, x6, x7, lsl #4",
     *lookup_way("9f"),
     "2:",
-    "ldr x3, [x16, %[lk_io]]",
+    "mov x3, %[io]",
     "mov w0, #1",
     "strb w0, [x14, x3]",
     f"ldr {result}, [x2, %[tb_tc_ptr]]",
@@ -759,14 +763,14 @@ def lookup_tb(name, result):
     *C_CALL_EPILOGUE,
     f"mov {result}, x27",
     operands=", ".join([
-        '[lk_flags] "i" (TCTI_LK(flags_ofs))',
         '[lk_masks] "i" (TCTI_LK(extra_mask))',
-        '[lk_pc] "i" (TCTI_LK(pc_ofs))',
-        '[lk_jc] "i" (TCTI_LK(jc_ofs))',
-        '[lk_sstep] "i" (TCTI_LK(sstep_ofs))',
-        '[lk_io] "i" (TCTI_LK(io_ofs))',
         '[lk_one] "i" (TCTI_LK(one_insn_per_tb))',
         '[lk_logmask] "i" (TCTI_LK(log_mask))',
+        '[sstep] "i" (TCTI_CPU_OFS(singlestep_flags))',
+        '[bps] "i" (TCTI_CPU_OFS(breakpoints.tqh_first))',
+        '[cflags] "i" (TCTI_CPU_OFS(tcg_cflags))',
+        '[jc] "i" (TCTI_CPU_OFS(tb_jmp_cache))',
+        '[io] "i" (TCTI_CPU_OFS(neg.can_do_io))',
         '[shift] "i" (TCTI_LK_HASH_SHIFT)',
         '[page_mask] "i" (TCTI_LK_PAGE_MASK)',
         '[addr_mask] "i" (TCTI_LK_ADDR_MASK)',

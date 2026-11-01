@@ -735,6 +735,9 @@ static void tcti_out_lookup(TCGContext *s, const void *gadget)
     tcg_out_gadget(s, gadget);
     tcg_out64(s, (uintptr_t)helper_lookup_tb_ptr);
     tcg_out64(s, (uintptr_t)&tcg_lookup_key);
+    tcg_out64(s, tcg_lookup_key.flags_ofs);
+    tcg_out64(s, tcg_lookup_key.extra_ofs);
+    tcg_out64(s, tcg_lookup_key.pc_ofs);
 }
 
 static const void *const tcti_call_env[TCTI_ENV_ARGS] = {

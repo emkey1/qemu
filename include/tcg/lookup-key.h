@@ -15,10 +15,9 @@
  * with extra_mask, pc the 64-bit word at pc_ofs and cs_base 0, while flags
  * has a bit of mode set. pc_ofs is 0 until a target sets them.
  *
- * accel/tcg's fields are CPUState's, relative to env, and what makes
- * curr_cflags() more than tcg_cflags or makes check_for_breakpoints() look:
- * a back end that finds single-stepping, a breakpoint, one_insn_per_tb or
- * a log bit of log_mask calls the helper.
+ * accel/tcg's fields are what makes curr_cflags() more than tcg_cflags: a
+ * back end that finds one_insn_per_tb or a log bit of log_mask, or
+ * single-stepping or a breakpoint in the CPUState, calls the helper.
  *
  * Each field is 64 bits, so that a gadget loads them in pairs.
  */
@@ -27,9 +26,6 @@ typedef struct TCGLookupKey {
     uint64_t extra_mask, mode;
     int64_t pc_ofs;
 
-    int64_t cflags_ofs, jc_ofs;
-    int64_t sstep_ofs, bp_ofs;
-    int64_t io_ofs;
     const bool *one_insn_per_tb;
     const unsigned *loglevel;
     uint64_t log_mask;

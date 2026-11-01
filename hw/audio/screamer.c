@@ -144,8 +144,12 @@ static void pmac_screamer_rx(DBDMA_io *io)
     //ScreamerState *s = io->opaque;
     DBDMA_channel *ch = io->channel;
         
-    /* FIXME: stop channel after updating with status to stop MacOS 9 freezing */
-    ch->regs[DBDMA_STATUS] &= ~RUN;
+    /*
+     * FIXME: stop channel after updating with status to stop MacOS 9 freezing.
+     * A stopped channel is not active: Mac OS 9's sound plugins wait, with no
+     * timeout, for ACTIVE to drop after they ask for the input to stop.
+     */
+    ch->regs[DBDMA_STATUS] &= ~(RUN | ACTIVE);
 
     io->dma_end(io);
 }

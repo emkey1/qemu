@@ -117,10 +117,15 @@ static const AokPair rv_pair_list[] = {
 
 static AokPairSet rv_pairs = { rv_pair_list, ARRAY_SIZE(rv_pair_list) };
 static bool rv_pairs_on;
+/* Which folds (FOLD_*) are on: QEMU_AOK_FOLD_MASK, all by default. */
+static unsigned rv_fold_mask;
 
 static void __attribute__((constructor)) rv_pairs_init(void)
 {
     rv_pairs_on = !getenv("QEMU_AOK_NO_PAIRS");
+    rv_fold_mask = getenv("QEMU_AOK_NO_FOLD") ? 0 :
+                   getenv("QEMU_AOK_FOLD_MASK") ?
+                   strtoul(getenv("QEMU_AOK_FOLD_MASK"), NULL, 0) : ~0u;
     rv_pairs.forward = !getenv("QEMU_AOK_NO_FWD");
     aok_pair_set_init(&rv_pairs);
 }
@@ -1214,6 +1219,337 @@ static int insn16(Ctx *c, uint32_t insn)
     return UNKNOWN;
 }
 
+/*
+ * Two insns as one gadget: the idioms iSH-AOK's translator folds before its
+ * pair pass (its jit/gen.c: gen_riscv64_try_after_slli, _try_li_branch and
+ * _try_andi_branch), whose gadgets the shared sources give this front end
+ * as well (shared/alu.S):
+ *
+ *   slli rd, rs, a ; srli/srai rd, rd, b        sll_srl, sll_sra
+ *   slli t, rs, s ; add rd, t, rb (or rb, t)    sll_add
+ *   li t, K ; b<cond> t, rs (or rs, t)          b<cond>_ri, _ir (and _bk)
+ *   andi t, rs, K ; beqz/bnez t                 andi_beqz, andi_bnez (and _bk)
+ *   add t, ra, rb ; l<x> rd, imm(t)             add_l<x>
+ *   ld/fld, ld/fld off one base                 ld_ld
+ *   sd/fsd, sd/fsd off one base                 sd_sd
+ *
+ * The last three are this host's own gadgets (gadgets-shared.S). Every
+ * register the two write is written, in order, so the result is the unfused
+ * pair's; each insn is still an insn of the TB, and the second can still be
+ * jumped to (a TB that starts there translates it alone). Each access keeps
+ * its own word for its fault path, so a fault in either is that insn's.
+ */
+enum { NO_FOLD = -1 };
+enum {
+    FOLD_SHIFT = 1, FOLD_SLL_ADD = 2, FOLD_LI_BR = 4, FOLD_ANDI_BR = 8,
+    FOLD_ADD_LOAD = 16, FOLD_MEM_PAIR = 32,
+};
+
+#define DECL_BR_CONST(n) DECL(n##_ri) DECL(n##_ri_bk)
+DECL(sll_srl) DECL(sll_sra) DECL(sll_add)
+DECL_BR_CONST(beq) DECL_BR_CONST(bne) DECL_BR_CONST(blt) DECL_BR_CONST(bge)
+DECL_BR_CONST(bltu) DECL_BR_CONST(bgeu)
+DECL(blt_ir) DECL(bge_ir) DECL(bltu_ir) DECL(bgeu_ir)
+DECL(blt_ir_bk) DECL(bge_ir_bk) DECL(bltu_ir_bk) DECL(bgeu_ir_bk)
+DECL(andi_beqz) DECL(andi_bnez) DECL(andi_beqz_bk) DECL(andi_bnez_bk)
+DECL(add_lb) DECL(add_lh) DECL(add_lw) DECL(add_ld)
+DECL(add_lbu) DECL(add_lhu) DECL(add_lwu)
+DECL(ld_ld) DECL(sd_sd)
+
+/* An insn's fields, as far as a fold looks at them. */
+typedef struct RvFields {
+    unsigned op, f3, f7, rd, rs1, rs2;
+    int64_t imm;            /* I, or S for a store, or B for a branch */
+} RvFields;
+
+/*
+ * The fields of a 32-bit insn, or of the 16-bit insns that are one of the
+ * forms above (c.li, c.slli, c.srli, c.srai, c.andi, c.add, c.mv, c.beqz,
+ * c.bnez, and the 64-bit loads and stores and c.lw) as the 32-bit insn each
+ * stands for. False for any other 16-bit insn, and for a hint.
+ */
+static bool fold_fields(uint32_t insn, unsigned len, RvFields *f)
+{
+    unsigned rdp = 8 + ((insn >> 7) & 7), r = (insn >> 7) & 31;
+    unsigned imm6 = ((insn >> 12) & 1) << 5 | ((insn >> 2) & 31);
+    /* c.ld, c.sd, c.fld, c.fsd: [12:10] offset[5:3], [6:5] offset[7:6] */
+    unsigned off8 = ((insn >> 10) & 7) << 3 | ((insn >> 5) & 3) << 6;
+    unsigned rs2p = 8 + ((insn >> 2) & 7);
+    /* c.ldsp, c.fldsp: [12] offset[5], [6:5] offset[4:3], [4:2] offset[8:6] */
+    unsigned offl = ((insn >> 12) & 1) << 5 | ((insn >> 5) & 3) << 3 |
+                    ((insn >> 2) & 7) << 6;
+    /* c.sdsp, c.fsdsp: [12:10] offset[5:3], [9:7] offset[8:6] */
+    unsigned offs = ((insn >> 10) & 7) << 3 | ((insn >> 7) & 7) << 6;
+
+    *f = (RvFields){ 0 };
+    if (len == 4) {
+        f->op = insn & 0x7f;
+        f->rd = (insn >> 7) & 31;
+        f->f3 = (insn >> 12) & 7;
+        f->rs1 = (insn >> 15) & 31;
+        f->rs2 = (insn >> 20) & 31;
+        f->f7 = insn >> 25;
+        f->imm = f->op == 0x63 ?
+            sext((((insn >> 31) & 1) << 12) | (((insn >> 7) & 1) << 11) |
+                 (((insn >> 25) & 0x3f) << 5) | (((insn >> 8) & 0xf) << 1),
+                 13) :
+            f->op == 0x23 || f->op == 0x27 ?
+            sext((insn >> 25) << 5 | ((insn >> 7) & 31), 12) :
+            sext(insn >> 20, 12);
+        return true;
+    }
+    switch ((insn & 3) << 3 | ((insn >> 13) & 7)) {
+    case 0 << 3 | 1: /* c.fld */
+    case 0 << 3 | 3: /* c.ld */
+        *f = (RvFields){ .op = (insn >> 14) & 1 ? 0x03 : 0x07, .f3 = 3,
+                         .rd = rs2p, .rs1 = rdp, .imm = off8 };
+        return true;
+    case 0 << 3 | 2: /* c.lw */
+        *f = (RvFields){ .op = 0x03, .f3 = 2, .rd = rs2p, .rs1 = rdp,
+                         .imm = ((insn >> 10) & 7) << 3 |
+                                ((insn >> 6) & 1) << 2 |
+                                ((insn >> 5) & 1) << 6 };
+        return true;
+    case 0 << 3 | 5: /* c.fsd */
+    case 0 << 3 | 7: /* c.sd */
+        *f = (RvFields){ .op = (insn >> 14) & 1 ? 0x23 : 0x27, .f3 = 3,
+                         .rs1 = rdp, .rs2 = rs2p, .imm = off8 };
+        return true;
+    case 2 << 3 | 1: /* c.fldsp */
+    case 2 << 3 | 3: /* c.ldsp */
+        *f = (RvFields){ .op = (insn >> 14) & 1 ? 0x03 : 0x07, .f3 = 3,
+                         .rd = r, .rs1 = 2, .imm = offl };
+        return (insn >> 14) & 1 ? r != 0 : true;
+    case 2 << 3 | 5: /* c.fsdsp */
+    case 2 << 3 | 7: /* c.sdsp */
+        *f = (RvFields){ .op = (insn >> 14) & 1 ? 0x23 : 0x27, .f3 = 3,
+                         .rs1 = 2, .rs2 = (insn >> 2) & 31, .imm = offs };
+        return true;
+    case 1 << 3 | 2: /* c.li */
+        *f = (RvFields){ .op = 0x13, .rd = r, .imm = sext(imm6, 6) };
+        return r != 0;
+    case 1 << 3 | 4:
+        switch ((insn >> 10) & 3) {
+        case 0: /* c.srli */
+        case 1: /* c.srai */
+            *f = (RvFields){ .op = 0x13, .f3 = 5, .rd = rdp, .rs1 = rdp,
+                             .imm = imm6 | ((insn >> 10) & 1) << 10 };
+            return imm6 != 0;
+        case 2: /* c.andi */
+            *f = (RvFields){ .op = 0x13, .f3 = 7, .rd = rdp, .rs1 = rdp,
+                             .imm = sext(imm6, 6) };
+            return true;
+        }
+        return false;
+    case 1 << 3 | 6: /* c.beqz */
+    case 1 << 3 | 7: /* c.bnez */
+        *f = (RvFields){ .op = 0x63, .f3 = (insn >> 13) & 1, .rs1 = rdp,
+                         .imm = sext((((insn >> 12) & 1) << 8) |
+                                     (((insn >> 5) & 3) << 6) |
+                                     (((insn >> 2) & 1) << 5) |
+                                     (((insn >> 10) & 3) << 3) |
+                                     (((insn >> 3) & 3) << 1), 9) };
+        return true;
+    case 2 << 3 | 0: /* c.slli */
+        *f = (RvFields){ .op = 0x13, .f3 = 1, .rd = r, .rs1 = r, .imm = imm6 };
+        return r != 0 && imm6 != 0;
+    case 2 << 3 | 4: /* c.add, c.mv */
+        if (r == 0 || ((insn >> 2) & 31) == 0) {
+            return false;
+        }
+        *f = (RvFields){ .op = 0x33, .rd = r, .rs2 = (insn >> 2) & 31,
+                         .rs1 = (insn >> 12) & 1 ? r : 0 };
+        return true;
+    }
+    return false;
+}
+
+/* The two ways out of a folded branch, @b being the branch's fields. */
+static int fold_branch_ways(Ctx *c, unsigned at, unsigned len,
+                            const RvFields *b)
+{
+    jump_operands(c, 0, at + b->imm);
+    jump_operands(c, 1, at + len);
+    return END;
+}
+
+/* A load's or store's register slot: an FP one for fld and fsd. */
+static bool fold_mem_reg(Ctx *c, const RvFields *f, uint64_t *off)
+{
+    bool fp = f->op == 0x07 || f->op == 0x27;
+    unsigned reg = f->op == 0x03 || f->op == 0x07 ? f->rd : f->rs2;
+
+    if (f->f3 != 3 || (fp && !c->has_fd)) {
+        return false;
+    }
+    *off = fp ? fpr_off(reg) : f->op == 0x03 ? rd_off(reg) : rs_off(reg);
+    return true;
+}
+
+/* Two 64-bit loads or two 64-bit stores off one base: ld_ld, sd_sd. */
+static int fold_mem_pair(Ctx *c, const RvFields *a, const RvFields *b,
+                         unsigned at, uint32_t insn2)
+{
+    bool load = a->op == 0x03 || a->op == 0x07;
+    uint64_t r1, r2;
+
+    if (b->rs1 != a->rs1 ||
+        (load ? b->op != 0x03 && b->op != 0x07 : b->op != 0x23 && b->op != 0x27) ||
+        !fold_mem_reg(c, a, &r1) || !fold_mem_reg(c, b, &r2) ||
+        /* the gadget reads the base again for the second */
+        (a->op == 0x03 && a->rd == a->rs1 && a->rs1 != 0)) {
+        return NO_FOLD;
+    }
+    aok_emit_gadget(&c->g, load ? G(ld_ld) : G(sd_sd));
+    aok_emit(&c->g, r1);
+    aok_emit(&c->g, rs_off(a->rs1));
+    aok_emit(&c->g, a->imm);
+    aok_emit(&c->g, mem_word(c));
+    aok_emit(&c->g, r2);
+    aok_emit(&c->g, b->imm);
+    aok_emit(&c->g, (uint64_t)at << 32 | insn2);
+    return NEXT;
+}
+
+static int fold_emit(Ctx *c, const RvFields *a, const RvFields *b,
+                     unsigned at, unsigned len2, uint32_t insn2)
+{
+    static const Gadget add_load[8] = {
+        G(add_lb), G(add_lh), G(add_lw), G(add_ld),
+        G(add_lbu), G(add_lhu), G(add_lwu), NULL,
+    };
+    static const Gadget ri[2][8] = {
+        { G(beq_ri), G(bne_ri), NULL, NULL,
+          G(blt_ri), G(bge_ri), G(bltu_ri), G(bgeu_ri) },
+        { G(beq_ri_bk), G(bne_ri_bk), NULL, NULL,
+          G(blt_ri_bk), G(bge_ri_bk), G(bltu_ri_bk), G(bgeu_ri_bk) },
+    };
+    static const Gadget ir[2][8] = {
+        { G(beq_ri), G(bne_ri), NULL, NULL,
+          G(blt_ir), G(bge_ir), G(bltu_ir), G(bgeu_ir) },
+        { G(beq_ri_bk), G(bne_ri_bk), NULL, NULL,
+          G(blt_ir_bk), G(bge_ir_bk), G(bltu_ir_bk), G(bgeu_ir_bk) },
+    };
+    unsigned t = a->rd;
+
+    switch (a->op) {
+    case 0x03: case 0x07: case 0x23: case 0x27:
+        if (!(rv_fold_mask & FOLD_MEM_PAIR)) {
+            return NO_FOLD;
+        }
+        return fold_mem_pair(c, a, b, at, insn2);
+    case 0x33:                                                /* add */
+        if (!(rv_fold_mask & FOLD_ADD_LOAD) ||
+            a->f3 || a->f7 || t == 0 || b->op != 0x03 || b->rs1 != t ||
+            b->rd == 0 || !add_load[b->f3]) {
+            return NO_FOLD;
+        }
+        alu_rr(c, add_load[b->f3], t, a->rs1, a->rs2);
+        aok_emit(&c->g, b->imm);
+        aok_emit(&c->g, rd_off(b->rd));
+        aok_emit(&c->g, (uint64_t)at << 32 | insn2);
+        return NEXT;
+    case 0x13:
+        break;
+    default:
+        return NO_FOLD;
+    }
+    if (t == 0) {
+        return NO_FOLD;
+    }
+    if (a->f3 == 1 && a->f7 >> 1 == 0) {                      /* slli */
+        unsigned sh = a->imm & 63;
+
+        if ((rv_fold_mask & FOLD_SHIFT) &&
+            b->op == 0x13 && b->f3 == 5 && b->rd == t && b->rs1 == t &&
+            !(b->imm & ~0x43f)) {
+            alu_ri_off(c, b->imm & 0x400 ? G(sll_sra) : G(sll_srl),
+                       rd_off(t), rs_off(a->rs1), sh);
+            aok_emit(&c->g, b->imm & 63);
+            return NEXT;
+        }
+        if ((rv_fold_mask & FOLD_SLL_ADD) &&
+            b->op == 0x33 && b->f3 == 0 && b->f7 == 0 && b->rd &&
+            (b->rs1 == t || b->rs2 == t)) {
+            alu_ri_off(c, G(sll_add), rd_off(t), rs_off(a->rs1), sh);
+            aok_emit(&c->g, rd_off(b->rd));
+            aok_emit(&c->g, rs_off(b->rs1 == t ? b->rs2 : b->rs1));
+            return NEXT;
+        }
+        return NO_FOLD;
+    }
+    if (b->op != 0x63) {
+        return NO_FOLD;
+    }
+    if (a->f3 == 0 && a->rs1 == 0 && (rv_fold_mask & FOLD_LI_BR)) { /* li */
+        bool t2 = b->rs2 == t && b->rs1 != t, t1 = b->rs1 == t && b->rs2 != t;
+        Gadget g = t2 ? ri[b->imm < 0][b->f3] : t1 ? ir[b->imm < 0][b->f3]
+                      : NULL;
+
+        if (!g) {
+            return NO_FOLD;
+        }
+        alu_ri_off(c, g, rd_off(t), rs_off(t2 ? b->rs1 : b->rs2), a->imm);
+        return fold_branch_ways(c, at, len2, b);
+    }
+    if (a->f3 == 7 && b->f3 <= 1 && (rv_fold_mask & FOLD_ANDI_BR) && /* andi */
+        ((b->rs1 == t && b->rs2 == 0) || (b->rs1 == 0 && b->rs2 == t))) {
+        static const Gadget andi[2][2] = {
+            { G(andi_beqz), G(andi_bnez) },
+            { G(andi_beqz_bk), G(andi_bnez_bk) },
+        };
+
+        alu_ri_off(c, andi[b->imm < 0][b->f3], rd_off(t), rs_off(a->rs1),
+                   a->imm);
+        return fold_branch_ways(c, at, len2, b);
+    }
+    return NO_FOLD;
+}
+
+/*
+ * The insn at c->off (c->insn, c->len) and the one after it, if they are one
+ * of the forms above: their gadget, offered to the pair pass as one step,
+ * and both insns' ends. NEXT or END, as for one insn; NO_FOLD, having
+ * emitted nothing, when they are not, or the second is not in the TB's page,
+ * or the TB has room for one insn more and not two.
+ */
+static int fold(Ctx *c, const uint8_t *code, unsigned left, uint64_t *start)
+{
+    RvFields a, b;
+    uint32_t insn2;
+    unsigned len2, at = c->off + c->len;
+    int r;
+
+    if (c->g.n_insns + 2 > c->g.max_insns || left < c->len + 2 ||
+        !fold_fields(c->insn, c->len, &a)) {
+        return NO_FOLD;
+    }
+    insn2 = lduw_le_p(code + at);
+    if ((insn2 & 3) != 3) {
+        len2 = 2;
+    } else if (left < c->len + 4) {
+        return NO_FOLD;
+    } else {
+        insn2 = ldl_le_p(code + at);
+        len2 = 4;
+    }
+    if (!fold_fields(insn2, len2, &b)) {
+        return NO_FOLD;
+    }
+    r = fold_emit(c, &a, &b, at, len2, insn2);
+    if (r == NO_FOLD) {
+        return NO_FOLD;
+    }
+    if (rv_pairs_on) {
+        aok_gen_pair(&c->g, start, &rv_pairs);
+    }
+    aok_gen_insn_end(&c->g, c->page_off + c->off, c->insn);
+    aok_gen_insn_end(&c->g, c->page_off + at, insn2);
+    c->off = at + len2;
+    aok_stats.folds++;
+    return r;
+}
+
 int riscv_aok_translate_code(CPUState *cs, TranslationBlock *tb,
                              int *max_insns, vaddr pc, void *host_pc)
 {
@@ -1277,14 +1613,19 @@ int riscv_aok_translate_code(CPUState *cs, TranslationBlock *tb,
         c.insn = lduw_le_p(code + c.off);
         if ((c.insn & 3) != 3) {
             c.len = 2;
-            r = insn16(&c, c.insn);
         } else if (left < 4) {
             break;
         } else {
             c.insn = ldl_le_p(code + c.off);
             c.len = 4;
-            r = insn32(&c, c.insn);
         }
+        if (rv_fold_mask && (r = fold(&c, code, left, start)) != NO_FOLD) {
+            if (r == END) {
+                break;
+            }
+            continue;
+        }
+        r = c.len == 2 ? insn16(&c, c.insn) : insn32(&c, c.insn);
         if (r == UNKNOWN) {
             c.g.p = start;
             break;

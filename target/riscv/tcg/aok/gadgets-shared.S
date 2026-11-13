@@ -199,3 +199,91 @@ f_gadget jalr_cached
     str x11, [_cpu, _sav]
     gret_ahead
     read_bullshit 32, flw, 8
+
+/*
+ * The translator's memory folds (translate.c, fold()): two insns, one
+ * gadget, each access with its own word for its fault path. iSH-AOK has the
+ * same gadgets for its own host (jit/guest-riscv64/memory.S); these are this
+ * host's.
+ *
+ * add t, ra, rb ; l<x> rd, imm(t): an indexed load.
+ * [t offset][ra offset][rb offset][imm][rd offset][the load's word].
+ * t is written before the load is tried: if it faults, the add is done, as
+ * it would be unfused.
+ */
+.macro add_load name, size, ld_insn, reg
+.gadget add_\name
+    ldp x9, x10, [_ip]          /* t, ra */
+    ldp x11, x12, [_ip, #16]    /* rb, imm */
+    ldr _sav, [_ip, #32]        /* rd */
+    add _ip, _ip, #56           /* the six operands and the next gadget */
+    ldr x10, [_cpu, x10]
+    ldr x11, [_cpu, x11]
+    add _addr, x10, x11
+    str _addr, [_cpu, x9]
+    add _addr, _addr, x12
+    read_prep \size, add_\name, 8
+    \ld_insn \reg, [_addr]
+    str x11, [_cpu, _sav]
+    gret_ahead
+    read_bullshit \size, add_\name, 8
+.endm
+add_load lb,  8,  ldrsb, x11
+add_load lbu, 8,  ldrb,  w11
+add_load lh,  16, ldrsh, x11
+add_load lhu, 16, ldrh,  w11
+add_load lw,  32, ldrsw, x11
+add_load lwu, 32, ldr,   w11
+add_load ld,  64, ldr,   x11
+
+/*
+ * Two 64-bit loads, or two 64-bit stores, off one base, back to back (ld or
+ * fld, sd or fsd: the registers are slots): the ldp and stp RV64 does not
+ * have, which prologues and epilogues spell as runs of them.
+ * [reg1 offset][base offset][imm1][word1][reg2 offset][imm2][word2].
+ * The base is read again for the second access, the first's slow path
+ * having called C; the translator refuses a first load into the base.
+ */
+.gadget ld_ld
+    ldr _sav, [_ip]             /* reg1 */
+    ldp x9, x10, [_ip, #8]      /* base, imm1 */
+    add _ip, _ip, #64           /* the seven operands and the next gadget */
+    ldr _addr, [_cpu, x9]
+    add _addr, _addr, x10
+    read_prep 64, ld_ld_1, 32
+    ldr x11, [_addr]
+    str x11, [_cpu, _sav]
+    ldur _sav, [_ip, #-32]      /* reg2 */
+    ldur x9, [_ip, #-56]        /* base */
+    ldur x10, [_ip, #-24]       /* imm2 */
+    ldr _addr, [_cpu, x9]
+    add _addr, _addr, x10
+    read_prep 64, ld_ld_2, 8
+    ldr x11, [_addr]
+    str x11, [_cpu, _sav]
+    gret_ahead
+    read_bullshit 64, ld_ld_1, 32
+    read_bullshit 64, ld_ld_2, 8
+
+.gadget sd_sd
+    ldr x9, [_ip]               /* reg1: the value */
+    ldp x10, x11, [_ip, #8]     /* base, imm1 */
+    add _ip, _ip, #64
+    ldr _sav, [_cpu, x9]
+    ldr _addr, [_cpu, x10]
+    add _addr, _addr, x11
+    write_prep 64, sd_sd_1, 32
+    str _sav, [_addr]
+    write_done 64, sd_sd_1
+    ldur x9, [_ip, #-32]        /* reg2 */
+    ldur x10, [_ip, #-56]       /* base */
+    ldur x11, [_ip, #-24]       /* imm2 */
+    ldr _sav, [_cpu, x9]
+    ldr _addr, [_cpu, x10]
+    add _addr, _addr, x11
+    write_prep 64, sd_sd_2, 8
+    str _sav, [_addr]
+    write_done 64, sd_sd_2
+    gret_ahead
+    write_bullshit 64, sd_sd_1, 32
+    write_bullshit 64, sd_sd_2, 8

@@ -129,10 +129,26 @@ static void monitor_init(Object *obj)
     mon->outbuf = g_string_new(NULL);
 }
 
+/*
+ * True while this thread emits an event to the monitors, holding
+ * monitor_lock (monitor_qapi_event_emit()). Writing to a monitor's chardev
+ * can log: a spiceport's write path does, through spice-server's g_log(),
+ * and QEMU's glib log handler reports through error_vprintf(), which asks
+ * monitor_cur() whose monitor it is. monitor_lock is not recursive, so
+ * taking it again there would deadlock the main loop, inside the event and
+ * with the command that raised it unanswered: a snapshot-load, whose job
+ * reports JOB_STATUS_CHANGE as it is created, or a cont and its RESUME.
+ * This thread has the lock already, and reads the table under it.
+ */
+static __thread bool monitor_emitting;
+
 Monitor *monitor_cur(void)
 {
     Monitor *mon;
 
+    if (monitor_emitting) {
+        return g_hash_table_lookup(coroutine_mon, qemu_coroutine_self());
+    }
     qemu_mutex_lock(&monitor_lock);
     mon = g_hash_table_lookup(coroutine_mon, qemu_coroutine_self());
     qemu_mutex_unlock(&monitor_lock);
@@ -151,13 +167,17 @@ Monitor *monitor_set_cur(Coroutine *co, Monitor *mon)
 {
     Monitor *old_monitor = monitor_cur();
 
-    qemu_mutex_lock(&monitor_lock);
+    if (!monitor_emitting) {
+        qemu_mutex_lock(&monitor_lock);
+    }
     if (mon) {
         g_hash_table_replace(coroutine_mon, co, mon);
     } else {
         g_hash_table_remove(coroutine_mon, co);
     }
-    qemu_mutex_unlock(&monitor_lock);
+    if (!monitor_emitting) {
+        qemu_mutex_unlock(&monitor_lock);
+    }
 
     return old_monitor;
 }
@@ -359,12 +379,14 @@ static void monitor_qapi_event_emit(QAPIEvent event, QDict *qdict)
     Monitor *mon;
 
     trace_monitor_protocol_event_emit(event, qdict);
+    monitor_emitting = true;
     QTAILQ_FOREACH(mon, &mon_list, entry) {
         MonitorClass *cls = MONITOR_GET_CLASS(mon);
         if (cls->emit_event) {
             cls->emit_event(mon, event, qdict);
         }
     }
+    monitor_emitting = false;
 }
 
 static void monitor_qapi_event_handler(void *opaque);

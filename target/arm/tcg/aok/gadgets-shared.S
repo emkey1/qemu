@@ -26,6 +26,15 @@
  * below save these, x8 and x17.
  */
 _addr   .req x7
+/*
+ * After a folded read_prep or write_prep (FOLD 1: the single-register loads
+ * and stores) the access is [_addr, _hoff]: the guest address and the TLB
+ * entry's addend on a hit, the addend folded into the access's own
+ * addressing as TCG's backend does; the frame's scratch word and 0 after the
+ * slow path. Unfolded (the pairs and the vector accesses, which add an
+ * immediate), _addr is the host address.
+ */
+_hoff   .req x10
 _fofs   .req x6
 _fslot1 .req x5
 _fslot2 .req x4
@@ -77,7 +86,7 @@ _fval2  .req x1
 .set A64_SLOW_ONLY, 0
 .set A64_ALIGNED, 0
 
-.macro a64_tlb_probe size, id, tag
+.macro a64_tlb_probe size, id, tag, fold=0
     .if A64_SLOW_ONLY
     b handle_miss_\id
     .else
@@ -98,22 +107,24 @@ _fval2  .req x1
     .endif
     cmp x11, x9
     b.ne handle_miss_\id
+    .if !\fold
     add _addr, _addr, x10
+    .endif
     .endif
 back_\id:
 .endm
 
-.macro read_prep size, id, ahead=0
-    a64_tlb_probe \size, \id, AOK_TLBE_READ
+.macro read_prep size, id, ahead=0, fold=0
+    a64_tlb_probe \size, \id, AOK_TLBE_READ, \fold
 .endm
-.macro write_prep size, id, ahead=0
-    a64_tlb_probe \size, \id, AOK_TLBE_WRITE
+.macro write_prep size, id, ahead=0, fold=0
+    a64_tlb_probe \size, \id, AOK_TLBE_WRITE, \fold
 .endm
 .macro write_done size, id
 .endm
 
 /* Unaligned, but inside its page and the page plain RAM: the entry's addend. */
-.macro a64_unaligned size, id
+.macro a64_unaligned size, id, fold=0
     .if \size > 8 && \size <= 64 && (A64_SLOW_ONLY + A64_ALIGNED) == 0
     and x9, _addr, #0xfff
     cmp x9, #(0x1000 - \size / 8)
@@ -123,7 +134,9 @@ back_\id:
     and x9, _addr, #0xfffffffffffff000
     cmp x11, x9
     b.ne 1f
+    .if !\fold
     add _addr, _addr, x10
+    .endif
     b back_\id
 1:
     .endif
@@ -148,16 +161,17 @@ back_\id:
     ldp x8, x17, [sp, #48]
     ldp x1, x2, [sp], #64
     add _addr, x29, #AOK_FRAME_SCRATCH
+    mov _hoff, #0
     b back_\id
 .endm
-.macro read_bullshit size, id, ahead=0
+.macro read_bullshit size, id, ahead=0, fold=0
 handle_miss_\id:
-    a64_unaligned \size, \id
+    a64_unaligned \size, \id, \fold
     a64_slow aok_a64_helper_ld, \id, \ahead
 .endm
-.macro write_bullshit size, id, ahead=0
+.macro write_bullshit size, id, ahead=0, fold=0
 handle_miss_\id:
-    a64_unaligned \size, \id
+    a64_unaligned \size, \id, \fold
     a64_slow aok_a64_helper_st, \id, \ahead
 .endm
 
@@ -285,12 +299,12 @@ f_gadget stp32_pre,  f_stp_wb, 64, 4, w17, w1, 1
     .else
     mov _addr, x10
     .endif
-    read_prep \bits, \name, 8
-    \ldinsn \reg, [_addr]
+    read_prep \bits, \name, 8, 1
+    \ldinsn \reg, [_addr, _hoff]
     str x17, [_cpu, x8]
     str _fnewb, [_cpu, _frn]
     gret_ahead
-    read_bullshit \bits, \name, 8
+    read_bullshit \bits, \name, 8, 1
 .endm
 .macro wb_store name, bits, stinsn, reg, pre
 .gadget \name
@@ -305,12 +319,12 @@ f_gadget stp32_pre,  f_stp_wb, 64, 4, w17, w1, 1
     .else
     mov _addr, x10
     .endif
-    write_prep \bits, \name, 8
-    \stinsn \reg, [_addr]
+    write_prep \bits, \name, 8, 1
+    \stinsn \reg, [_addr, _hoff]
     write_done \bits, \name
     str _fnewb, [_cpu, _frn]
     gret_ahead
-    write_bullshit \bits, \name, 8
+    write_bullshit \bits, \name, 8, 1
 .endm
 .irp pre, 0, 1
 wb_load load8_wb\pre,      8, ldrb,  w17, \pre
@@ -334,11 +348,11 @@ wb_store store64_wb\pre,  64, str,  x17, \pre
     ldp x8, x10, [_ip]
     add _ip, _ip, #40
     add _addr, _pc, x10
-    read_prep \bits, \name, 8
-    \ldinsn \reg, [_addr]
+    read_prep \bits, \name, 8, 1
+    \ldinsn \reg, [_addr, _hoff]
     str x17, [_cpu, x8]
     gret_ahead
-    read_bullshit \bits, \name, 8
+    read_bullshit \bits, \name, 8, 1
 .endm
 lit_load load32_lit, 32, ldr, w17
 lit_load load64_lit, 64, ldr, x17

@@ -112,32 +112,32 @@
     gret_ahead
 .endif
 .endm
-.macro f_read_prep last, bits, id
+.macro f_read_prep last, bits, id, fold=0
 .if \last
-    read_prep \bits, \id, 8
+    read_prep \bits, \id, 8, \fold
 .else
-    read_prep \bits, \id
+    read_prep \bits, \id, 0, \fold
 .endif
 .endm
-.macro f_write_prep last, bits, id
+.macro f_write_prep last, bits, id, fold=0
 .if \last
-    write_prep \bits, \id, 8
+    write_prep \bits, \id, 8, \fold
 .else
-    write_prep \bits, \id
+    write_prep \bits, \id, 0, \fold
 .endif
 .endm
-.macro f_read_bullshit last, bits, id
+.macro f_read_bullshit last, bits, id, fold=0
 .if \last
-    read_bullshit \bits, \id, 8
+    read_bullshit \bits, \id, 8, \fold
 .else
-    read_bullshit \bits, \id
+    read_bullshit \bits, \id, 0, \fold
 .endif
 .endm
-.macro f_write_bullshit last, bits, id
+.macro f_write_bullshit last, bits, id, fold=0
 .if \last
-    write_bullshit \bits, \id, 8
+    write_bullshit \bits, \id, 8, \fold
 .else
-    write_bullshit \bits, \id
+    write_bullshit \bits, \id, 0, \fold
 .endif
 .endm
 
@@ -375,13 +375,13 @@
     f_ip_past \last
     f_src 10, x9, \fn        // base
     add _addr, x10, _fofs
-    f_read_prep \last, \bits, \id
-    \ldinsn \reg, [_addr]
+    f_read_prep \last, \bits, \id, 1
+    \ldinsn \reg, [_addr, _hoff]
     str x17, [_cpu, x8]       // full X store: 32-bit loads must clear the upper half
     f_end_ahead \last
 .endm
 .macro f_load_stub id, last, bits, ldinsn, reg, a4, a5, fn=_, fm=_
-    f_read_bullshit \last, \bits, \id
+    f_read_bullshit \last, \bits, \id, 1
 .endm
 
 // [rt_slot][rn_slot][offset][orig_ip]: bits, stinsn, reg
@@ -392,13 +392,13 @@
     f_src 10, x9, \fm        // base (before the value: a forward may come in x17)
     f_src 17, x8, \fn        // value (x17 survives write_prep's helpers)
     add _addr, x10, _fofs
-    f_write_prep \last, \bits, \id
-    \stinsn \reg, [_addr]
+    f_write_prep \last, \bits, \id, 1
+    \stinsn \reg, [_addr, _hoff]
     write_done \bits, \id     // clobbers x9 — rt_slot already consumed
     f_end_ahead \last
 .endm
 .macro f_store_stub id, last, bits, stinsn, reg, a4, a5, fn=_, fm=_
-    f_write_bullshit \last, \bits, \id
+    f_write_bullshit \last, \bits, \id, 1
 .endm
 
 // Register-offset form: the index register extended (0: none, 1: sxtw,
@@ -423,13 +423,13 @@
     f_src 10, x9, \fn
     rx_index \ext, \fm, x13
     add _addr, x10, x11
-    f_read_prep \last, \bits, \id
-    \ldinsn \reg, [_addr]
+    f_read_prep \last, \bits, \id, 1
+    \ldinsn \reg, [_addr, _hoff]
     str x17, [_cpu, x8]
     f_end_ahead \last
 .endm
 .macro f_load_rx_stub id, last, bits, ldinsn, reg, ext, a5, fn=_, fm=_
-    f_read_bullshit \last, \bits, \id
+    f_read_bullshit \last, \bits, \id, 1
 .endm
 
 .macro f_store_rx_body id, last, bits, stinsn, reg, ext, a5, fn=_, fm=_
@@ -440,13 +440,13 @@
     rx_index \ext, _, x13
     add _addr, x10, x11
     f_src 17, x8, \fn        // value
-    f_write_prep \last, \bits, \id
-    \stinsn \reg, [_addr]
+    f_write_prep \last, \bits, \id, 1
+    \stinsn \reg, [_addr, _hoff]
     write_done \bits, \id
     f_end_ahead \last
 .endm
 .macro f_store_rx_stub id, last, bits, stinsn, reg, ext, a5, fn=_, fm=_
-    f_write_bullshit \last, \bits, \id
+    f_write_bullshit \last, \bits, \id, 1
 .endm
 
 // Pairs, offset form. [rt_slot | rt2_slot<<16][rn_slot][offset][orig_ip]:

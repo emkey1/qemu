@@ -1232,6 +1232,10 @@ static int insn16(Ctx *c, uint32_t insn)
  *   add t, ra, rb ; l<x> rd, imm(t)             add_l<x>
  *   ld/fld, ld/fld off one base                 ld_ld
  *   sd/fsd, sd/fsd off one base                 sd_sd
+ *   auipc t, hi ; addi t, t, lo                 pcrel (one delta)
+ *   auipc t, hi ; l<x>/fld rd, lo(t)            pcrel_l<x> (new)
+ *   auipc t, hi ; s<x>/fsw/fsd rs2, lo(t)       pcrel_s<x> (new)
+ *   lui t, hi ; addi/addiw t, t, lo             mov_const (one constant)
  *
  * The last three are this host's own gadgets (gadgets-shared.S). Every
  * register the two write is written, in order, so the result is the unfused
@@ -1242,7 +1246,7 @@ static int insn16(Ctx *c, uint32_t insn)
 enum { NO_FOLD = -1 };
 enum {
     FOLD_SHIFT = 1, FOLD_SLL_ADD = 2, FOLD_LI_BR = 4, FOLD_ANDI_BR = 8,
-    FOLD_ADD_LOAD = 16, FOLD_MEM_PAIR = 32,
+    FOLD_ADD_LOAD = 16, FOLD_MEM_PAIR = 32, FOLD_PC_CONST = 64, FOLD_PC_MEM = 128,
 };
 
 #define DECL_BR_CONST(n) DECL(n##_ri) DECL(n##_ri_bk)
@@ -1255,6 +1259,9 @@ DECL(andi_beqz) DECL(andi_bnez) DECL(andi_beqz_bk) DECL(andi_bnez_bk)
 DECL(add_lb) DECL(add_lh) DECL(add_lw) DECL(add_ld)
 DECL(add_lbu) DECL(add_lhu) DECL(add_lwu)
 DECL(ld_ld) DECL(sd_sd)
+DECL(pcrel_lb) DECL(pcrel_lh) DECL(pcrel_lw) DECL(pcrel_ld)
+DECL(pcrel_lbu) DECL(pcrel_lhu) DECL(pcrel_lwu)
+DECL(pcrel_sb) DECL(pcrel_sh) DECL(pcrel_sw) DECL(pcrel_sd)
 
 /* An insn's fields, as far as a fold looks at them. */
 typedef struct RvFields {
@@ -1295,10 +1302,20 @@ static bool fold_fields(uint32_t insn, unsigned len, RvFields *f)
                  13) :
             f->op == 0x23 || f->op == 0x27 ?
             sext((insn >> 25) << 5 | ((insn >> 7) & 31), 12) :
+            f->op == 0x17 || f->op == 0x37 ? sext(insn & 0xfffff000, 32) :
             sext(insn >> 20, 12);
         return true;
     }
     switch ((insn & 3) << 3 | ((insn >> 13) & 7)) {
+    case 1 << 3 | 0: /* c.addi */
+    case 1 << 3 | 1: /* c.addiw */
+        *f = (RvFields){ .op = (insn >> 13) & 1 ? 0x1b : 0x13, .rd = r,
+                         .rs1 = r, .imm = sext(imm6, 6) };
+        return r != 0;
+    case 1 << 3 | 3: /* c.lui (rd 2 is c.addi16sp) */
+        *f = (RvFields){ .op = 0x37, .rd = r,
+                         .imm = sext((uint64_t)imm6 << 12, 18) };
+        return r != 0 && r != 2 && imm6 != 0;
     case 0 << 3 | 1: /* c.fld */
     case 0 << 3 | 3: /* c.ld */
         *f = (RvFields){ .op = (insn >> 14) & 1 ? 0x03 : 0x07, .f3 = 3,
@@ -1411,6 +1428,72 @@ static int fold_mem_pair(Ctx *c, const RvFields *a, const RvFields *b,
     return NEXT;
 }
 
+/*
+ * auipc or lui into t, and an insn after it that takes t: addi/addiw back into
+ * t (one constant, or one pc delta), or, for auipc, a load or store through t
+ * (pcrel_l<x>, pcrel_s<x>, which write t first).
+ */
+static int fold_upper(Ctx *c, const RvFields *a, const RvFields *b,
+                      unsigned at, uint32_t insn2)
+{
+    static const Gadget loads[8] = {
+        G(pcrel_lb), G(pcrel_lh), G(pcrel_lw), G(pcrel_ld),
+        G(pcrel_lbu), G(pcrel_lhu), G(pcrel_lwu), NULL,
+    };
+    static const Gadget stores[4] = {
+        G(pcrel_sb), G(pcrel_sh), G(pcrel_sw), G(pcrel_sd),
+    };
+    unsigned t = a->rd;
+    int64_t delta = (int64_t)c->off + a->imm;
+    bool same = b->rd == t && b->rs1 == t && b->f3 == 0;
+    Gadget g = NULL;
+    uint64_t slot = 0;
+
+    if ((rv_fold_mask & FOLD_PC_CONST) && same &&
+        (b->op == 0x13 || (b->op == 0x1b && a->op == 0x37))) {
+        if (a->op == 0x37) {
+            int64_t v = a->imm + b->imm;
+
+            return li(c, t, b->op == 0x1b ? (int64_t)(int32_t)v : v);
+        }
+        aok_emit_gadget(&c->g, G(pcrel));
+        aok_emit(&c->g, rd_off(t));
+        aok_emit(&c->g, delta + b->imm);
+        return NEXT;
+    }
+    if (a->op != 0x17 || !(rv_fold_mask & FOLD_PC_MEM) || b->rs1 != t) {
+        return NO_FOLD;
+    }
+    switch (b->op) {
+    case 0x03:
+        g = loads[b->f3];
+        slot = rd_off(b->rd);
+        break;
+    case 0x07:                                                /* fld */
+        g = b->f3 == 3 && c->has_fd ? G(pcrel_ld) : NULL;
+        slot = fpr_off(b->rd);
+        break;
+    case 0x23:
+        g = b->f3 < 4 ? stores[b->f3] : NULL;
+        slot = rs_off(b->rs2);
+        break;
+    case 0x27:                                                /* fsw, fsd */
+        g = (b->f3 == 2 || b->f3 == 3) && c->has_fd ? stores[b->f3] : NULL;
+        slot = fpr_off(b->rs2);
+        break;
+    }
+    if (!g) {
+        return NO_FOLD;
+    }
+    aok_emit_gadget(&c->g, g);
+    aok_emit(&c->g, rd_off(t));
+    aok_emit(&c->g, delta);
+    aok_emit(&c->g, slot);
+    aok_emit(&c->g, b->imm);
+    aok_emit(&c->g, (uint64_t)at << 32 | insn2);
+    return NEXT;
+}
+
 static int fold_emit(Ctx *c, const RvFields *a, const RvFields *b,
                      unsigned at, unsigned len2, uint32_t insn2)
 {
@@ -1433,6 +1516,9 @@ static int fold_emit(Ctx *c, const RvFields *a, const RvFields *b,
     unsigned t = a->rd;
 
     switch (a->op) {
+    case 0x17:                                                /* auipc */
+    case 0x37:                                                /* lui */
+        return t ? fold_upper(c, a, b, at, insn2) : NO_FOLD;
     case 0x03: case 0x07: case 0x23: case 0x27:
         if (!(rv_fold_mask & FOLD_MEM_PAIR)) {
             return NO_FOLD;

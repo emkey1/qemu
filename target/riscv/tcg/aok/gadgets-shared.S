@@ -287,3 +287,55 @@ add_load ld,  64, ldr,   x11
     gret_ahead
     write_bullshit 64, sd_sd_1, 32
     write_bullshit 64, sd_sd_2, 8
+
+/*
+ * auipc t, hi ; l<x> rd, lo(t) and s<x> rs2, lo(t): a global's load or store
+ * (the translator's fold). t = the TB's entry pc + delta (the auipc's distance
+ * from it, plus hi), written first, then the access at t + lo, with the
+ * access's own word, so that a fault is the load's or store's, with t written
+ * as it would be unfused. rd and rs2 may be FP registers' slots (fld, fsd).
+ * [t offset][delta][rd offset | rs2 offset][lo][the access's word].
+ * The value is read after t is written (sd t, lo(t) stores the new t).
+ */
+.macro pcrel_load name, size, ld_insn, reg
+.gadget pcrel_\name
+    ldp x9, x10, [_ip]          /* t, delta */
+    ldp x11, x12, [_ip, #16]    /* rd, lo */
+    add _ip, _ip, #48           /* the five operands and the next gadget */
+    add _addr, _pc, x10
+    str _addr, [_cpu, x9]
+    add _addr, _addr, x12
+    mov _sav, x11
+    read_prep \size, pcrel_\name, 8
+    \ld_insn \reg, [_addr]
+    str x11, [_cpu, _sav]
+    gret_ahead
+    read_bullshit \size, pcrel_\name, 8
+.endm
+pcrel_load lb,  8,  ldrsb, x11
+pcrel_load lbu, 8,  ldrb,  w11
+pcrel_load lh,  16, ldrsh, x11
+pcrel_load lhu, 16, ldrh,  w11
+pcrel_load lw,  32, ldrsw, x11
+pcrel_load lwu, 32, ldr,   w11
+pcrel_load ld,  64, ldr,   x11
+
+.macro pcrel_store name, size, st_insn, reg
+.gadget pcrel_\name
+    ldp x9, x10, [_ip]          /* t, delta */
+    ldp x11, x12, [_ip, #16]    /* rs2, lo */
+    add _ip, _ip, #48
+    add _addr, _pc, x10
+    str _addr, [_cpu, x9]
+    ldr _sav, [_cpu, x11]
+    add _addr, _addr, x12
+    write_prep \size, pcrel_\name, 8
+    \st_insn \reg, [_addr]
+    write_done \size, pcrel_\name
+    gret_ahead
+    write_bullshit \size, pcrel_\name, 8
+.endm
+pcrel_store sb, 8,  strb, _savw
+pcrel_store sh, 16, strh, _savw
+pcrel_store sw, 32, str,  _savw
+pcrel_store sd, 64, str,  _sav

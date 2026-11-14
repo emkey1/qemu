@@ -271,14 +271,13 @@ f_nostub b
 // (the bodies only: memory.S's load_gadget emits the gadgets)
 .macro def_load name, size, lid, ld_insn, reg
 .macro f_\name\()_body id, last, fn=_, fm=_, res=0
-    ldr _sav, [_ip]           // rd_off (kept across prep)
-    ldr x9, [_ip, #8]         // rs1_off
+    ldp _sav, x9, [_ip]       // rd_off (kept across prep), rs1_off
     ldr x10, [_ip, #16]       // imm
     f_ip_past \last, 4       // 3 params + the host's word
     f_src_r _addr, x9, \fn
     add _addr, _addr, x10     // effective address
     f_read_prep \last, \size, \id
-    \ld_insn \reg, [_addr]
+    \ld_insn \reg, [_addr, _hoff]
     str x11, [_cpu, _sav]
     f_res \res, x11
     f_end_ahead \last
@@ -298,15 +297,14 @@ def_load ld,  64, rvld,  ldr,   x11
 // (`lid`: the old label id, unused -- the labels take the body's own `id`)
 .macro def_store name, size, lid, st_insn, reg
 .macro f_\name\()_body id, last, fn=_, fm=_, res=0
-    ldr x9, [_ip]             // rs2_off (value)
-    ldr x10, [_ip, #8]        // rs1_off (base)
+    ldp x9, x10, [_ip]        // rs2_off (value), rs1_off (base)
     ldr x11, [_ip, #16]       // imm
     f_ip_past \last, 4
     f_src_r _sav, x9, \fn    // the value, kept across prep
     f_src_r _addr, x10, \fm
     add _addr, _addr, x11
     f_write_prep \last, \size, \id
-    \st_insn \reg, [_addr]
+    \st_insn \reg, [_addr, _hoff]
     write_done \size, \id
     f_end_ahead \last
 .endm

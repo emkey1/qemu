@@ -34,6 +34,13 @@ SYM(aok_gadget_rv_\name):
 _addr   .req x7
 _sav    .req x6
 _savw   .req w6
+/*
+ * After read_prep or write_prep the access is [_addr, _hoff]: the guest
+ * address and the TLB entry's addend on a hit (the add folded into the
+ * load's or store's own addressing, as TCG's backend does), the frame's
+ * scratch word and 0 after the slow path.
+ */
+_hoff   .req x10
 
 /* The dispatch of a body that has already moved _ip past the next word. */
 .macro gret_ahead
@@ -76,7 +83,6 @@ _savw   .req w6
     .endif
     cmp x11, x9
     b.ne handle_miss_\id
-    add _addr, _addr, x10
 back_\id:
 .endm
 
@@ -103,6 +109,7 @@ handle_miss_\id:
     ldr _sav, [sp], #16
     str x0, [x29, #AOK_FRAME_SCRATCH]
     add _addr, x29, #AOK_FRAME_SCRATCH
+    mov _hoff, #0
     b back_\id
 .endm
 .macro write_bullshit size, id, ahead=0
@@ -116,6 +123,7 @@ handle_miss_\id:
     add x3, _pc, x3, lsr #32
     bl SYM(aok_rv_helper_store\size)
     add _addr, x29, #AOK_FRAME_SCRATCH
+    mov _hoff, #0
     b back_\id
 .endm
 
@@ -194,7 +202,7 @@ f_gadget jalr_cached
     ldr _addr, [_cpu, x9]
     add _addr, _addr, x10
     read_prep 32, flw, 8
-    ldr w11, [_addr]
+    ldr w11, [_addr, _hoff]
     orr x11, x11, #0xffffffff00000000
     str x11, [_cpu, _sav]
     gret_ahead
@@ -223,7 +231,7 @@ f_gadget jalr_cached
     str _addr, [_cpu, x9]
     add _addr, _addr, x12
     read_prep \size, add_\name, 8
-    \ld_insn \reg, [_addr]
+    \ld_insn \reg, [_addr, _hoff]
     str x11, [_cpu, _sav]
     gret_ahead
     read_bullshit \size, add_\name, 8
@@ -251,7 +259,7 @@ add_load ld,  64, ldr,   x11
     ldr _addr, [_cpu, x9]
     add _addr, _addr, x10
     read_prep 64, ld_ld_1, 32
-    ldr x11, [_addr]
+    ldr x11, [_addr, _hoff]
     str x11, [_cpu, _sav]
     ldur _sav, [_ip, #-32]      /* reg2 */
     ldur x9, [_ip, #-56]        /* base */
@@ -259,7 +267,7 @@ add_load ld,  64, ldr,   x11
     ldr _addr, [_cpu, x9]
     add _addr, _addr, x10
     read_prep 64, ld_ld_2, 8
-    ldr x11, [_addr]
+    ldr x11, [_addr, _hoff]
     str x11, [_cpu, _sav]
     gret_ahead
     read_bullshit 64, ld_ld_1, 32
@@ -273,7 +281,7 @@ add_load ld,  64, ldr,   x11
     ldr _addr, [_cpu, x10]
     add _addr, _addr, x11
     write_prep 64, sd_sd_1, 32
-    str _sav, [_addr]
+    str _sav, [_addr, _hoff]
     write_done 64, sd_sd_1
     ldur x9, [_ip, #-32]        /* reg2 */
     ldur x10, [_ip, #-56]       /* base */
@@ -282,7 +290,7 @@ add_load ld,  64, ldr,   x11
     ldr _addr, [_cpu, x10]
     add _addr, _addr, x11
     write_prep 64, sd_sd_2, 8
-    str _sav, [_addr]
+    str _sav, [_addr, _hoff]
     write_done 64, sd_sd_2
     gret_ahead
     write_bullshit 64, sd_sd_1, 32
@@ -307,7 +315,7 @@ add_load ld,  64, ldr,   x11
     add _addr, _addr, x12
     mov _sav, x11
     read_prep \size, pcrel_\name, 8
-    \ld_insn \reg, [_addr]
+    \ld_insn \reg, [_addr, _hoff]
     str x11, [_cpu, _sav]
     gret_ahead
     read_bullshit \size, pcrel_\name, 8
@@ -330,7 +338,7 @@ pcrel_load ld,  64, ldr,   x11
     ldr _sav, [_cpu, x11]
     add _addr, _addr, x12
     write_prep \size, pcrel_\name, 8
-    \st_insn \reg, [_addr]
+    \st_insn \reg, [_addr, _hoff]
     write_done \size, pcrel_\name
     gret_ahead
     write_bullshit \size, pcrel_\name, 8

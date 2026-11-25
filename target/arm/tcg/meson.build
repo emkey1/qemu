@@ -40,8 +40,10 @@ if get_option('tcg_threaded_interpreter') or \
   a64_rcg_gadgets = custom_target('a64-rcg-gadgets',
                                   output: ['a64-rcg-table.c.inc',
                                            'a64-rcg.decode',
-                                           'rcg_gadgets_add.c',
-                                           'rcg_gadgets_sub.c'],
+                                           'rcg_gadgets_addsub.c',
+                                           'rcg_gadgets_logic.c',
+                                           'rcg_gadgets_move.c',
+                                           'rcg_gadgets_mul.c'],
                                   input: files('rcg-gen.py'),
                                   depend_files: [rcg_core, tcti_memory,
                                                  files('a64.decode')],
@@ -57,7 +59,8 @@ if get_option('tcg_threaded_interpreter') or \
                                    '@OUTPUT@'])
   arm_system_ss.add(when: ['CONFIG_TCG', 'TARGET_AARCH64'],
                     if_true: [a64_rcg_gadgets[0], a64_rcg_gadgets[2],
-                              a64_rcg_gadgets[3], a64_rcg_decode])
+                              a64_rcg_gadgets[3], a64_rcg_gadgets[4],
+                              a64_rcg_gadgets[5], a64_rcg_decode])
 endif
 arm_stubs_ss.add(files('stubs32.c'))
 

@@ -30,8 +30,11 @@ every gadget (see rcg_core.check_coverage()):
     rcg-gen.py --gadgets DIR
     rcg-gen.py --coverage ordered|plain NM TRACE...
 
-There are gadgets for ADD, ADDS, SUB and SUBS of an immediate and of a
-shifted register. Everything else is left to TCG.
+There are gadgets for the integer data processing instructions between
+registers: the adds and subtracts, the logical operations, the moves of
+constants, the bitfield moves and EXTR, the shifts, the multiplies and
+divides, and the bit and byte reversals and counts. Everything else is
+left to TCG.
 """
 
 import argparse
@@ -57,128 +60,290 @@ from rcg_core import w  # noqa: E402
 
 # A register is an operand word: the env offset of its xregs[] slot. Slot 31
 # is SP, which only the forms that take SP name. Where register 31 is XZR
-# there is no word: a form that reads it has a variant that reads zero, and
-# one that writes it has a variant that writes nothing (FLAGS, ZEROS).
+# there is no word: a form that often reads it has a variant that reads
+# zero, one that often writes it under S has a variant that writes only
+# NZCV, and the rest are left to TCG.
 WIDTHS = (32, 64)
 
 # The operand words, in the translator's order: the destination register,
-# the first and second source registers, an immediate, and a shift amount.
-WORD_NAMES = ("d", "n", "m", "imm", "sa")
+# the first, second and third source registers, an immediate, a mask, and
+# two shift amounts.
+WORD_NAMES = ("d", "n", "m", "a", "imm", "mask", "sa", "sa2")
 
 # The operand words that always fit in 32 bits, signed: env offsets and
-# shift amounts. imm may not.
-NARROW_WORDS = ("d", "n", "m", "sa")
+# shift amounts. imm and mask may not.
+NARROW_WORDS = ("d", "n", "m", "a", "sa", "sa2")
 
 # What an instruction does with NZCV and its result: neither S nor a
 # compare ("none"), an S form ("set"), or an S form with XZR as its
-# destination, which writes only NZCV ("only": CMP and CMN).
+# destination, which writes only NZCV ("only": CMP, CMN and TST).
 FLAGS = ("none", "set", "only")
 
 # How a shifted-register form shifts its second source: not at all, which
-# is any shift by 0, or by the "sa" word.
-SHIFTS = ("none", "lsl", "lsr", "asr")
+# is any shift by 0, or by the "sa" word. Add and subtract have no ROR.
+SHIFTS = ("none", "lsl", "lsr", "asr", "ror")
 
 # Which source of a shifted-register form is XZR: neither, the first
-# ("n": NEG and NEGS) or the second ("m"), which no shift changes.
+# ("n": NEG, NEGS, MOV and MVN) or the second ("m"), which no shift
+# changes.
 ZEROS = ("none", "n", "m")
+
+# How an extended-register add or subtract extends its second source: not
+# at all (UXTX and SXTX, and at 32 bits UXTW and SXTW too), or from 8, 16
+# or 32 bits, without or with sign.
+EXTENDS = ("none", "ub", "uh", "uw", "sb", "sh", "sw")
+
+# The logical operations; each also has a form that inverts its second
+# source (BIC, ORN and EON).
+LOGICS = ("and", "orr", "eor")
+
+# Which of a bitfield move's two shifts it needs (see bitfield_body()).
+BITFIELDS = ("both", "first", "second")
+
+# The multiply-adds, by what they multiply: 64-bit registers, 32-bit
+# registers, or 32-bit registers extended to 64, with sign or without.
+MULS = ("x", "w", "sl", "ul")
+
+# The operations on one register.
+UNARIES = ("rbit", "rev16", "rev32", "rev64", "clz", "cls")
 
 # The patterns of a64.decode that a64-rcg.decode copies, each with the
 # translator's trans_rcg_<name>().
 PATTERNS = ("ADD_i", "ADDS_i", "SUB_i", "SUBS_i",
-            "ADD_r", "ADDS_r", "SUB_r", "SUBS_r")
+            "ADD_r", "ADDS_r", "SUB_r", "SUBS_r",
+            "ADD_ext", "ADDS_ext", "SUB_ext", "SUBS_ext",
+            "ADC", "ADCS", "SBC", "SBCS",
+            "AND_i", "ORR_i", "EOR_i", "ANDS_i",
+            "AND_r", "ORR_r", "EOR_r", "ANDS_r",
+            "MOVN", "MOVZ", "MOVK", "ADR", "ADRP",
+            "SBFM", "BFM", "UBFM", "EXTR",
+            "LSLV", "LSRV", "ASRV", "RORV", "UDIV", "SDIV",
+            "MADD_w", "MSUB_w", "MADD_x", "MSUB_x",
+            "SMADDL", "SMSUBL", "UMADDL", "UMSUBL", "SMULH", "UMULH",
+            "RBIT", "REV16", "REV32", "REV64", "CLZ", "CLS")
 
 # The translator's tables of gadgets, by kind: each index's name and the
-# values it takes, a number of them or the tuple that names them.
+# values it takes, a number of them or the tuple that names them. A kind
+# with no index has one gadget.
 TABLES = {
     "addsub_i": (("sub", 2), ("sf", 2), ("flags", FLAGS)),
     "addsub_r": (("sub", 2), ("sf", 2), ("flags", FLAGS),
                  ("shift", SHIFTS), ("zero", ZEROS)),
+    "addsub_x": (("sub", 2), ("sf", 2), ("flags", FLAGS),
+                 ("extend", EXTENDS)),
+    "adc": (("sub", 2), ("sf", 2), ("set", 2)),
+    "logic_i": (("op", LOGICS), ("sf", 2), ("flags", FLAGS)),
+    "logic_r": (("op", LOGICS), ("inv", 2), ("sf", 2), ("flags", FLAGS),
+                ("shift", SHIFTS), ("zn", 2)),
+    "mov_i": (),
+    "movk": (),
+    "adr": (),
+    "bitfield": (("signed", 2), ("sf", 2), ("shifts", BITFIELDS)),
+    "bfm": (("sf", 2),),
+    "extr": (("sf", 2), ("ror", 2)),
+    "shiftv": (("shift", SHIFTS), ("sf", 2)),
+    "div": (("signed", 2), ("sf", 2)),
+    "muladd": (("mul", MULS), ("sub", 2), ("za", 2)),
+    "mulh": (("signed", 2),),
+    "unary": (("op", UNARIES), ("sf", 2)),
 }
 
 # The tuples that become enums in the table, with their prefixes.
-ENUMS = (("FLAGS", FLAGS), ("SHIFT", SHIFTS), ("ZERO", ZEROS))
+ENUMS = (("FLAGS", FLAGS), ("SHIFT", SHIFTS), ("ZERO", ZEROS),
+         ("EXTEND", EXTENDS), ("LOGIC", LOGICS), ("BITFIELD", BITFIELDS),
+         ("MUL", MULS), ("UNARY", UNARIES))
+
+# The gadget source files, by kind, split so they compile in parallel.
+# Must match target/arm/tcg/meson.build.
+KIND_FILES = {
+    "addsub_i": "addsub", "addsub_r": "addsub", "addsub_x": "addsub",
+    "adc": "addsub",
+    "logic_i": "logic", "logic_r": "logic",
+    "mov_i": "move", "movk": "move", "adr": "move", "bitfield": "move",
+    "bfm": "move", "extr": "move", "shiftv": "move", "unary": "move",
+    "div": "mul", "muladd": "mul", "mulh": "mul",
+}
+GADGET_FILES = ("addsub", "logic", "move", "mul")
 
 
 class Spec:
-    """ One gadget: ADD or SUB (sub) of an immediate (kind addsub_i) or of
-    a shifted register (addsub_r), at 32 or 64 bits (width), with what it
-    does with NZCV and its result (flags), and for a register form its
-    shift and which source is XZR (zero). """
+    """ One gadget: its kind, which picks its body and its table, its
+    name, its operand words in the translator's order, its place in the
+    kind's table, a value for each index of TABLES, and whatever else its
+    body needs to know, as attributes. """
 
     ordered = False
     accesses_memory = False
     has_table = False
 
-    def __init__(self, kind, sub, width, flags, shift="none", zero="none"):
+    def __init__(self, kind, name, words, index, **attrs):
         self.kind = kind
-        self.sub = sub
-        self.width = width
-        self.flags = flags
-        self.shift = shift
-        self.zero = zero
-
-    @property
-    def mnemonic(self):
-        """ The A64 mnemonic, with CMP and CMN for the forms that write
-        only NZCV. """
-        if self.flags == "only":
-            return "cmp" if self.sub else "cmn"
-        return ("sub" if self.sub else "add") + \
-            ("s" if self.flags == "set" else "")
-
-    @property
-    def name(self):
-        if self.kind == "addsub_i":
-            form = "i"
-        else:
-            form = "r" if self.shift == "none" else self.shift
-            if self.zero != "none":
-                form += "_z" + self.zero
-        return f"{self.mnemonic}_{form}_{self.width}"
-
-    @property
-    def words(self):
-        """ The gadget's operand words, in the translator's order. """
-        words = [] if self.flags == "only" else ["d"]
-        if self.kind == "addsub_i":
-            return words + ["n", "imm"]
-        if self.zero != "n":
-            words.append("n")
-        if self.zero != "m":
-            words.append("m")
-        if self.shift != "none":
-            words.append("sa")
-        return words
+        self.name = name
+        self.words = list(words)
+        self.index = list(index)
+        self.__dict__.update(attrs)
 
     @property
     def stream(self):
         """ The stream words, from rcg_core.stream_words(). """
         return rcg_core.stream_words(self.words, NARROW_WORDS)
 
-    @property
-    def index(self):
-        """ Where the gadget is in its kind's table: a value for each index
-        of TABLES. """
-        index = [int(self.sub), WIDTHS.index(self.width),
-                 FLAGS.index(self.flags)]
-        if self.kind == "addsub_r":
-            index += [SHIFTS.index(self.shift), ZEROS.index(self.zero)]
-        return index
+
+def addsub_name(sub, flags):
+    """ The mnemonic of an add or subtract, with CMN and CMP for the forms
+    that write only NZCV. """
+    if flags == "only":
+        return "cmp" if sub else "cmn"
+    return ("sub" if sub else "add") + ("s" if flags == "set" else "")
 
 
-def specs():
-    """ Every gadget. A shifted XZR is still zero, so the second source is
-    XZR only without a shift, and a form with both sources XZR is left to
-    TCG. """
+def addsub_specs():
+    """ ADD, ADDS, SUB and SUBS of an immediate, a shifted register and an
+    extended register, and ADC, ADCS, SBC and SBCS. A shifted XZR is still
+    zero, so the second source is XZR only without a shift, and a form
+    with both sources XZR is left to TCG. """
     for sub in (False, True):
         for width in WIDTHS:
+            sf = WIDTHS.index(width)
             for flags in FLAGS:
-                yield Spec("addsub_i", sub, width, flags)
-                for shift in SHIFTS:
+                f = FLAGS.index(flags)
+                d = [] if flags == "only" else ["d"]
+                name = addsub_name(sub, flags)
+                yield Spec("addsub_i", f"{name}_i_{width}", d + ["n", "imm"],
+                           (sub, sf, f), sub=sub, width=width, flags=flags)
+                for shift in SHIFTS[:4]:
                     for zero in ZEROS:
                         if zero == "m" and shift != "none":
                             continue
-                        yield Spec("addsub_r", sub, width, flags, shift, zero)
+                        form = "r" if shift == "none" else shift
+                        if zero != "none":
+                            form += "_z" + zero
+                        words = d + [r for r in "nm" if r != zero] + \
+                            (["sa"] if shift != "none" else [])
+                        yield Spec("addsub_r", f"{name}_{form}_{width}", words,
+                                   (sub, sf, f, SHIFTS.index(shift),
+                                    ZEROS.index(zero)),
+                                   sub=sub, width=width, flags=flags,
+                                   shift=shift, zero=zero)
+                for extend in EXTENDS:
+                    if width == 32 and extend in ("uw", "sw"):
+                        continue
+                    yield Spec("addsub_x", f"{name}_x{extend}_{width}",
+                               d + ["n", "m", "sa"],
+                               (sub, sf, f, EXTENDS.index(extend)),
+                               sub=sub, width=width, flags=flags,
+                               extend=extend)
+            for setflags in (False, True):
+                name = ("sbc" if sub else "adc") + ("s" if setflags else "")
+                yield Spec("adc", f"{name}_{width}", ("d", "n", "m"),
+                           (sub, sf, setflags), sub=sub, width=width,
+                           flags="set" if setflags else "none")
+
+
+def logic_name(op, inv, flags):
+    """ The mnemonic of a logical operation: BIC, ORN and EON invert the
+    second source, ANDS and BICS set NZCV. """
+    name = {"and": "bic", "orr": "orn", "eor": "eon"}[op] if inv else op
+    return name + ("s" if flags != "none" else "")
+
+
+def logic_specs():
+    """ AND, ORR, EOR and ANDS of an immediate, and those and BIC, ORN, EON
+    and BICS of a shifted register. Only AND has S forms. ORR and ORN of
+    XZR and an unshifted register are MOV and MVN ("zn"). """
+    for op in LOGICS:
+        o = LOGICS.index(op)
+        for width in WIDTHS:
+            sf = WIDTHS.index(width)
+            for flags in FLAGS if op == "and" else FLAGS[:1]:
+                f = FLAGS.index(flags)
+                d = [] if flags == "only" else ["d"]
+                only = "_only" if flags == "only" else ""
+                yield Spec("logic_i",
+                           f"{logic_name(op, False, flags)}_i{only}_{width}",
+                           d + ["n", "imm"], (o, sf, f),
+                           op=op, inv=False, width=width, flags=flags)
+                for inv in (False, True):
+                    name = logic_name(op, inv, flags)
+                    for shift in SHIFTS:
+                        form = "r" if shift == "none" else shift
+                        yield Spec("logic_r", f"{name}_{form}{only}_{width}",
+                                   d + ["n", "m"] +
+                                   (["sa"] if shift != "none" else []),
+                                   (o, inv, sf, f, SHIFTS.index(shift), 0),
+                                   op=op, inv=inv, width=width, flags=flags,
+                                   shift=shift, zn=False)
+                    if op == "orr":
+                        yield Spec("logic_r", f"{name}_r_zn_{width}",
+                                   ("d", "m"), (o, inv, sf, f, 0, 1),
+                                   op=op, inv=inv, width=width, flags=flags,
+                                   shift="none", zn=True)
+
+
+def move_specs():
+    """ The moves: a constant to a register (MOVZ, MOVN, and ORR of XZR and
+    an immediate), MOVK, ADR and ADRP, the bitfield moves SBFM, UBFM and
+    BFM with every alias they have, EXTR with ROR, the shifts by a
+    register, and the operations on one register. """
+    yield Spec("mov_i", "mov_i", ("d", "imm"), ())
+    yield Spec("movk", "movk", ("d", "imm", "mask"), ())
+    yield Spec("adr", "adr", ("d", "imm"), ())
+    for width in WIDTHS:
+        sf = WIDTHS.index(width)
+        for signed in (False, True):
+            for shifts in BITFIELDS:
+                words = ["d", "n"] + (["sa"] if shifts != "second" else []) + \
+                    (["sa2"] if shifts != "first" else [])
+                yield Spec("bitfield",
+                           f"{'sbfm' if signed else 'ubfm'}_{shifts}_{width}",
+                           words, (signed, sf, BITFIELDS.index(shifts)),
+                           signed=signed, width=width, shifts=shifts)
+        yield Spec("bfm", f"bfm_{width}", ("d", "n", "sa", "mask"), (sf,),
+                   width=width)
+        yield Spec("extr", f"extr_{width}", ("d", "n", "m", "sa", "sa2"),
+                   (sf, 0), width=width, ror=False)
+        yield Spec("extr", f"ror_i_{width}", ("d", "m", "sa"), (sf, 1),
+                   width=width, ror=True)
+        for shift in SHIFTS[1:]:
+            yield Spec("shiftv", f"{shift}v_{width}", ("d", "n", "m"),
+                       (SHIFTS.index(shift), sf), width=width, shift=shift)
+        for op in UNARIES:
+            if op == "rev64" and width == 32:
+                continue
+            yield Spec("unary", f"{op}_{width}", ("d", "n"),
+                       (UNARIES.index(op), sf), width=width, op=op)
+
+
+def mul_specs():
+    """ UDIV and SDIV; MADD and MSUB of X and of W registers, and SMADDL,
+    SMSUBL, UMADDL and UMSUBL, each also with XZR as the register added to
+    or subtracted from ("za": MUL, MNEG, SMULL, SMNEGL, UMULL and UMNEGL);
+    and SMULH and UMULH. """
+    for signed in (False, True):
+        for width in WIDTHS:
+            yield Spec("div", f"{'sdiv' if signed else 'udiv'}_{width}",
+                       ("d", "n", "m"), (signed, WIDTHS.index(width)),
+                       signed=signed, width=width)
+    for mul in MULS:
+        for sub in (False, True):
+            for za in (False, True):
+                name = {"x": "m", "w": "m", "sl": "sm", "ul": "um"}[mul] + \
+                    ("sub" if sub else "add") + ("l" if "l" in mul else "") + \
+                    ("_za" if za else "") + ("_32" if mul == "w" else "")
+                yield Spec("muladd", name,
+                           ["d", "n", "m"] + ([] if za else ["a"]),
+                           (MULS.index(mul), sub, za), mul=mul, sub=sub, za=za)
+    for signed in (False, True):
+        yield Spec("mulh", "smulh" if signed else "umulh", ("d", "n", "m"),
+                   (signed,), signed=signed, width=64)
+
+
+def specs():
+    """ Every gadget. """
+    yield from addsub_specs()
+    yield from logic_specs()
+    yield from move_specs()
+    yield from mul_specs()
 
 
 #
@@ -202,13 +367,13 @@ class Body(rcg_core.Body):
         self.emit(f"str {value}, [{self.env}, {self.word(word)}]")
 
     def write_nzcv(self):
-        """ The guest's NZCV from the host's, as the ADDS or SUBS before
+        """ The guest's NZCV from the host's, as the instruction before
         this left them. env holds each flag in a 32-bit field of which only
         this much means anything: bit 31 of NF and VF, whether ZF is 0,
         which says that Z is set, and CF, 0 or 1. So NF is the host's NZCV
         itself, whose bit 31 is N, VF is that shifted to put V there, and
         ZF and CF are CSETs. The fields are together in env, CF first. It
-        uses ADDR, A, B and T. """
+        uses ADDR, A, B, R and T. """
         self.emit(f"mrs {T}, nzcv",
                   f"cset {w(A)}, cs",
                   f"lsl {w(B)}, {w(T)}, #3",
@@ -217,10 +382,25 @@ class Body(rcg_core.Body):
                   f"stp {w(A)}, {w(B)}, [{R}]",
                   f"stp {w(T)}, {w(ADDR)}, [{R}, #8]")
 
+    def read_carry(self):
+        """ The host's C from the guest's: CF is 0 or 1, and comparing it
+        with 1 sets C exactly when it is 1. It uses T. """
+        self.emit(f"ldr {w(T)}, [{self.env}, %[cf]]",
+                  f"cmp {w(T)}, #1")
+
 
 def reg(x, width):
     """ The view of x register x that a body at width computes in. """
     return x if width == 64 else w(x)
+
+
+def finish(g, spec):
+    """ The end of a body that has its result in R and, for an S form, the
+    host's NZCV set from it. """
+    if spec.flags != "only":
+        g.write_reg(R, "d")
+    if spec.flags != "none":
+        g.write_nzcv()
 
 
 def addsub_body(g, spec):
@@ -229,12 +409,26 @@ def addsub_body(g, spec):
     host's W form leaves the upper half of its result zero and sets NZCV
     from the low half, both as the guest's does. A shift is the host's
     variable one, which takes its amount modulo the width, as the
-    translator requires it to be below the width already. """
+    translator requires it to be below the width already. An extended
+    register is extended from its low 8, 16 or 32 bits, then shifted left
+    by 0 to 4, as TCG's ext_and_shift_reg() does. """
     width = spec.width
     a, b, r = reg(A, width), reg(B, width), reg(R, width)
     if spec.kind == "addsub_i":
         g.read_reg(A, "n")
         b = reg(g.word("imm"), width)
+    elif spec.kind == "addsub_x":
+        g.read_reg(A, "n")
+        g.read_reg(B, "m")
+        if spec.extend != "none":
+            signed, size = spec.extend[0] == "s", spec.extend[1]
+            if signed:
+                g.emit(f"sxt{size} {b}, {w(B)}")
+            elif size == "w":
+                g.emit(f"mov {w(B)}, {w(B)}")
+            else:
+                g.emit(f"uxt{size} {w(B)}, {w(B)}")
+        g.emit(f"lsl {b}, {b}, {reg(g.word('sa'), width)}")
     else:
         if spec.zero == "n":
             a = reg("xzr", width)
@@ -248,15 +442,190 @@ def addsub_body(g, spec):
             g.emit(f"{spec.shift} {b}, {b}, {reg(g.word('sa'), width)}")
     op = ("sub" if spec.sub else "add") + ("" if spec.flags == "none" else "s")
     g.emit(f"{op} {r}, {a}, {b}")
-    if spec.flags != "only":
-        g.write_reg(R, "d")
-    if spec.flags != "none":
-        g.write_nzcv()
+    finish(g, spec)
+
+
+def adc_body(g, spec):
+    """ ADC, ADCS, SBC and SBCS: the host's own, after its C is set from
+    the guest's CF. """
+    width = spec.width
+    g.read_reg(A, "n")
+    g.read_reg(B, "m")
+    g.read_carry()
+    op = ("sbc" if spec.sub else "adc") + ("" if spec.flags == "none" else "s")
+    g.emit(f"{op} {reg(R, width)}, {reg(A, width)}, {reg(B, width)}")
+    finish(g, spec)
+
+
+def logic_body(g, spec):
+    """ The logical operations: the host's own. ANDS and BICS leave the
+    host's C and V clear, as the guest's are after them. MOV and MVN,
+    which are ORR and ORN of XZR, are the host's too. """
+    width = spec.width
+    a, b, r = reg(A, width), reg(B, width), reg(R, width)
+    if spec.kind == "logic_i":
+        g.read_reg(A, "n")
+        b = reg(g.word("imm"), width)
+    else:
+        if spec.zn:
+            a = reg("xzr", width)
+        else:
+            g.read_reg(A, "n")
+        g.read_reg(B, "m")
+        if spec.shift != "none":
+            g.emit(f"{spec.shift} {b}, {b}, {reg(g.word('sa'), width)}")
+    g.emit(f"{logic_name(spec.op, spec.inv, spec.flags)} {r}, {a}, {b}")
+    finish(g, spec)
+
+
+def mov_i_body(g, spec):
+    """ A constant, which the translator works out, to a register. """
+    g.write_reg(g.word("imm"), "d")
+
+
+def movk_body(g, spec):
+    """ MOVK: the register with the bits of mask cleared, then those of imm
+    set. At 32 bits the mask has the upper half too. """
+    g.read_reg(A, "d")
+    g.emit(f"bic {A}, {A}, {g.word('mask')}",
+           f"orr {A}, {A}, {g.word('imm')}")
+    g.write_reg(A, "d")
+
+
+def adr_body(g, spec):
+    """ ADR and ADRP under CF_PCREL: env's pc plus what the translator
+    works out, as gen_pc_plus_diff() adds. """
+    g.emit(f"ldr {A}, [{g.env}, %[pc]]",
+           f"add {A}, {A}, {g.word('imm')}")
+    g.write_reg(A, "d")
+
+
+def bitfield_body(g, spec):
+    """ SBFM and UBFM, whatever alias they are: a shift left by sa, then a
+    shift right by sa2, arithmetic for SBFM, both at the guest's width.
+    With the width less one less imms as the first amount, and that plus
+    immr, modulo the width, as the second, the two shifts are an extract
+    (imms >= immr) or an insert into zeros, and the host takes each amount
+    modulo the width itself. A bitfield move with one amount zero has a
+    gadget without that shift: LSL, and LSR and ASR. """
+    width = spec.width
+    a = reg(A, width)
+    g.read_reg(A, "n")
+    if spec.shifts != "second":
+        g.emit(f"lsl {a}, {a}, {reg(g.word('sa'), width)}")
+    if spec.shifts != "first":
+        g.emit(f"{'asr' if spec.signed else 'lsr'} {a}, {a}, "
+               f"{reg(g.word('sa2'), width)}")
+    g.write_reg(A, "d")
+
+
+def bfm_body(g, spec):
+    """ BFM: the source rotated right by immr at the guest's width, which
+    puts the field where it goes for both of BFM's cases, then those bits
+    of the destination replaced. The translator works out the mask of the
+    bits that change. """
+    width = spec.width
+    a, b, mask = reg(A, width), reg(B, width), reg(g.word("mask"), width)
+    g.read_reg(A, "n")
+    g.read_reg(B, "d")
+    g.emit(f"ror {a}, {a}, {reg(g.word('sa'), width)}",
+           f"and {a}, {a}, {mask}",
+           f"bic {b}, {b}, {mask}",
+           f"orr {b}, {b}, {a}")
+    g.write_reg(B, "d")
+
+
+def extr_body(g, spec):
+    """ EXTR: the second source shifted right by sa, with the first
+    shifted left by sa2, the width less sa, above it. With both sources
+    the same register it is ROR. An EXTR by 0 is left to TCG. """
+    width = spec.width
+    a, b, r = reg(A, width), reg(B, width), reg(R, width)
+    g.read_reg(B, "m")
+    if spec.ror:
+        g.emit(f"ror {r}, {b}, {reg(g.word('sa'), width)}")
+    else:
+        g.read_reg(A, "n")
+        g.emit(f"lsr {b}, {b}, {reg(g.word('sa'), width)}",
+               f"lsl {a}, {a}, {reg(g.word('sa2'), width)}",
+               f"orr {r}, {a}, {b}")
+    g.write_reg(R, "d")
+
+
+def binary_body(g, spec, insn):
+    """ The host's insn on two registers at the guest's width. """
+    width = spec.width
+    g.read_reg(A, "n")
+    g.read_reg(B, "m")
+    g.emit(f"{insn} {reg(R, width)}, {reg(A, width)}, {reg(B, width)}")
+    g.write_reg(R, "d")
+
+
+def shiftv_body(g, spec):
+    """ LSLV, LSRV, ASRV and RORV: the host's, which also takes the amount
+    modulo the width. """
+    binary_body(g, spec, spec.shift)
+
+
+def div_body(g, spec):
+    """ UDIV and SDIV: the host's, which also gives 0 for a division by 0
+    and the dividend for the one signed division that overflows. """
+    binary_body(g, spec, "sdiv" if spec.signed else "udiv")
+
+
+def muladd_body(g, spec):
+    """ The multiply-adds: the host's own. """
+    wide = spec.mul != "w"
+    r = R if wide else w(R)
+    a, b = (A, B) if spec.mul == "x" else (w(A), w(B))
+    prefix = {"x": "", "w": "", "sl": "s", "ul": "u"}[spec.mul]
+    suffix = "l" if "l" in spec.mul else ""
+    g.read_reg(A, "n")
+    g.read_reg(B, "m")
+    if spec.za:
+        insn = prefix + ("mneg" if spec.sub else "mul") + suffix
+        g.emit(f"{insn} {r}, {a}, {b}")
+    else:
+        g.read_reg(T, "a")
+        insn = prefix + ("msub" if spec.sub else "madd") + suffix
+        g.emit(f"{insn} {r}, {a}, {b}, {T if wide else w(T)}")
+    g.write_reg(R, "d")
+
+
+def mulh_body(g, spec):
+    """ SMULH and UMULH: the host's. """
+    binary_body(g, spec, "smulh" if spec.signed else "umulh")
+
+
+def unary_body(g, spec):
+    """ RBIT, REV16, REV32, REV64, CLZ and CLS: the host's. REV32 at 32
+    bits is REV of a W register, and REV64 is REV of an X register. """
+    width = spec.width
+    insn = "rev" if spec.op == "rev64" or (spec.op, width) == ("rev32", 32) \
+        else spec.op
+    g.read_reg(A, "n")
+    g.emit(f"{insn} {reg(R, width)}, {reg(A, width)}")
+    g.write_reg(R, "d")
 
 
 BODIES = {
     "addsub_i": addsub_body,
     "addsub_r": addsub_body,
+    "addsub_x": addsub_body,
+    "adc": adc_body,
+    "logic_i": logic_body,
+    "logic_r": logic_body,
+    "mov_i": mov_i_body,
+    "movk": movk_body,
+    "adr": adr_body,
+    "bitfield": bitfield_body,
+    "bfm": bfm_body,
+    "extr": extr_body,
+    "shiftv": shiftv_body,
+    "div": div_body,
+    "muladd": muladd_body,
+    "mulh": mulh_body,
+    "unary": unary_body,
 }
 
 # The "i" asm operands the bodies use, which the C compiler works out from
@@ -266,6 +635,7 @@ BODY_OPERANDS = {
     **rcg_core.MEMORY_OPERANDS,
     **rcg_core.HARNESS_OPERANDS,
     "cf": "offsetof(CPUARMState, CF)",
+    "pc": "offsetof(CPUARMState, pc)",
 }
 
 # What the bodies take for granted of QEMU's definitions, beyond what their
@@ -278,6 +648,9 @@ BODY_ASSUMPTIONS = (
     "offsetof(CPUARMState, ZF) != offsetof(CPUARMState, CF) + 12",
     # and reaches them with an ADD immediate.
     "offsetof(CPUARMState, CF) > 4095",
+    # read_carry() and adr_body() load from env with an immediate offset.
+    "offsetof(CPUARMState, CF) % 4 || offsetof(CPUARMState, pc) % 8",
+    "offsetof(CPUARMState, pc) > 32760",
 )
 
 
@@ -377,7 +750,7 @@ def check():
     for spec in specs():
         assert spec.name not in names, spec.name
         names.add(spec.name)
-        place = (spec.kind, *spec.index)
+        place = (spec.kind, *map(int, spec.index))
         assert place not in places, spec.name
         places.add(place)
         sizes = [n if isinstance(n, int) else len(n)
@@ -392,15 +765,6 @@ def check():
 #
 # TCTI's gadgets, and the translator's table of them.
 #
-
-# The gadget source files, split so they compile in parallel.
-# Must match target/arm/tcg/meson.build.
-GADGET_FILES = ("add", "sub")
-
-
-def gadget_file(spec):
-    return "sub" if spec.sub else "add"
-
 
 def write_table(all_specs, out):
     """ The translator's gadget tables: for each kind of TABLES, an array
@@ -418,15 +782,18 @@ def write_table(all_specs, out):
         p(f"void rcg_gadget_{spec.name}(void);")
     p("")
     for kind, indices in TABLES.items():
-        p(f"/* Indexed by {', '.join(name for name, _ in indices)}. */")
+        if indices:
+            p(f"/* Indexed by {', '.join(name for name, _ in indices)}. */")
         dims = "".join(f"[{n}]" if isinstance(n, int)
                        else f"[{len(n)}]" for _, n in indices)
         p(f"static const RCGGadget rcg_{kind}{dims} = {{")
         for spec in all_specs:
             if spec.kind == kind:
-                place = "".join(f"[{i}]" for i in spec.index)
+                place = "".join(f"[{int(i)}]" for i in spec.index)
                 words = ", ".join(f"RCG_W_{w.upper()}" for w in spec.words)
-                p(f"    {place} = {{ rcg_gadget_{spec.name}, {{ {words} }} }},")
+                entry = f"rcg_gadget_{spec.name}, {{ {words} }}"
+                p(f"    {place} = {{ {entry} }}," if place else
+                  f"    {entry}")
         p("};\n")
 
 
@@ -437,7 +804,7 @@ def write_gadgets(outdir):
     all_specs = list(specs())
     instructions = rcg_core.write_gadgets(
         outdir, GADGET_FILES, ("cpu.h",), BODY_OPERANDS,
-        ((gadget_file(spec), spec.name, body(spec, harness))
+        ((KIND_FILES[spec.kind], spec.name, body(spec, harness))
          for spec in all_specs))
     with open(os.path.join(outdir, "a64-rcg-table.c.inc"), "w") as out:
         write_table(all_specs, out)
@@ -455,22 +822,33 @@ def write_gadgets(outdir):
 class Case:
     """ One test case: an instruction, as its encoding (word) and what to
     call it (name), and the registers that take the values tested, a and
-    b, of which 31 is SP; -1 for none. """
+    b, of which 31 is SP; -1 for none. adr is the register an ADR or ADRP
+    writes, from whose value the test takes the instruction's address, or
+    for ADRP (page) its page's, so that the result does not depend on where
+    the test was linked. """
 
-    def __init__(self, name, word, a=-1, b=-1):
+    def __init__(self, name, word, a=-1, b=-1, adr=-1, page=False):
         self.name = name
         self.word = word
         self.a = a
         self.b = b
+        self.adr = adr
+        self.page = page
 
 
-def reg_name(n, width, sp):
+def reg_name(n, width, sp=False):
     """ Register n at width as an instruction names it, with 31 as SP if sp
     and else as XZR. """
     if n == 31:
         return {(64, True): "sp", (32, True): "wsp",
                 (64, False): "xzr", (32, False): "wzr"}[width, sp]
     return ("x" if width == 64 else "w") + str(n)
+
+
+def roles(rn, rm):
+    """ The registers that take the two values, for an instruction that
+    reads rn and rm as registers, where 31 is XZR: each once. """
+    return (rn if rn != 31 else -1, rm if rm not in (31, rn) else -1)
 
 
 # The destination and source of an immediate form, with 31 and the same
@@ -504,44 +882,352 @@ def addsub_imm_cases():
                             yield Case(name, word, a=rn)
 
 
-# The destination and sources of a shifted-register form, with 31, which is
-# XZR, in each place, and registers repeated.
-SHIFT_REGS = ((0, 1, 2), (0, 0, 0), (1, 1, 2), (2, 1, 2), (0, 1, 31),
-              (0, 31, 2), (31, 1, 2), (31, 31, 2), (31, 1, 31), (0, 31, 31),
-              (30, 29, 28))
+# The destination and sources of a form between registers, with 31, which
+# is XZR, in each place, and registers repeated.
+REGS3 = ((0, 1, 2), (0, 0, 0), (1, 1, 2), (2, 1, 2), (0, 1, 31),
+         (0, 31, 2), (31, 1, 2), (31, 31, 2), (31, 1, 31), (0, 31, 31),
+         (30, 29, 28))
+SHIFT_NAMES = ("lsl", "lsr", "asr", "ror")
+
+
+def names3(regs, width):
+    return ", ".join(reg_name(r, width) for r in regs)
 
 
 def addsub_shift_cases():
     """ ADD, ADDS, SUB and SUBS of a shifted register: every value of sf,
     op, S and the shift type that is allocated (ROR is not), by amounts
-    from 0 to the most the width allows, over SHIFT_REGS. Those that write
+    from 0 to the most the width allows, over REGS3. Those that write
     XZR without S, and those with both sources XZR, are TCG's. """
     for sf in (0, 1):
         width = 64 if sf else 32
         for op in (0, 1):
             for s in (0, 1):
-                for st, shift in enumerate(("lsl", "lsr", "asr")):
+                for st in range(3):
                     for sa in ((0, 1, width - 1) if st == 0 else
                                (0, 3, width - 1)):
-                        for rd, rn, rm in SHIFT_REGS:
+                        for rd, rn, rm in REGS3:
                             name = (f"{'sub' if op else 'add'}"
                                     f"{'s' if s else ''} "
-                                    f"{reg_name(rd, width, False)}, "
-                                    f"{reg_name(rn, width, False)}, "
-                                    f"{reg_name(rm, width, False)}, "
-                                    f"{shift} #{sa}")
+                                    f"{names3((rd, rn, rm), width)}, "
+                                    f"{SHIFT_NAMES[st]} #{sa}")
                             word = (sf << 31 | op << 30 | s << 29 |
                                     0b01011 << 24 | st << 22 | rm << 16 |
                                     sa << 10 | rn << 5 | rd)
-                            a = rn if rn != 31 else -1
-                            b = rm if rm not in (31, rn) else -1
+                            a, b = roles(rn, rm)
                             yield Case(name, word, a=a, b=b)
+
+
+EXTEND_NAMES = ("uxtb", "uxth", "uxtw", "uxtx", "sxtb", "sxth", "sxtw", "sxtx")
+
+# The destination and sources of an extended-register form: 31 is SP as
+# the first source, and as the destination without S, and XZR as the
+# second source.
+EXTEND_REGS = ((0, 1, 2), (1, 1, 2), (0, 31, 2), (31, 1, 2), (31, 31, 2),
+               (0, 1, 31), (30, 29, 28))
+
+
+def addsub_extend_cases():
+    """ ADD, ADDS, SUB and SUBS of an extended register: every value of sf,
+    op, S and the extension, shifted by 0 over EXTEND_REGS and by 1 and 4
+    over two of them. Those with XZR as the second source are TCG's. """
+    for sf in (0, 1):
+        width = 64 if sf else 32
+        for op in (0, 1):
+            for s in (0, 1):
+                for option in range(8):
+                    for sa in (0, 1, 4):
+                        for rd, rn, rm in (EXTEND_REGS if sa == 0 else
+                                           EXTEND_REGS[:1] + EXTEND_REGS[2:3]):
+                            name = (f"{'sub' if op else 'add'}"
+                                    f"{'s' if s else ''} "
+                                    f"{reg_name(rd, width, not s)}, "
+                                    f"{reg_name(rn, width, True)}, "
+                                    f"{reg_name(rm, width)}, "
+                                    f"{EXTEND_NAMES[option]} #{sa}")
+                            word = (sf << 31 | op << 30 | s << 29 |
+                                    0b01011001 << 21 | rm << 16 |
+                                    option << 13 | sa << 10 | rn << 5 | rd)
+                            yield Case(name, word, a=rn,
+                                       b=rm if rm not in (31, rn) else -1)
+
+
+def carry_cases():
+    """ ADC, ADCS, SBC and SBCS: every value of sf, op and S over REGS3.
+    The starts give them each value of C. Those with XZR in any place are
+    TCG's. """
+    for sf in (0, 1):
+        width = 64 if sf else 32
+        for op in (0, 1):
+            for s in (0, 1):
+                for rd, rn, rm in REGS3:
+                    name = (f"{'sbc' if op else 'adc'}{'s' if s else ''} "
+                            f"{names3((rd, rn, rm), width)}")
+                    word = (sf << 31 | op << 30 | s << 29 |
+                            0b11010000 << 21 | rm << 16 | rn << 5 | rd)
+                    a, b = roles(rn, rm)
+                    yield Case(name, word, a=a, b=b)
+
+
+def logic_imm(n, immr, imms):
+    """ The value of a logical immediate, as logic_imm_decode_wmask()
+    works it out: a run of imms + 1 ones in an element whose size n and
+    imms give, rotated right by immr, in every element of 64 bits. """
+    length = ((n << 6) | (~imms & 0x3f)).bit_length() - 1
+    assert length >= 1
+    e = 1 << length
+    s, r = imms & (e - 1), immr & (e - 1)
+    assert s != e - 1
+    mask = (1 << (s + 1)) - 1
+    mask = ((mask >> r) | (mask << (e - r))) & ((1 << e) - 1)
+    return sum(mask << i for i in range(0, 64, e))
+
+
+LOGIC_NAMES = ("and", "orr", "eor", "ands")
+
+# Logical immediates, as N, immr and imms: one bit, a byte, all but the top
+# bit, the top bit, a run across the top, and repeating patterns with
+# elements of 2, 8 and 16 bits. Those of N = 1 need 64 bits.
+LOGIC_IMMS = ((0, 0, 0), (0, 0, 7), (0, 0, 30), (0, 1, 0), (0, 28, 3),
+              (0, 0, 0b111100), (0, 4, 0b110011), (0, 8, 0b100111),
+              (1, 0, 0), (1, 0, 7), (1, 0, 62), (1, 1, 0), (1, 60, 3))
+
+# The destination and source of a logical immediate form. 31 is XZR as
+# the source and as ANDS's destination, and SP as the others'.
+LOGIC_IMM_REGS = ((0, 1), (2, 2), (31, 1), (0, 31), (30, 29))
+
+
+def logic_imm_cases():
+    """ AND, ORR, EOR and ANDS of an immediate: every value of sf and opc,
+    over LOGIC_IMMS and LOGIC_IMM_REGS. ORR and EOR of XZR are moves of the
+    immediate, which have the constant's gadget, and AND and ANDS of XZR
+    are TCG's. """
+    for sf in (0, 1):
+        width = 64 if sf else 32
+        for opc in range(4):
+            for n, immr, imms in LOGIC_IMMS:
+                if n > sf:
+                    continue
+                imm = logic_imm(n, immr, imms) & ((1 << width) - 1)
+                for rd, rn in LOGIC_IMM_REGS:
+                    name = (f"{LOGIC_NAMES[opc]} "
+                            f"{reg_name(rd, width, opc != 3)}, "
+                            f"{reg_name(rn, width)}, #{imm:#x}")
+                    word = (sf << 31 | opc << 29 | 0b100100 << 23 | n << 22 |
+                            immr << 16 | imms << 10 | rn << 5 | rd)
+                    yield Case(name, word, a=rn if rn != 31 else -1)
+
+
+# The destination and sources of a logical shifted-register form.
+LOGIC_REGS = ((0, 1, 2), (0, 0, 0), (1, 1, 2), (0, 31, 2), (31, 1, 2),
+              (0, 1, 31), (30, 29, 28), (30, 31, 28))
+
+
+def logic_shift_cases():
+    """ AND, ORR, EOR and ANDS of a shifted register, and BIC, ORN, EON and
+    BICS: every value of sf, opc, N and the shift type, by amounts from 0
+    to the most the width allows, over LOGIC_REGS. MOV and MVN, which are
+    ORR and ORN of XZR and a register that is not shifted, have gadgets;
+    the other forms that read XZR, and those that write it without S, are
+    TCG's. """
+    for sf in (0, 1):
+        width = 64 if sf else 32
+        for opc in range(4):
+            for n in (0, 1):
+                mnemonic = (("bic", "orn", "eon", "bics")[opc] if n
+                            else LOGIC_NAMES[opc])
+                for st in range(4):
+                    for sa in ((0, 3, width - 1) if st == 0 else
+                               (3, width - 1)):
+                        for regs in LOGIC_REGS:
+                            rd, rn, rm = regs
+                            name = (f"{mnemonic} {names3(regs, width)}, "
+                                    f"{SHIFT_NAMES[st]} #{sa}")
+                            word = (sf << 31 | opc << 29 | 0b01010 << 24 |
+                                    st << 22 | n << 21 | rm << 16 |
+                                    sa << 10 | rn << 5 | rd)
+                            a, b = roles(rn, rm)
+                            yield Case(name, word, a=a, b=b)
+
+
+def move_wide_cases():
+    """ MOVN, MOVZ and MOVK: every value of sf, opc and hw that is
+    allocated, with three immediates, to two registers and XZR. MOVK
+    keeps the rest of its register, which takes the values. Those to XZR
+    are TCG's. """
+    for sf in (0, 1):
+        width = 64 if sf else 32
+        for opc, mnemonic in ((0, "movn"), (2, "movz"), (3, "movk")):
+            for hw in range(4 if sf else 2):
+                for imm in (0, 0xffff, 0x1234):
+                    for rd in (0, 30, 31):
+                        name = (f"{mnemonic} {reg_name(rd, width)}, "
+                                f"#{imm:#x}, lsl #{hw * 16}")
+                        word = (sf << 31 | opc << 29 | 0b100101 << 23 |
+                                hw << 21 | imm << 5 | rd)
+                        yield Case(name, word,
+                                   a=rd if opc == 3 and rd != 31 else -1)
+
+
+def pc_relative_cases():
+    """ ADR and ADRP, with offsets of 0, a word each way and the furthest
+    each way, to two registers and XZR, which is TCG's. """
+    for op, mnemonic in ((0, "adr"), (1, "adrp")):
+        for imm in (0, 4, -4, 0xfffff, -0x100000):
+            for rd in (0, 30, 31):
+                name = f"{mnemonic} {reg_name(rd, 64)}, {imm:+#x}"
+                word = (op << 31 | (imm & 3) << 29 | 0b10000 << 24 |
+                        ((imm >> 2) & 0x7ffff) << 5 | rd)
+                yield Case(name, word, adr=rd if rd != 31 else -1,
+                           page=bool(op))
+
+
+# The destination and source of a form with one source.
+REGS2 = ((0, 1), (2, 2), (0, 31), (31, 1), (30, 29))
+
+
+def bitfield_pairs(width):
+    """ immr and imms for a bitfield move at width: the extracts and the
+    inserts, with each of their edges, and every alias: the extensions,
+    and the shifts by 1, by 4 and by all but one bit. """
+    top = width - 1
+    pairs = [(0, 0), (0, 7), (0, 15), (0, top), (1, top), (top, top),
+             (4, 11), (11, 4), (top, 0), (1, 0), (width - 4, top - 4),
+             (0, top - 1), (top, top - 1), (4, top)]
+    if width == 64:
+        pairs += [(0, 31), (32, 63), (32, 31), (33, 0)]
+    return pairs
+
+
+def bitfield_cases():
+    """ SBFM, BFM and UBFM: every value of sf and opc over
+    bitfield_pairs() and REGS2. BFM keeps the rest of its destination,
+    which takes the second value. Those that read or write XZR are TCG's.
+    """
+    for sf in (0, 1):
+        width = 64 if sf else 32
+        for opc, mnemonic in enumerate(("sbfm", "bfm", "ubfm")):
+            for immr, imms in bitfield_pairs(width):
+                for rd, rn in REGS2:
+                    name = (f"{mnemonic} {reg_name(rd, width)}, "
+                            f"{reg_name(rn, width)}, #{immr}, #{imms}")
+                    word = (sf << 31 | opc << 29 | 0b100110 << 23 | sf << 22 |
+                            immr << 16 | imms << 10 | rn << 5 | rd)
+                    b = rd if opc == 1 and rd not in (31, rn) else -1
+                    yield Case(name, word, a=rn if rn != 31 else -1, b=b)
+
+
+# The destination and sources of EXTR, with the sources the same register,
+# which makes it ROR, among them.
+EXTR_REGS = ((0, 1, 2), (0, 1, 1), (0, 0, 0), (1, 1, 2), (2, 1, 2),
+             (0, 31, 2), (0, 1, 31), (31, 1, 2), (30, 29, 28))
+
+
+def extract_cases():
+    """ EXTR: both values of sf, from bit 0, which is TCG's, bit 1, bit 13
+    and the top bit, over EXTR_REGS. Those that read or write XZR are
+    TCG's. """
+    for sf in (0, 1):
+        width = 64 if sf else 32
+        for imm in (0, 1, 13, width - 1):
+            for regs in EXTR_REGS:
+                rd, rn, rm = regs
+                name = f"extr {names3(regs, width)}, #{imm}"
+                word = (sf << 31 | 0b100111 << 23 | sf << 22 | rm << 16 |
+                        imm << 10 | rn << 5 | rd)
+                a, b = roles(rn, rm)
+                yield Case(name, word, a=a, b=b)
+
+
+def two_source_cases():
+    """ UDIV, SDIV, LSLV, LSRV, ASRV and RORV: both values of sf over
+    REGS3. The values divide by 0 and overflow the signed division. Those
+    that read or write XZR are TCG's. """
+    for opcode, mnemonic in ((0b000010, "udiv"), (0b000011, "sdiv"),
+                             (0b001000, "lslv"), (0b001001, "lsrv"),
+                             (0b001010, "asrv"), (0b001011, "rorv")):
+        for sf in (0, 1):
+            width = 64 if sf else 32
+            for regs in REGS3:
+                rd, rn, rm = regs
+                name = f"{mnemonic} {names3(regs, width)}"
+                word = (sf << 31 | 0b11010110 << 21 | rm << 16 |
+                        opcode << 10 | rn << 5 | rd)
+                a, b = roles(rn, rm)
+                yield Case(name, word, a=a, b=b)
+
+
+def one_source_cases():
+    """ RBIT, REV16, REV32, REV64, CLZ and CLS: each value of sf that is
+    allocated, over REGS2. Those that read or write XZR are TCG's. """
+    for opcode, mnemonic in enumerate(("rbit", "rev16", "rev32", "rev64",
+                                       "clz", "cls")):
+        for sf in (0, 1):
+            if mnemonic == "rev64" and not sf:
+                continue
+            width = 64 if sf else 32
+            for rd, rn in REGS2:
+                name = (f"{mnemonic} {reg_name(rd, width)}, "
+                        f"{reg_name(rn, width)}")
+                word = (sf << 31 | 1 << 30 | 0b11010110 << 21 |
+                        opcode << 10 | rn << 5 | rd)
+                yield Case(name, word, a=rn if rn != 31 else -1)
+
+
+# The destination, the two registers multiplied and the one added to, with
+# XZR as the last, which makes MUL and its like, among them.
+REGS4 = ((0, 1, 2, 3), (0, 1, 2, 31), (0, 0, 0, 0), (1, 1, 2, 1),
+         (0, 1, 1, 31), (0, 31, 2, 3), (0, 1, 31, 3), (31, 1, 2, 3),
+         (30, 29, 28, 27))
+
+
+def multiply_cases():
+    """ MADD and MSUB at both widths, SMADDL, SMSUBL, UMADDL and UMSUBL,
+    over REGS4, with the values in the registers multiplied and, once
+    more, in the one added to; and SMULH and UMULH over REGS3. Those that
+    read XZR to multiply, or write it, are TCG's. """
+    for sf, op31, prefix, suffix in ((0, 0, "m", ""), (1, 0, "m", ""),
+                                     (1, 1, "sm", "l"), (1, 5, "um", "l")):
+        width = 64 if sf else 32
+        for o0 in (0, 1):
+            mnemonic = prefix + ("sub" if o0 else "add") + suffix
+            for regs in REGS4:
+                rd, rn, rm, ra = regs
+                srcs = 32 if suffix else width
+                name = (f"{mnemonic} {reg_name(rd, width)}, "
+                        f"{reg_name(rn, srcs)}, {reg_name(rm, srcs)}, "
+                        f"{reg_name(ra, width)}")
+                word = (sf << 31 | 0b11011 << 24 | op31 << 21 | rm << 16 |
+                        o0 << 15 | ra << 10 | rn << 5 | rd)
+                a, b = roles(rn, rm)
+                yield Case(name, word, a=a, b=b)
+                if regs == REGS4[0]:
+                    yield Case(name + " (addend)", word, a=ra, b=rn)
+    for op31, mnemonic in ((2, "smulh"), (6, "umulh")):
+        for regs in REGS3:
+            rd, rn, rm = regs
+            name = f"{mnemonic} {names3(regs, 64)}"
+            word = (1 << 31 | 0b11011 << 24 | op31 << 21 | rm << 16 |
+                    31 << 10 | rn << 5 | rd)
+            a, b = roles(rn, rm)
+            yield Case(name, word, a=a, b=b)
 
 
 def insn_cases():
     """ The cases of rcg-insns. """
     yield from addsub_imm_cases()
     yield from addsub_shift_cases()
+    yield from addsub_extend_cases()
+    yield from carry_cases()
+    yield from logic_imm_cases()
+    yield from logic_shift_cases()
+    yield from move_wide_cases()
+    yield from pc_relative_cases()
+    yield from bitfield_cases()
+    yield from extract_cases()
+    yield from two_source_cases()
+    yield from one_source_cases()
+    yield from multiply_cases()
 
 
 def write_cases(cases, out, prefix):
@@ -552,7 +1238,8 @@ def write_cases(cases, out, prefix):
         return ()
 
     def row(name, c):
-        return f'"{c.name}", {c.word:#010x}, {c.a}, {c.b}'
+        return (f'"{c.name}", {c.word:#010x}, {c.a}, {c.b}, {c.adr}, '
+                f'{int(c.page)}')
 
     rcg_core.write_cases(cases, out, prefix, define, row)
 

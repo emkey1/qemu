@@ -10,7 +10,9 @@
  * the neighbors that are left to TCG. Each runs over every pair of values
  * from rcg_values (or each single value, where it takes one operand), from
  * every start in rcg_starts. X0 to X30, SP and NZCV after it are hashed,
- * and a case prints its hash.
+ * and a case prints its hash. What ADR or ADRP wrote is hashed as its
+ * distance from the instruction, or from the instruction's page, so that
+ * the hash does not depend on where the test was linked.
  *
  * rcg-insns.ref holds TCG's hashes. To regenerate it after rcg-gen.py
  * changes the cases, run the test under TCG (in a build with TCTI, with
@@ -36,6 +38,11 @@ static uint64_t run(const struct rcg_case *c)
 
                 rcg_setup(c, rcg_values[x], rcg_values[y], &rcg_starts[s]);
                 rcg_run_insn();
+                if (c->adr >= 0) {
+                    uint64_t pc = (uint64_t)rcg_insn_slot;
+
+                    rcg_out.x[c->adr] -= c->page ? pc & ~0xffful : pc;
+                }
                 nzcv = rcg_out.nzcv & RCG_NZCV;
                 h = rcg_hash(h, rcg_out.x, sizeof(rcg_out.x));
                 h = rcg_hash(h, &rcg_out.sp, sizeof(rcg_out.sp));

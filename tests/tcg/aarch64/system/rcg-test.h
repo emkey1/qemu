@@ -148,12 +148,15 @@ static inline void rcg_set_insn(uint32_t insn)
 
 /*
  * A case: what to call it, its instruction, and the registers that take
- * the values tested, of which 31 is SP; -1 for none.
+ * the values tested, of which 31 is SP; -1 for none. adr is the register
+ * that ADR or ADRP writes, or -1 for any other instruction, and page says
+ * that it is ADRP.
  */
 struct rcg_case {
     const char *name;
     uint32_t insn;
-    int8_t a, b;
+    int8_t a, b, adr;
+    uint8_t page;
 };
 
 /*

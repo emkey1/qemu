@@ -25,21 +25,25 @@
 /*
  * What RCG assumes of the translation state. Every field of DisasContext
  * is here with what it means to the instructions RCG takes, which so far
- * are the integer data processing instructions between registers: they
- * read and write X registers, SP and NZCV, ADR and ADRP also read the PC,
- * and that is all. A field that changes what such an instruction does, or
- * what must happen around it, has to be tested in rcg_translate() or by
- * the trans_rcg_<name>() it concerns.
+ * are the integer data processing instructions between registers, the
+ * conditional selects and compares, and the conditional branches: they
+ * read and write X registers, SP and NZCV, ADR, ADRP and the branches
+ * also use the PC, and that is all. A field that changes what such an
+ * instruction does, or what must happen around it, has to be tested in
+ * rcg_translate() or by the trans_rcg_<name>() it concerns.
  *
  * Tested by rcg_translate():
  *   base.plugin_enabled, ss_active.
  * Handled by aarch64_tr_translate_insn() around every instruction, whoever
  * translates it:
- *   base (but plugin_enabled), insn, pstate_ss, pstate_il, bt, btype,
+ *   base (but plugin_enabled), insn, pstate_ss, pstate_il, bt,
  *   sme_trap_nonstreaming, is_nonstreaming, fp_access_checked,
  *   sve_access_checked, insn_start_updated.
- * Used by rcg_pcrel() as gen_pc_plus_diff() uses them:
+ * Used by rcg_pcrel() as gen_pc_plus_diff() uses them, and by the
+ * branches through gen_goto_tb() and the labels, as trans_B_cond() does:
  *   pc_curr, pc_save.
+ * Reset by the branches with reset_btype(), as trans_B_cond() does:
+ *   btype.
  * Program-counter relative code that no instruction taken needs:
  *   page_start.
  * Memory accesses, of which none is made:
@@ -81,24 +85,28 @@ enum {
     RCG_READS_CF = 2,
     RCG_READS_PC = 4,
     RCG_READS_RD = 8,       /* the "d" register, which it also writes */
+    RCG_READS_NZCV = 16,
 };
 
-/*
- * Emits g with its words from a, if there is a gadget at g, and returns
- * whether there is. The gadget writes the register of its "d" word whole,
- * and reads those of its "n", "m" and "a" words. touches says what else,
- * RCG_*. The trace event says which instructions RCG took, by gadget.
- */
-static bool rcg_emit(DisasContext *s, const RCGGadget *g, const RCGArgs *a,
-                     unsigned touches)
-{
+/* A gadget's operand words, and the globals it writes and reads. */
+typedef struct RCGOp {
     uint64_t words[RCG_MAX_WORDS];
     TCGTemp *outs[RCG_MAX_WORDS], *ins[RCG_MAX_WORDS];
+    unsigned nb_words, nb_outs, nb_ins;
+} RCGOp;
+
+/*
+ * Fills in op for g with its words from a. The gadget writes the register
+ * of its "d" word whole, and reads those of its "n", "m" and "a" words.
+ * touches says what else, RCG_*.
+ */
+static void rcg_op(RCGOp *op, const RCGGadget *g, const RCGArgs *a,
+                   unsigned touches)
+{
+    uint64_t *words = op->words;
+    TCGTemp **outs = op->outs, **ins = op->ins;
     unsigned n, nb_outs = 0, nb_ins = 0;
 
-    if (!g->gadget) {
-        return false;
-    }
     for (n = 0; n < RCG_MAX_WORDS && g->words[n] != RCG_W_END; n++) {
         switch (g->words[n]) {
         case RCG_W_D:
@@ -142,13 +150,38 @@ static bool rcg_emit(DisasContext *s, const RCGGadget *g, const RCGArgs *a,
         rcg_note_temp(outs, &nb_outs, tcgv_i32_temp(cpu_CF));
         rcg_note_temp(outs, &nb_outs, tcgv_i32_temp(cpu_VF));
     }
-    if (touches & RCG_READS_CF) {
+    if (touches & (RCG_READS_CF | RCG_READS_NZCV)) {
         rcg_note_temp(ins, &nb_ins, tcgv_i32_temp(cpu_CF));
+    }
+    if (touches & RCG_READS_NZCV) {
+        rcg_note_temp(ins, &nb_ins, tcgv_i32_temp(cpu_NF));
+        rcg_note_temp(ins, &nb_ins, tcgv_i32_temp(cpu_ZF));
+        rcg_note_temp(ins, &nb_ins, tcgv_i32_temp(cpu_VF));
     }
     if (touches & RCG_READS_PC) {
         rcg_note_temp(ins, &nb_ins, tcgv_i64_temp(cpu_pc));
     }
-    tcg_gen_rich(g->gadget, words, n, 0, outs, nb_outs, ins, nb_ins);
+    op->nb_words = n;
+    op->nb_outs = nb_outs;
+    op->nb_ins = nb_ins;
+}
+
+/*
+ * Emits g with its words from a, if there is a gadget at g, and returns
+ * whether there is; touches is as for rcg_op(). The trace event says
+ * which instructions RCG took, by gadget.
+ */
+static bool rcg_emit(DisasContext *s, const RCGGadget *g, const RCGArgs *a,
+                     unsigned touches)
+{
+    RCGOp op;
+
+    if (!g->gadget) {
+        return false;
+    }
+    rcg_op(&op, g, a, touches);
+    tcg_gen_rich(g->gadget, op.words, op.nb_words, 0, op.outs, op.nb_outs,
+                 op.ins, op.nb_ins);
     trace_rcg_insn(s->pc_curr, g->gadget);
     return true;
 }
@@ -501,6 +534,160 @@ static bool rcg_one_source(DisasContext *s, int rd, int rn, const RCGGadget *g)
         return false;
     }
     return rcg_emit(s, g, &args, 0);
+}
+
+/*
+ * CSEL, CSINC, CSINV and CSNEG, as trans_CSEL() does them. With both
+ * sources XZR, CSINC and CSINV are CSET and CSETM, which have gadgets.
+ * The conditions that always hold, and XZR in any other place, are left
+ * to TCG.
+ */
+static bool trans_rcg_CSEL(DisasContext *s, arg_rcg_CSEL *a)
+{
+    static const uint8_t ops[2][2] = {
+        { RCG_SELECT_SEL, RCG_SELECT_INC },
+        { RCG_SELECT_INV, RCG_SELECT_NEG },
+    };
+    RCGArgs args = { .rd = a->rd, .rn = a->rn, .rm = a->rm };
+    bool zz = a->rn == 31 && a->rm == 31;
+
+    if (a->cond >= 14 || a->rd == 31 || (!zz && (a->rn == 31 || a->rm == 31))) {
+        return false;
+    }
+    return rcg_emit(s, &rcg_csel[ops[a->else_inv][a->else_inc]][a->sf]
+                                [a->cond][zz], &args, RCG_READS_NZCV);
+}
+
+/*
+ * CCMP and CCMN, as trans_CCMP() does them: the gadget takes the NZCV
+ * for a condition that fails already in place. The conditions that
+ * always hold, and XZR in either place, are left to TCG.
+ */
+static bool trans_rcg_CCMP(DisasContext *s, arg_rcg_CCMP *a)
+{
+    RCGArgs args = {
+        .rn = a->rn, .rm = a->y, .imm = a->y,
+        .mask = (uint64_t)a->nzcv << 28,
+    };
+
+    if (a->cond >= 14 || a->rn == 31 || (!a->imm && a->y == 31)) {
+        return false;
+    }
+    return rcg_emit(s, &rcg_ccmp[a->op][a->sf][a->imm][a->cond], &args,
+                    RCG_READS_NZCV | RCG_WRITES_NZCV);
+}
+
+/*
+ * The rich op of a gadget right before this instruction that a B.cond can
+ * join, with *setter its index in rcg_fused_setter, or NULL. Nothing may
+ * come between the two: this instruction has emitted nothing yet, and
+ * its insn_start follows the gadget's op.
+ */
+static TCGOp *rcg_fused_setter_op(DisasContext *s, int *setter)
+{
+    TCGOp *op;
+    const void *gadget;
+
+    if (tcg_last_op() != s->base.insn_start) {
+        return NULL;
+    }
+    op = QTAILQ_PREV(s->base.insn_start, link);
+    gadget = tcg_rich_gadget(op);
+    for (int i = 0; gadget && i < RCG_NB_FUSED; i++) {
+        if (rcg_fused_setter[i] == gadget) {
+            *setter = i;
+            return op;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * The two ways out of a conditional branch to diff, as trans_B_cond(),
+ * trans_CBZ() and trans_TBZ() emit them after their test.
+ */
+static void rcg_branch_ways(DisasContext *s, DisasLabel match, int64_t diff)
+{
+    gen_goto_tb(s, 0, 4);
+    set_disas_label(s, match);
+    gen_goto_tb(s, 1, diff);
+}
+
+/*
+ * A conditional branch to diff on a register, CBZ's or TBZ's, with the
+ * gadgets at g: the one that branches, then the one that also jumps each
+ * way, which TCTI swaps in where both ways start with a goto_tb.
+ */
+static bool rcg_branch(DisasContext *s, const RCGGadget *g,
+                       const RCGArgs *a, int64_t diff)
+{
+    DisasLabel match;
+    RCGOp op;
+
+    if (!g->gadget) {
+        return false;
+    }
+    rcg_op(&op, g, a, 0);
+    reset_btype(s);
+    match = gen_disas_label(s);
+    tcg_gen_rich_br(g->gadget, op.words, op.nb_words, match.label,
+                    g[1].gadget, op.outs, op.nb_outs, op.ins, op.nb_ins);
+    trace_rcg_insn(s->pc_curr, g->gadget);
+    rcg_branch_ways(s, match, diff);
+    return true;
+}
+
+/*
+ * B.cond, as trans_B_cond() does it. Right after a gadget of
+ * rcg_fused_setter, one gadget does both, branching on the flags the
+ * setter left in the host rather than on NZCV reloaded from env; with
+ * btype to reset, that store would come between the two, so they are not
+ * joined. BC.cond and the conditions that always hold are left to TCG.
+ */
+static bool trans_rcg_B_cond(DisasContext *s, arg_rcg_B_cond *a)
+{
+    const RCGGadget *g;
+    DisasLabel match;
+    TCGOp *setter_op;
+    int setter;
+
+    if (a->c || a->cond >= 14) {
+        return false;
+    }
+    setter_op = s->btype ? NULL : rcg_fused_setter_op(s, &setter);
+    reset_btype(s);
+    match = gen_disas_label(s);
+    if (setter_op) {
+        g = rcg_fused[setter][a->cond];
+        tcg_gen_rich_br_join(setter_op, g->gadget, NULL, 0, match.label,
+                             g[1].gadget, NULL, 0, NULL, 0);
+    } else {
+        RCGOp op;
+
+        g = rcg_bcond[a->cond];
+        rcg_op(&op, g, NULL, RCG_READS_NZCV);
+        tcg_gen_rich_br(g->gadget, NULL, 0, match.label, g[1].gadget,
+                        NULL, 0, op.ins, op.nb_ins);
+    }
+    trace_rcg_insn(s->pc_curr, g->gadget);
+    rcg_branch_ways(s, match, a->imm);
+    return true;
+}
+
+/* CBZ and CBNZ, as trans_CBZ() does them. XZR is left to TCG. */
+static bool trans_rcg_CBZ(DisasContext *s, arg_cbz *a)
+{
+    RCGArgs args = { .rn = a->rt };
+
+    return a->rt != 31 && rcg_branch(s, rcg_cbz[a->sf][a->nz], &args, a->imm);
+}
+
+/* TBZ and TBNZ, as trans_TBZ() does them. XZR is left to TCG. */
+static bool trans_rcg_TBZ(DisasContext *s, arg_tbz *a)
+{
+    RCGArgs args = { .rn = a->rt, .mask = 1ull << a->bitpos };
+
+    return a->rt != 31 && rcg_branch(s, rcg_tbz[a->nz], &args, a->imm);
 }
 
 TRANS(rcg_ADD_i, rcg_addsub_imm, a, false, false)

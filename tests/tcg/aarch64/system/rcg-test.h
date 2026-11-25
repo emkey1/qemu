@@ -4,11 +4,11 @@
  * What the RCG tests share: running one instruction from a register and
  * flags state set up in memory.
  *
- * Each case is an instruction that target/arm/tcg/rcg-gen.py writes out,
- * as its encoding, from the same tables it makes RCG's gadgets from.
- * rcg_set_insn() puts a case's instruction in rcg_run_insn(), which loads
- * X0 to X30, SP and NZCV from rcg_in, runs the instruction, and stores
- * them all to rcg_out. It keeps the caller's registers. There is one such
+ * Each case is an instruction, or a few, that target/arm/tcg/rcg-gen.py
+ * writes out, as encodings, from the same tables it makes RCG's gadgets
+ * from. rcg_set_insn() puts a case's instructions in rcg_run_insn(), which
+ * loads X0 to X30, SP and NZCV from rcg_in, runs them, and stores them
+ * all to rcg_out. It keeps the caller's registers. There is one such
  * function, patched for each case, rather than a function for each case:
  * a function for each of thousands of cases would not fit in the 2 MiB
  * that kernel.ld gives the text.
@@ -96,9 +96,12 @@ asm("    .macro rcg_load\n"
 
 /*
  * rcg_run_insn(): it saves the registers its caller expects back, and its
- * SP, swaps in the state of rcg_in, runs the instruction at rcg_insn_slot,
- * and swaps the state out to rcg_out.
+ * SP, swaps in the state of rcg_in, runs the RCG_SLOT instructions at
+ * rcg_insn_slot, and swaps the state out to rcg_out. A case that is a
+ * branch goes forward within the slot, over an instruction that marks
+ * the way it was not taken.
  */
+#define RCG_SLOT 3
 void rcg_run_insn(void);
 extern uint32_t rcg_insn_slot[];
 asm("    .pushsection .text\n"
@@ -118,6 +121,8 @@ asm("    .pushsection .text\n"
     "    rcg_load\n"
     "rcg_insn_slot:\n"
     "    nop\n"
+    "    nop\n"
+    "    nop\n"
     "    rcg_store\n"
     "    adrp x0, rcg_saved_sp\n"
     "    ldr x1, [x0, :lo12:rcg_saved_sp]\n"
@@ -132,31 +137,34 @@ asm("    .pushsection .text\n"
     "    .popsection\n");
 
 /*
- * Makes insn the instruction that rcg_run_insn() runs. boot.S maps the
+ * Makes insn the instructions that rcg_run_insn() runs. boot.S maps the
  * text so that EL1 can write it. The cache maintenance is what hardware
- * needs before it runs an instruction that was just written.
+ * needs before it runs instructions that were just written.
  */
-static inline void rcg_set_insn(uint32_t insn)
+static inline void rcg_set_insn(const uint32_t *insn)
 {
-    rcg_insn_slot[0] = insn;
-    asm volatile("dc cvau, %0\n"
-                 "dsb ish\n"
-                 "ic ivau, %0\n"
-                 "dsb ish\n"
-                 "isb\n" : : "r" (rcg_insn_slot) : "memory");
+    for (int i = 0; i < RCG_SLOT; i++) {
+        rcg_insn_slot[i] = insn[i];
+        asm volatile("dc cvau, %0\n"
+                     "dsb ish\n"
+                     "ic ivau, %0\n"
+                     "dsb ish\n"
+                     "isb\n" : : "r" (&rcg_insn_slot[i]) : "memory");
+    }
 }
 
 /*
- * A case: what to call it, its instruction, and the registers that take
+ * A case: what to call it, its instructions, and the registers that take
  * the values tested, of which 31 is SP; -1 for none. adr is the register
  * that ADR or ADRP writes, or -1 for any other instruction, and page says
- * that it is ADRP.
+ * that it is ADRP. flags says that it reads NZCV: it then starts from
+ * each value of NZCV, with fewer values in its registers.
  */
 struct rcg_case {
     const char *name;
-    uint32_t insn;
+    uint32_t insn[RCG_SLOT];
     int8_t a, b, adr;
-    uint8_t page;
+    uint8_t page, flags;
 };
 
 /*
@@ -170,6 +178,13 @@ static const uint64_t rcg_values[] = {
     0xfedcba9876543210, 0x5555555555555555,
 };
 #define RCG_NB_VALUES (sizeof(rcg_values) / sizeof(rcg_values[0]))
+
+/* The values of a case that starts from each value of NZCV. */
+static const uint64_t rcg_flag_values[] = {
+    0, 1, 0x80000000, 0xffffffffffffffff, 0x0123456789abcdef,
+};
+#define RCG_NB_FLAG_VALUES \
+    (sizeof(rcg_flag_values) / sizeof(rcg_flag_values[0]))
 
 /*
  * What a case starts from: NZCV, and a seed for the registers that take

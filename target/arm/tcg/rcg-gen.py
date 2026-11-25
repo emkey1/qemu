@@ -26,6 +26,7 @@ and a64-rcg.decode to a directory. --coverage checks that the tests took
 every gadget (see rcg_core.check_coverage()):
 
     rcg-gen.py --insn-tests FILE
+    rcg-gen.py --branch-tests FILE
     rcg-gen.py --check
     rcg-gen.py --gadgets DIR
     rcg-gen.py --coverage ordered|plain NM TRACE...
@@ -33,8 +34,9 @@ every gadget (see rcg_core.check_coverage()):
 There are gadgets for the integer data processing instructions between
 registers: the adds and subtracts, the logical operations, the moves of
 constants, the bitfield moves and EXTR, the shifts, the multiplies and
-divides, and the bit and byte reversals and counts. Everything else is
-left to TCG.
+divides, and the bit and byte reversals and counts; for the conditional
+selects and compares; and for the conditional branches, B.cond, CBZ and
+TBZ. Everything else is left to TCG.
 """
 
 import argparse
@@ -51,7 +53,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(SRC, "tcg", "aarch64-tcti"))
 import rcg_core  # noqa: E402
 from rcg_core import ADDR, A, B, R, T, CheckHarness, TctiHarness  # noqa: E402
-from rcg_core import w  # noqa: E402
+from rcg_core import ARM_INVERT, w  # noqa: E402
 
 
 #
@@ -107,6 +109,23 @@ MULS = ("x", "w", "sl", "ul")
 # The operations on one register.
 UNARIES = ("rbit", "rev16", "rev32", "rev64", "clz", "cls")
 
+# The conditions, by their encoding. 14 and 15 are always, which TCG has.
+CONDS = ("eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc", "hi", "ls", "ge",
+         "lt", "gt", "le")
+
+# The conditional selects: CSEL, CSINC, CSINV and CSNEG.
+SELECTS = ("sel", "inc", "inv", "neg")
+
+
+def select_name(op):
+    return "csel" if op == "sel" else "cs" + op
+
+# The gadgets a B.cond right after them can join (see fused_specs()), by
+# name without the width: CMP and CMN of an immediate, CMP of a register,
+# TST of an immediate and of a register, and SUBS of an immediate.
+FUSED_SETTERS = ("cmp_i", "cmn_i", "cmp_r", "ands_i_only", "ands_r_only",
+                 "subs_i")
+
 # The patterns of a64.decode that a64-rcg.decode copies, each with the
 # translator's trans_rcg_<name>().
 PATTERNS = ("ADD_i", "ADDS_i", "SUB_i", "SUBS_i",
@@ -120,7 +139,8 @@ PATTERNS = ("ADD_i", "ADDS_i", "SUB_i", "SUBS_i",
             "LSLV", "LSRV", "ASRV", "RORV", "UDIV", "SDIV",
             "MADD_w", "MSUB_w", "MADD_x", "MSUB_x",
             "SMADDL", "SMSUBL", "UMADDL", "UMSUBL", "SMULH", "UMULH",
-            "RBIT", "REV16", "REV32", "REV64", "CLZ", "CLS")
+            "RBIT", "REV16", "REV32", "REV64", "CLZ", "CLS",
+            "CSEL", "CCMP", "B_cond", "CBZ", "TBZ")
 
 # The translator's tables of gadgets, by kind: each index's name and the
 # values it takes, a number of them or the tuple that names them. A kind
@@ -146,12 +166,19 @@ TABLES = {
     "muladd": (("mul", MULS), ("sub", 2), ("za", 2)),
     "mulh": (("signed", 2),),
     "unary": (("op", UNARIES), ("sf", 2)),
+    "csel": (("op", SELECTS), ("sf", 2), ("cond", 16), ("zz", 2)),
+    "ccmp": (("sub", 2), ("sf", 2), ("imm", 2), ("cond", 16)),
+    "bcond": (("cond", 16), ("jumps", 2)),
+    "cbz": (("sf", 2), ("nz", 2), ("jumps", 2)),
+    "tbz": (("nz", 2), ("jumps", 2)),
+    "fused": (("setter", len(FUSED_SETTERS) * 2), ("cond", 16),
+              ("jumps", 2)),
 }
 
 # The tuples that become enums in the table, with their prefixes.
 ENUMS = (("FLAGS", FLAGS), ("SHIFT", SHIFTS), ("ZERO", ZEROS),
          ("EXTEND", EXTENDS), ("LOGIC", LOGICS), ("BITFIELD", BITFIELDS),
-         ("MUL", MULS), ("UNARY", UNARIES))
+         ("MUL", MULS), ("UNARY", UNARIES), ("SELECT", SELECTS))
 
 # The gadget source files, by kind, split so they compile in parallel.
 # Must match target/arm/tcg/meson.build.
@@ -162,8 +189,10 @@ KIND_FILES = {
     "mov_i": "move", "movk": "move", "adr": "move", "bitfield": "move",
     "bfm": "move", "extr": "move", "shiftv": "move", "unary": "move",
     "div": "mul", "muladd": "mul", "mulh": "mul",
+    "csel": "cond", "ccmp": "cond",
+    "bcond": "branch", "cbz": "branch", "tbz": "branch", "fused": "fused",
 }
-GADGET_FILES = ("addsub", "logic", "move", "mul")
+GADGET_FILES = ("addsub", "logic", "move", "mul", "cond", "branch", "fused")
 
 
 class Spec:
@@ -338,12 +367,85 @@ def mul_specs():
                    (signed,), signed=signed, width=64)
 
 
+def cond_specs():
+    """ CSEL, CSINC, CSINV and CSNEG for each condition, and CSINC and
+    CSINV of XZR and XZR ("zz": CSET and CSETM); and CCMP and CCMN of a
+    register and of an immediate for each condition. """
+    for op in SELECTS:
+        for width in WIDTHS:
+            for cond, name in enumerate(CONDS):
+                index = (SELECTS.index(op), WIDTHS.index(width), cond)
+                yield Spec("csel", f"{select_name(op)}_{name}_{width}",
+                           ("d", "n", "m"), (*index, 0), op=op, width=width,
+                           cond=cond, zz=False)
+                if op in ("inc", "inv"):
+                    yield Spec("csel", f"cs{op}_zz_{name}_{width}", ("d",),
+                               (*index, 1), op=op, width=width, cond=cond,
+                               zz=True)
+    for sub in (False, True):
+        for width in WIDTHS:
+            for imm in (False, True):
+                for cond, name in enumerate(CONDS):
+                    yield Spec("ccmp",
+                               f"{'ccmp' if sub else 'ccmn'}_"
+                               f"{'i' if imm else 'r'}_{name}_{width}",
+                               ("n", "imm" if imm else "m", "mask"),
+                               (sub, WIDTHS.index(width), imm, cond),
+                               sub=sub, width=width, imm=imm, cond=cond)
+
+
+def branch_specs():
+    """ B.cond for each condition, CBZ and CBNZ at each width, and TBZ and
+    TBNZ, each as a gadget that branches and as one that also makes the
+    jump to the next TB each way ("jumps": see rcg_core's Harness). """
+    for jumps in (False, True):
+        suffix = "_jumps" if jumps else ""
+        for cond, name in enumerate(CONDS):
+            yield Spec("bcond", f"b_{name}{suffix}", (), (cond, jumps),
+                       cond=cond, jumps=jumps)
+        for width in WIDTHS:
+            for nz in (False, True):
+                yield Spec("cbz", f"cb{'n' if nz else ''}z_{width}{suffix}",
+                           ("n",), (WIDTHS.index(width), nz, jumps),
+                           width=width, nz=nz, jumps=jumps)
+        for nz in (False, True):
+            yield Spec("tbz", f"tb{'n' if nz else ''}z{suffix}",
+                       ("n", "mask"), (nz, jumps), nz=nz, jumps=jumps)
+
+
+def fused_setters():
+    """ The specs of the gadgets a B.cond right after them can join:
+    FUSED_SETTERS at each width, in the order of the translator's
+    rcg_fused_setter. """
+    by_name = {spec.name: spec for spec in (*addsub_specs(), *logic_specs())}
+    return [by_name[f"{name}_{width}"]
+            for name in FUSED_SETTERS for width in WIDTHS]
+
+
+def fused_specs():
+    """ A setter of fused_setters() and the B.cond right after it, in one
+    gadget, which does the setter's work and then branches on the host's
+    flags as the setter left them, rather than on NZCV reloaded from env.
+    Its words are the setter's. """
+    for i, setter in enumerate(fused_setters()):
+        for cond, name in enumerate(CONDS):
+            for jumps in (False, True):
+                yield Spec("fused",
+                           f"{setter.name}_b_{name}"
+                           f"{'_jumps' if jumps else ''}",
+                           setter.words, (i, cond, jumps), setter=setter,
+                           cond=cond, jumps=jumps)
+
+
 def specs():
     """ Every gadget. """
     yield from addsub_specs()
     yield from logic_specs()
     yield from move_specs()
     yield from mul_specs()
+    yield from cond_specs()
+    yield from branch_specs()
+    yield from fused_specs()
 
 
 #
@@ -387,6 +489,46 @@ class Body(rcg_core.Body):
         with 1 sets C exactly when it is 1. It uses T. """
         self.emit(f"ldr {w(T)}, [{self.env}, %[cf]]",
                   f"cmp {w(T)}, #1")
+
+    def test_cond(self, cond):
+        """ Sets the host's flags from the guest's NZCV in env, and returns
+        the host's condition under which the guest's condition cond holds.
+        It reads only the fields the condition needs, and of them only
+        what they mean: N and V are bit 31 of NF and VF, Z is set where ZF
+        is 0, and C where CF is not. It uses ADDR and T. """
+        env, t, u = self.env, w(T), w(ADDR)
+        base = cond >> 1
+        if base == 0:
+            self.emit(f"ldr {t}, [{env}, %[zf]]", f"cmp {t}, #0")
+            arm = "eq"
+        elif base == 1:
+            self.emit(f"ldr {t}, [{env}, %[cf]]", f"cmp {t}, #0")
+            arm = "ne"
+        elif base in (2, 3):
+            self.emit(f"ldr {t}, [{env}, %[{'nf' if base == 2 else 'vf'}]]",
+                      f"cmp {t}, #0")
+            arm = "mi"
+        elif base == 4:
+            # HI: C and not Z. If CF is not 0, the test of ZF; else Z.
+            self.emit(f"ldr {t}, [{env}, %[cf]]",
+                      f"ldr {u}, [{env}, %[zf]]",
+                      f"cmp {t}, #0",
+                      f"ccmp {u}, #0, #4, ne")
+            arm = "ne"
+        else:
+            # GE: N is V. GT: that, and not Z: if ZF is not 0, the test of
+            # NF ^ VF; else N.
+            self.emit(f"ldr {t}, [{env}, %[nf]]",
+                      f"ldr {u}, [{env}, %[vf]]",
+                      f"eor {t}, {t}, {u}")
+            if base == 5:
+                self.emit(f"cmp {t}, #0")
+            else:
+                self.emit(f"ldr {u}, [{env}, %[zf]]",
+                          f"cmp {u}, #0",
+                          f"ccmp {t}, #0, #8, ne")
+            arm = "pl"
+        return ARM_INVERT[arm] if cond & 1 else arm
 
 
 def reg(x, width):
@@ -608,6 +750,75 @@ def unary_body(g, spec):
     g.write_reg(R, "d")
 
 
+def csel_body(g, spec):
+    """ CSEL, CSINC, CSINV and CSNEG: the host's own, on the condition
+    that test_cond() makes of the guest's. """
+    width = spec.width
+    a = b = reg("xzr", width)
+    if not spec.zz:
+        g.read_reg(A, "n")
+        g.read_reg(B, "m")
+        a, b = reg(A, width), reg(B, width)
+    arm = g.test_cond(spec.cond)
+    g.emit(f"{select_name(spec.op)} {reg(R, width)}, {a}, {b}, {arm}")
+    g.write_reg(R, "d")
+
+
+def ccmp_body(g, spec):
+    """ CCMP and CCMN: the compare, whose NZCV is kept if the condition
+    holds, and else replaced by the instruction's, which the translator
+    has shifted into place in the mask word. The condition is tested after
+    the compare, from env, which the compare has not changed yet. """
+    width = spec.width
+    g.read_reg(A, "n")
+    if spec.imm:
+        b = reg(g.word("imm"), width)
+    else:
+        g.read_reg(B, "m")
+        b = reg(B, width)
+    g.emit(f"{'cmp' if spec.sub else 'cmn'} {reg(A, width)}, {b}",
+           f"mrs {R}, nzcv")
+    arm = g.test_cond(spec.cond)
+    g.emit(f"csel {R}, {R}, {g.word('mask')}, {arm}",
+           f"msr nzcv, {R}")
+    g.write_nzcv()
+
+
+def branch_end(g, spec, arm):
+    """ The end of a branch gadget that branches if the host's condition
+    arm holds: the harness's branch, or its branch and jumps. """
+    if spec.jumps:
+        g.jumps(arm)
+    else:
+        g.branch(arm)
+
+
+def bcond_body(g, spec):
+    """ B.cond, on NZCV from env. """
+    branch_end(g, spec, g.test_cond(spec.cond))
+
+
+def cbz_body(g, spec):
+    """ CBZ and CBNZ. """
+    g.read_reg(A, "n")
+    g.emit(f"cmp {reg(A, spec.width)}, #0")
+    branch_end(g, spec, "ne" if spec.nz else "eq")
+
+
+def tbz_body(g, spec):
+    """ TBZ and TBNZ: the translator gives the bit as a mask. """
+    g.read_reg(A, "n")
+    g.emit(f"tst {A}, {g.word('mask')}")
+    branch_end(g, spec, "ne" if spec.nz else "eq")
+
+
+def fused_body(g, spec):
+    """ The setter's body, then the branch on the host's flags, which are
+    the guest's: write_nzcv() has stored them without changing them. """
+    BODIES[spec.setter.kind](g, spec.setter)
+    branch_end(g, spec, CONDS[spec.cond])
+
+
 BODIES = {
     "addsub_i": addsub_body,
     "addsub_r": addsub_body,
@@ -626,6 +837,12 @@ BODIES = {
     "muladd": muladd_body,
     "mulh": mulh_body,
     "unary": unary_body,
+    "csel": csel_body,
+    "ccmp": ccmp_body,
+    "bcond": bcond_body,
+    "cbz": cbz_body,
+    "tbz": tbz_body,
+    "fused": fused_body,
 }
 
 # The "i" asm operands the bodies use, which the C compiler works out from
@@ -635,6 +852,9 @@ BODY_OPERANDS = {
     **rcg_core.MEMORY_OPERANDS,
     **rcg_core.HARNESS_OPERANDS,
     "cf": "offsetof(CPUARMState, CF)",
+    "vf": "offsetof(CPUARMState, VF)",
+    "nf": "offsetof(CPUARMState, NF)",
+    "zf": "offsetof(CPUARMState, ZF)",
     "pc": "offsetof(CPUARMState, pc)",
 }
 
@@ -709,7 +929,7 @@ def rcg_decode():
         if toks and toks[0] in PATTERNS:
             assert depth == 0, f"{toks[0]} is in a group in a64.decode"
             found.add(toks[0])
-            wanted.update(toks[1:])
+            wanted.update(tok.split("=")[-1] for tok in toks[1:])
     assert found == set(PATTERNS), set(PATTERNS) - found
     # What the patterns' formats refer to, and so on.
     grew = True
@@ -781,6 +1001,13 @@ def write_table(all_specs, out):
     for spec in all_specs:
         p(f"void rcg_gadget_{spec.name}(void);")
     p("")
+    setters = fused_setters()
+    p("/* The gadgets a B.cond right after them can join: fused_setters(). */")
+    p(f"#define RCG_NB_FUSED {len(setters)}\n")
+    p("static const void *const rcg_fused_setter[RCG_NB_FUSED] = {")
+    for spec in setters:
+        p(f"    rcg_gadget_{spec.name},")
+    p("};\n")
     for kind, indices in TABLES.items():
         if indices:
             p(f"/* Indexed by {', '.join(name for name, _ in indices)}. */")
@@ -819,21 +1046,37 @@ def write_gadgets(outdir):
 # The tests: every encoding class, run over awkward values.
 #
 
+# The instructions of a case, as rcg-test.h's RCG_SLOT has it: those the
+# case does not give are NOPs.
+SLOT = 3
+NOP = 0xd503201f
+
+# MOVZ X16, #0xbad, which a case that branches puts after the branch, where
+# the branch goes over it: X16 then says which way it went.
+MARK = 0xd2800000 | 0xbad << 5 | 16
+
+
 class Case:
     """ One test case: an instruction, as its encoding (word) and what to
     call it (name), and the registers that take the values tested, a and
-    b, of which 31 is SP; -1 for none. adr is the register an ADR or ADRP
-    writes, from whose value the test takes the instruction's address, or
-    for ADRP (page) its page's, so that the result does not depend on where
-    the test was linked. """
+    b, of which 31 is SP; -1 for none. more are the instructions after it,
+    if any. adr is the register an ADR or ADRP writes, from whose value the
+    test takes the instruction's address, or for ADRP (page) its page's, so
+    that the result does not depend on where the test was linked. flags
+    says that it reads NZCV, so that the test starts it from each value of
+    NZCV; and branch that it branches. """
 
-    def __init__(self, name, word, a=-1, b=-1, adr=-1, page=False):
+    def __init__(self, name, word, a=-1, b=-1, adr=-1, page=False, more=(),
+                 flags=False, branch=False):
         self.name = name
-        self.word = word
+        self.words = (word, *more, *(NOP,) * (SLOT - 1 - len(more)))
+        assert len(self.words) == SLOT
         self.a = a
         self.b = b
         self.adr = adr
         self.page = page
+        self.flags = flags
+        self.branch = branch
 
 
 def reg_name(n, width, sp=False):
@@ -1213,6 +1456,135 @@ def multiply_cases():
             yield Case(name, word, a=a, b=b)
 
 
+COND_NAMES = (*CONDS, "al", "nv")
+
+
+def select_cases():
+    """ CSEL, CSINC, CSINV and CSNEG: both values of sf, each condition,
+    those that always hold among them, over registers with XZR in each
+    place and as both sources, which makes CSET and CSETM. Those that
+    always hold, and those with XZR in one place, are TCG's. """
+    for inv, inc, mnemonic in ((0, 0, "csel"), (0, 1, "csinc"),
+                               (1, 0, "csinv"), (1, 1, "csneg")):
+        for sf in (0, 1):
+            width = 64 if sf else 32
+            for cond in range(16):
+                for regs in ((0, 1, 2), (0, 31, 31), (0, 1, 31), (0, 31, 2),
+                             (31, 1, 2), (0, 1, 1)):
+                    rd, rn, rm = regs
+                    name = (f"{mnemonic} {names3(regs, width)}, "
+                            f"{COND_NAMES[cond]}")
+                    word = (sf << 31 | inv << 30 | 0b011010100 << 21 |
+                            rm << 16 | cond << 12 | inc << 10 | rn << 5 | rd)
+                    a, b = roles(rn, rm)
+                    yield Case(name, word, a=a, b=b, flags=True)
+
+
+def compare_cases():
+    """ CCMP and CCMN of an immediate and of a register: both values of sf,
+    each condition, with NZCV for a condition that fails that differs from
+    what the compare gives. Those that always hold, and those with XZR,
+    are TCG's. """
+    for op, mnemonic in ((0, "ccmn"), (1, "ccmp")):
+        for sf in (0, 1):
+            width = 64 if sf else 32
+            for cond in range(16):
+                for imm, rn, y, nzcv in ((1, 1, 31, 0x6), (1, 1, 0, 0x9),
+                                         (1, 31, 1, 0x0), (0, 1, 2, 0x6),
+                                         (0, 1, 2, 0x9), (0, 1, 1, 0xf),
+                                         (0, 1, 31, 0x0), (0, 31, 2, 0x0)):
+                    second = f"#{y}" if imm else reg_name(y, width)
+                    name = (f"{mnemonic} {reg_name(rn, width)}, {second}, "
+                            f"#{nzcv:#x}, {COND_NAMES[cond]}")
+                    word = (sf << 31 | op << 30 | 1 << 29 | 0b11010010 << 21 |
+                            y << 16 | cond << 12 | imm << 11 | rn << 5 | nzcv)
+                    a, b = (rn if rn != 31 else -1, -1) if imm else \
+                        roles(rn, y)
+                    yield Case(name, word, a=a, b=b, flags=True)
+
+
+def b_cond(cond):
+    """ B.cond over the next instruction. """
+    return 0x54000000 | 2 << 5 | cond
+
+
+def setter_cases():
+    """ An instruction for each kind of FUSED_SETTERS at each width, as its
+    name, its encoding and the registers that take the values. """
+    for kind in FUSED_SETTERS:
+        for sf in (0, 1):
+            width = 64 if sf else 32
+            r0, r1, r2 = (reg_name(n, width) for n in range(3))
+            if kind in ("cmp_i", "cmn_i", "subs_i"):
+                op = kind != "cmn_i"
+                rd, imm = (0, 1) if kind == "subs_i" else (31, 0x80)
+                name = (f"subs {r0}, {r1}, #{imm:#x}" if kind == "subs_i"
+                        else f"{kind[:3]} {r1}, #{imm:#x}")
+                yield name, (sf << 31 | op << 30 | 1 << 29 | 0b100010 << 23 |
+                             imm << 10 | 1 << 5 | rd), 1, -1
+            elif kind == "cmp_r":
+                yield f"cmp {r1}, {r2}", (sf << 31 | 3 << 29 | 0b01011 << 24 |
+                                          2 << 16 | 1 << 5 | 31), 1, 2
+            elif kind == "ands_i_only":
+                # The top bit: N is sf, immr 1 and imms 0.
+                yield (f"tst {r1}, #{1 << (width - 1):#x}",
+                       sf << 31 | 3 << 29 | 0b100100 << 23 | sf << 22 |
+                       1 << 16 | 1 << 5 | 31, 1, -1)
+            else:
+                assert kind == "ands_r_only"
+                yield f"tst {r1}, {r2}", (sf << 31 | 3 << 29 | 0b01010 << 24 |
+                                          2 << 16 | 1 << 5 | 31), 1, 2
+
+
+def branch_cases():
+    """ The cases that branch, each over an instruction that marks the way
+    it was not taken: B.cond for each condition from each value of NZCV,
+    those that always hold among them, which are TCG's; CBZ and CBNZ at
+    each width, and TBZ and TBNZ of the edge bits of each half, with XZR,
+    which is TCG's; B.cond right after each kind of setter it can join,
+    for each condition; and B.cond after instructions it cannot join: a
+    compare that is no setter of FUSED_SETTERS, and one with an
+    instruction between. """
+    for cond in range(16):
+        yield Case(f"b.{COND_NAMES[cond]} +8", b_cond(cond), more=(MARK,),
+                   flags=True, branch=True)
+    for sf in (0, 1):
+        for nz in (0, 1):
+            for rt in (1, 30, 31):
+                yield Case(f"cb{'n' if nz else ''}z "
+                           f"{reg_name(rt, 64 if sf else 32)}, +8",
+                           sf << 31 | 0b011010 << 25 | nz << 24 | 2 << 5 | rt,
+                           a=rt if rt != 31 else -1, more=(MARK,),
+                           branch=True)
+    for nz in (0, 1):
+        for bit in (0, 1, 31, 32, 63):
+            for rt in (1, 31):
+                yield Case(f"tb{'n' if nz else ''}z "
+                           f"{reg_name(rt, 64 if bit > 31 else 32)}, "
+                           f"#{bit}, +8",
+                           (bit >> 5) << 31 | 0b011011 << 25 | nz << 24 |
+                           (bit & 31) << 19 | 2 << 5 | rt,
+                           a=rt if rt != 31 else -1, more=(MARK,),
+                           branch=True)
+    for name, word, a, b in setter_cases():
+        for cond in range(16):
+            yield Case(f"{name}; b.{COND_NAMES[cond]} +8", word, a=a, b=b,
+                       more=(b_cond(cond), MARK), branch=True)
+    # CMP of a shifted register, ADDS of an immediate and ANDS that writes
+    # a register have gadgets that B.cond does not join.
+    for name, word in (("cmp x1, x2, lsl #1", 0xeb02043f),
+                       ("adds x0, x1, #0x1", 0xb1000420),
+                       ("ands x0, x1, x2", 0xea020020)):
+        for cond in (0, 3, 8, 11):
+            yield Case(f"{name}; b.{COND_NAMES[cond]} +8", word, a=1, b=2,
+                       more=(b_cond(cond), MARK), branch=True)
+    # CMP, then an instruction that leaves NZCV alone, then B.cond.
+    for cond in (1, 2, 12):
+        yield Case(f"cmp x1, x2; b.{COND_NAMES[cond]} +8 (after mov x3, x4)",
+                   0xeb02003f, a=1, b=2, more=(0xaa0403e3, b_cond(cond)),
+                   branch=True)
+
+
 def insn_cases():
     """ The cases of rcg-insns. """
     yield from addsub_imm_cases()
@@ -1228,6 +1600,9 @@ def insn_cases():
     yield from two_source_cases()
     yield from one_source_cases()
     yield from multiply_cases()
+    yield from select_cases()
+    yield from compare_cases()
+    yield from branch_cases()
 
 
 def write_cases(cases, out, prefix):
@@ -1238,24 +1613,30 @@ def write_cases(cases, out, prefix):
         return ()
 
     def row(name, c):
-        return (f'"{c.name}", {c.word:#010x}, {c.a}, {c.b}, {c.adr}, '
-                f'{int(c.page)}')
+        words = ", ".join(f"{word:#010x}" for word in c.words)
+        return (f'"{c.name}", {{ {words} }}, {c.a}, {c.b}, {c.adr}, '
+                f'{int(c.page)}, {int(c.flags)}')
 
     rcg_core.write_cases(cases, out, prefix, define, row)
 
 
 def check_coverage(order, nm, traces):
     """ Checks that the tests' traces, from runs of QEMU's aarch64 system
-    emulator, took every gadget: see rcg_core.check_coverage(). No gadget
-    reaches guest memory yet, so every one is wanted under either order,
-    and none is joined to a branch. """
-    return rcg_core.check_coverage(order, nm, traces, list(specs()), {})
+    emulator, took every gadget, and that a B.cond right after a setter it
+    can join took a fused gadget: see rcg_core.check_coverage(). No gadget
+    reaches guest memory yet, so every one is wanted under either order.
+    """
+    # What a setter's B.cond would be called.
+    setters = {spec.name: "b_" for spec in fused_setters()}
+    return rcg_core.check_coverage(order, nm, traces, list(specs()), setters)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--insn-tests", metavar="FILE",
                         help="write rcg-insns.c's cases to FILE")
+    parser.add_argument("--branch-tests", metavar="FILE",
+                        help="write rcg-branch.c's cases to FILE")
     parser.add_argument("--check", action="store_true",
                         help="render every gadget's body and check it")
     parser.add_argument("--gadgets", metavar="DIR",
@@ -1266,7 +1647,8 @@ def main():
                              "took every gadget for ORDER (ordered or "
                              "plain)")
     args = parser.parse_args()
-    if not (args.insn_tests or args.check or args.gadgets or args.coverage):
+    if not (args.insn_tests or args.branch_tests or args.check or
+            args.gadgets or args.coverage):
         parser.error("nothing to do")
     if args.coverage and (len(args.coverage) < 3 or
                           args.coverage[0] not in ("ordered", "plain")):
@@ -1279,6 +1661,10 @@ def main():
     if args.insn_tests:
         with open(args.insn_tests, "w") as out:
             write_cases(insn_cases(), out, "rcg_insn_")
+    if args.branch_tests:
+        with open(args.branch_tests, "w") as out:
+            write_cases((c for c in insn_cases() if c.branch), out,
+                        "rcg_insn_")
     if args.coverage:
         order, nm, *traces = args.coverage
         if not check_coverage(order, nm, traces):

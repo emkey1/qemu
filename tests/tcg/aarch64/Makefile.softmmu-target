@@ -95,13 +95,16 @@ RCG_GEN=$(SRC_PATH)/target/arm/tcg/rcg-gen.py
 RCG_GEN_DEPS=$(RCG_GEN) $(SRC_PATH)/tcg/aarch64-tcti/tcti_memory.py \
 	$(SRC_PATH)/tcg/aarch64-tcti/rcg_core.py \
 	$(SRC_PATH)/target/arm/tcg/a64.decode
-CLEANFILES += rcg-insns.h
+CLEANFILES += rcg-insns.h rcg-branch.h rcg-branch.ref
 
 rcg-insns.h: $(RCG_GEN_DEPS)
 	$(call quiet-command, $(PYTHON) $< --check --insn-tests $@, GEN, $@)
+rcg-branch.h: $(RCG_GEN_DEPS)
+	$(call quiet-command, $(PYTHON) $< --branch-tests $@, GEN, $@)
 
 rcg-insns: rcg-insns.h rcg-test.h
-rcg-insns: CFLAGS += -I.
+rcg-branch: rcg-branch.h rcg-insns.c rcg-test.h
+rcg-insns rcg-branch: CFLAGS += -I.
 
 # rcg-insns prints a hash of each case's results, which must match TCG's,
 # held in rcg-insns.ref.
@@ -112,6 +115,19 @@ run-rcg-insns: rcg-insns
 		  -chardev file$(COMMA)path=$<.out$(COMMA)id=output \
 		  $(QEMU_OPTS) $<)
 	$(call diff-out, $<, $(AARCH64_SYSTEM_SRC)/rcg-insns.ref)
+
+# rcg-branch runs rcg-insns' branch cases without goto_tb, so that they run
+# the gadgets that only branch; see rcg-branch.c. Their hashes are
+# rcg-insns.ref's lines for the cases branch_cases() in rcg-gen.py picks.
+run-rcg-branch: TIMEOUT=600
+run-rcg-branch: rcg-branch
+	$(call run-test, $<, \
+	  $(QEMU) -d nochain -monitor none -display none \
+		  -chardev file$(COMMA)path=$<.out$(COMMA)id=output \
+		  $(QEMU_OPTS) $<)
+	@grep -E '(^|; )(b\.[a-z]+|cbn?z|tbn?z) ' \
+		$(AARCH64_SYSTEM_SRC)/rcg-insns.ref > $<.ref
+	$(call diff-out, $<, $<.ref)
 
 # Simple Record/Replay Test
 .PHONY: memory-record

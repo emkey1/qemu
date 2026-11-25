@@ -43,7 +43,10 @@ if get_option('tcg_threaded_interpreter') or \
                                            'rcg_gadgets_addsub.c',
                                            'rcg_gadgets_logic.c',
                                            'rcg_gadgets_move.c',
-                                           'rcg_gadgets_mul.c'],
+                                           'rcg_gadgets_mul.c',
+                                           'rcg_gadgets_cond.c',
+                                           'rcg_gadgets_branch.c',
+                                           'rcg_gadgets_fused.c'],
                                   input: files('rcg-gen.py'),
                                   depend_files: [rcg_core, tcti_memory,
                                                  files('a64.decode')],
@@ -60,7 +63,9 @@ if get_option('tcg_threaded_interpreter') or \
   arm_system_ss.add(when: ['CONFIG_TCG', 'TARGET_AARCH64'],
                     if_true: [a64_rcg_gadgets[0], a64_rcg_gadgets[2],
                               a64_rcg_gadgets[3], a64_rcg_gadgets[4],
-                              a64_rcg_gadgets[5], a64_rcg_decode])
+                              a64_rcg_gadgets[5], a64_rcg_gadgets[6],
+                              a64_rcg_gadgets[7], a64_rcg_gadgets[8],
+                              a64_rcg_decode])
 endif
 arm_stubs_ss.add(files('stubs32.c'))
 

@@ -12,9 +12,8 @@ set -euo pipefail
 targets="x86_64 aarch64"
 order=
 case $1 in
-# RCG has gadgets for x86_64 guests only.
-rcg) accel=tcti=on,rcg=on targets=x86_64 order=ordered ;;
-rcg-plain) accel=tcti=on,rcg=on,tcti-ordered=off targets=x86_64 order=plain ;;
+rcg) accel=tcti=on,rcg=on order=ordered ;;
+rcg-plain) accel=tcti=on,rcg=on,tcti-ordered=off order=plain ;;
 *) accel=tcti=$1 ;;
 esac
 build=$(cd build && pwd)
@@ -32,7 +31,7 @@ trace=
 for kernel; do :; done
 case "$order:\${kernel##*/}" in
 ?*:rcg-insns|?*:rcg-faults)
-  trace="-trace rcg_insn -trace rcg_jumps -D $wrappers/trace.\$\$" ;;
+  trace="-trace rcg_insn -trace rcg_jumps -D $wrappers/trace.$target.\$\$" ;;
 esac
 exec $build/qemu-system-$target -accel tcg,$accel \$trace "\$@"
 EOF
@@ -40,11 +39,18 @@ EOF
   make -C "$build" "run-tcg-tests-$target-softmmu" QEMU="$wrapper" || status=1
 done
 
-# Between them, the RCG tests must take every gadget for the memory order.
+# Between them, a guest's RCG tests must take every one of its gadgets for
+# the memory order.
 if [ -n "$order" ]; then
-  nm "$build/qemu-system-x86_64" >"$wrappers/nm"
-  python3 target/i386/tcg/rcg-gen.py --coverage "$order" "$wrappers/nm" \
-    "$wrappers"/trace.* || status=1
+  for target in $targets; do
+    case $target in
+    x86_64) gen=target/i386/tcg/rcg-gen.py ;;
+    aarch64) gen=target/arm/tcg/rcg-gen.py ;;
+    esac
+    nm "$build/qemu-system-$target" >"$wrappers/nm.$target"
+    python3 "$gen" --coverage "$order" "$wrappers/nm.$target" \
+      "$wrappers"/trace."$target".* || status=1
+  done
 fi
 
 exit $status

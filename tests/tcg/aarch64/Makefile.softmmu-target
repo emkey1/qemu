@@ -89,6 +89,30 @@ QEMU_EL3_BASE_ARGS=-semihosting-config enable=on,target=native,chardev=output,ar
 run-gpc-test:  QEMU_OPTS=$(QEMU_EL3_MACHINE) $(QEMU_EL3_BASE_ARGS) -kernel
 run-gpc3-test: QEMU_OPTS=$(QEMU_EL3_MACHINE) $(QEMU_EL3_BASE_ARGS) -kernel
 
+# The RCG test's cases come from the tables RCG's gadgets are made from.
+# Making rcg-insns.h also checks every gadget's body.
+RCG_GEN=$(SRC_PATH)/target/arm/tcg/rcg-gen.py
+RCG_GEN_DEPS=$(RCG_GEN) $(SRC_PATH)/tcg/aarch64-tcti/tcti_memory.py \
+	$(SRC_PATH)/tcg/aarch64-tcti/rcg_core.py \
+	$(SRC_PATH)/target/arm/tcg/a64.decode
+CLEANFILES += rcg-insns.h
+
+rcg-insns.h: $(RCG_GEN_DEPS)
+	$(call quiet-command, $(PYTHON) $< --check --insn-tests $@, GEN, $@)
+
+rcg-insns: rcg-insns.h rcg-test.h
+rcg-insns: CFLAGS += -I.
+
+# rcg-insns prints a hash of each case's results, which must match TCG's,
+# held in rcg-insns.ref.
+run-rcg-insns: TIMEOUT=600
+run-rcg-insns: rcg-insns
+	$(call run-test, $<, \
+	  $(QEMU) -monitor none -display none \
+		  -chardev file$(COMMA)path=$<.out$(COMMA)id=output \
+		  $(QEMU_OPTS) $<)
+	$(call diff-out, $<, $(AARCH64_SYSTEM_SRC)/rcg-insns.ref)
+
 # Simple Record/Replay Test
 .PHONY: memory-record
 run-memory-record: memory-record memory

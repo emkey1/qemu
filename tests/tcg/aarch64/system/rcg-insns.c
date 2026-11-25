@@ -1,0 +1,56 @@
+/*
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * Every instruction form RCG has a gadget for, over awkward values.
+ *
+ * RCG runs an A64 instruction under TCTI as one gadget, where TCG runs a
+ * TCG op at a time; it must give exactly what TCG gives. The cases come
+ * from the tables in target/arm/tcg/rcg-gen.py that RCG's gadgets are made
+ * from (see rcg-test.h): every value of each encoding class's fields, with
+ * the neighbors that are left to TCG. Each runs over every pair of values
+ * from rcg_values (or each single value, where it takes one operand), from
+ * every start in rcg_starts. X0 to X30, SP and NZCV after it are hashed,
+ * and a case prints its hash.
+ *
+ * rcg-insns.ref holds TCG's hashes. To regenerate it after rcg-gen.py
+ * changes the cases, run the test under TCG (in a build with TCTI, with
+ * -accel tcg,rcg=off) and copy the output over it.
+ */
+
+#include "rcg-test.h"
+#include "rcg-insns.h"
+
+#define NB_CASES (sizeof(rcg_insn_cases) / sizeof(rcg_insn_cases[0]))
+
+static uint64_t run(const struct rcg_case *c)
+{
+    int nx = c->a >= 0 ? RCG_NB_VALUES : 1;
+    int ny = c->b >= 0 ? RCG_NB_VALUES : 1;
+    uint64_t h = RCG_HASH_INIT;
+
+    rcg_set_insn(c->insn);
+    for (int s = 0; s < RCG_NB_STARTS; s++) {
+        for (int x = 0; x < nx; x++) {
+            for (int y = 0; y < ny; y++) {
+                uint64_t nzcv;
+
+                rcg_setup(c, rcg_values[x], rcg_values[y], &rcg_starts[s]);
+                rcg_run_insn();
+                nzcv = rcg_out.nzcv & RCG_NZCV;
+                h = rcg_hash(h, rcg_out.x, sizeof(rcg_out.x));
+                h = rcg_hash(h, &rcg_out.sp, sizeof(rcg_out.sp));
+                h = rcg_hash(h, &nzcv, sizeof(nzcv));
+            }
+        }
+    }
+    return h;
+}
+
+int main(void)
+{
+    for (int i = 0; i < NB_CASES; i++) {
+        ml_printf("%s: %lx\n", rcg_insn_cases[i].name,
+                  run(&rcg_insn_cases[i]));
+    }
+    return 0;
+}

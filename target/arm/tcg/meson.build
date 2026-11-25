@@ -28,6 +28,37 @@ translate32_d = [
 ]
 
 arm_ss.add(when: 'TARGET_AARCH64', if_true: gen_a64)
+
+# Builds with RCG (see include/tcg/rcg.h) generate its gadgets for A64,
+# a64-rcg-table.c.inc, the table rcg.c.inc picks them from, and
+# a64-rcg.decode, the patterns of a64.decode that it has gadgets for, from
+# which decodetree makes rcg.c.inc's decoder. The file list must match
+# GADGET_FILES in rcg-gen.py, which imports rcg_core.py and tcti_memory.py
+# and reads a64.decode, hence its dependencies.
+if get_option('tcg_threaded_interpreter') or \
+   get_option('tcg_hybrid') in ['tcti', 'runtime']
+  a64_rcg_gadgets = custom_target('a64-rcg-gadgets',
+                                  output: ['a64-rcg-table.c.inc',
+                                           'a64-rcg.decode',
+                                           'rcg_gadgets_add.c',
+                                           'rcg_gadgets_sub.c'],
+                                  input: files('rcg-gen.py'),
+                                  depend_files: [rcg_core, tcti_memory,
+                                                 files('a64.decode')],
+                                  command: [python, '@INPUT@', '--gadgets',
+                                            '@OUTDIR@'])
+  a64_rcg_decode = custom_target('decode-a64-rcg',
+                                 output: 'decode-a64-rcg.c.inc',
+                                 input: a64_rcg_gadgets[1],
+                                 command: [python, files(
+                                   meson.project_source_root() / 'scripts' /
+                                   'decodetree.py'), '@INPUT@',
+                                   '--static-decode=rcg_a64', '-o',
+                                   '@OUTPUT@'])
+  arm_system_ss.add(when: ['CONFIG_TCG', 'TARGET_AARCH64'],
+                    if_true: [a64_rcg_gadgets[0], a64_rcg_gadgets[2],
+                              a64_rcg_gadgets[3], a64_rcg_decode])
+endif
 arm_stubs_ss.add(files('stubs32.c'))
 
 arm_ss.add(files(

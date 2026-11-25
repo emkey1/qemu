@@ -11110,6 +11110,9 @@ static void aarch64_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
     dc->insn_start_updated = false;
 }
 
+/* Under TCTI, RCG may emit one gadget for a whole instruction. */
+#include "rcg.c.inc"
+
 static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *s = container_of(dcbase, DisasContext, base);
@@ -11197,7 +11200,8 @@ static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
         disas_sme_fa64(s, insn);
     }
 
-    if (!disas_a64(s, insn) &&
+    if (!rcg_translate(s, insn) &&
+        !disas_a64(s, insn) &&
         !disas_sme(s, insn) &&
         !disas_sve(s, insn)) {
         unallocated_encoding(s);

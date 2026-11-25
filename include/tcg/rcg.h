@@ -2,7 +2,7 @@
 /*
  * RCG, the rich code generator: under TCTI, a guest instruction the front
  * end has a gadget for runs as that one gadget rather than as a gadget for
- * each of its TCG ops. Only x86-64 guests have gadgets. It is off by
+ * each of its TCG ops. x86-64 and AArch64 guests have gadgets. It is off by
  * default; -accel tcg,rcg=on|off sets it at startup, and tctish_rcg_set()
  * or the monitor's tcg_rcg while the VM runs. It is never active while
  * native code runs (the hybrid's JIT), as the gadgets exist only for TCTI's

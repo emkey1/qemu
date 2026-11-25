@@ -17,5 +17,4 @@ kvm_sev_snp_launch_finish(char *id_block, char *id_auth, char *host_data) "id_bl
 sev_handle_reset(void) ""
 
 # tcg/rcg.c.inc
-rcg_insn(uint64_t pc, const void *gadget) "pc 0x%" PRIx64 " gadget %p"
 rcg_insn_declined(uint64_t pc, void *gen) "pc 0x%" PRIx64 " gen %p"

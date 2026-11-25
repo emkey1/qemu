@@ -12,9 +12,11 @@
 #if defined(TARGET_X86_64) && defined(TCG_HAVE_RCG)
 
 #include "target/i386/trace.h"
+#include "trace/trace-accel_tcg.h"
 #include "host/cpuinfo.h"
 #include "tcti-gadget-defs.h"
 #include "tcg/rcg-table.c.inc"
+#include "tcg/rcg-common.c.inc"
 
 /* The gadgets' fast paths are built for TCTI's page size. */
 QEMU_BUILD_BUG_ON(TARGET_PAGE_BITS != TCTI_TLB_PAGE_BITS);
@@ -357,21 +359,9 @@ static uint64_t rcg_reg(int n)
 }
 
 /*
- * Adds g to list unless it is already there. Each list has room for
- * RCG_MAX_WORDS.
+ * Adds v's temp to list (see rcg_note_temp()). An XMM register has no
+ * global: v is NULL.
  */
-static void rcg_note_temp(TCGTemp **list, unsigned *n, TCGTemp *g)
-{
-    for (unsigned i = 0; i < *n; i++) {
-        if (list[i] == g) {
-            return;
-        }
-    }
-    tcg_debug_assert(*n < RCG_MAX_WORDS);
-    list[(*n)++] = g;
-}
-
-/* The same for v's temp. An XMM register has no global: v is NULL. */
 static void rcg_note(TCGTemp **list, unsigned *n, TCGv v)
 {
     if (v) {
@@ -1046,42 +1036,6 @@ static int rcg_operands(DisasContext *s, X86DecodedInsn *decode, RCGOp op,
         return rcg_form(a, b);
     }
     }
-}
-
-/*
- * Packs the words of g, a gadget that accesses memory, into stream words,
- * matching rcg-gen.py's stream_words(): the narrow words two to a stream
- * word, the first in the low half, then the odd one out alone, then each
- * of the others alone. Returns how many stream words there are. Only the
- * RCG tests, which take every gadget (rcg-gen.py --coverage), check that
- * the two layouts agree.
- */
-static unsigned rcg_pack_words(const RCGGadget *g, uint64_t *words,
-                               unsigned n)
-{
-    uint64_t out[RCG_MAX_WORDS];
-    unsigned nb = 0, i;
-    bool odd = false;
-
-    for (i = 0; i < n; i++) {
-        if (!rcg_word_narrow(g->words[i])) {
-            continue;
-        }
-        tcg_debug_assert((int32_t)words[i] == (int64_t)words[i]);
-        if (odd) {
-            out[nb - 1] = deposit64(out[nb - 1], 32, 32, words[i]);
-        } else {
-            out[nb++] = words[i];
-        }
-        odd = !odd;
-    }
-    for (i = 0; i < n; i++) {
-        if (!rcg_word_narrow(g->words[i])) {
-            out[nb++] = words[i];
-        }
-    }
-    memcpy(words, out, nb * sizeof(uint64_t));
-    return nb;
 }
 
 /*

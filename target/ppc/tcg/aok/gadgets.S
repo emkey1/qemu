@@ -989,13 +989,137 @@ _addr   .req x7
 .endm
 
 /*
+ * What the arithmetic below leaves to this: a result QEMU gives with no flag
+ * raised that the host's own arithmetic does not settle. x1, x2 and x3 are
+ * the operands' bits in the order PowerPC takes a NaN from (frA, frB, frC; an
+ * op of two gives its second twice), frA and frC being what a fused op
+ * multiplies; d0 is the host's result, negated if the op negates; w7 is
+ * whether the op is a single one.
+ *
+ * A quiet NaN operand is passed on, the first in that order (a single op
+ * drops the 29 bits a single has no room for, as QEMU's float64r32 does),
+ * unless another is signalling or the product is infinity times zero: those
+ * are invalid. With no NaN operand, an infinite result of an infinite operand
+ * is exact; any other is an overflow or a zero divide.
+ *
+ * Out: eq, and x10, w16 and w11 as fp_class leaves them; or ne, for the slow
+ * path. x12 and x15 (fp_check's) are kept.
+ */
+    .balign 16
+ppc_fp_special:
+    lsl x4, x1, #1
+    lsl x5, x2, #1
+    lsl x6, x3, #1
+    mov x13, #0xffe0000000000000        /* an infinity, so shifted */
+    cmp x4, x13
+    ccmp x5, x13, #2, ls
+    ccmp x6, x13, #2, ls
+    b.ls 5f                             /* no NaN */
+    cmp x4, x13
+    b.ls 1f
+    tbz x4, #52, 9f                     /* signalling */
+1:  cmp x5, x13
+    b.ls 2f
+    tbz x5, #52, 9f
+2:  cmp x6, x13
+    b.ls 3f
+    tbz x6, #52, 9f
+3:  cmp x4, x13                         /* infinity * 0 */
+    ccmp x6, #0, #0, eq
+    b.eq 9f
+    cmp x6, x13
+    ccmp x4, #0, #0, eq
+    b.eq 9f
+    mov x10, x1
+    cmp x4, x13
+    b.hi 4f
+    mov x10, x2
+    cmp x5, x13
+    b.hi 4f
+    mov x10, x3
+4:  cbz w7, 7f
+    and x10, x10, #0xffffffffe0000000
+7:  mov w16, #0x11                      /* a quiet NaN */
+    b 8f
+5:  fmov x10, d0
+    lsl x14, x10, #1
+    cmp x14, x13
+    b.ne 9f
+    cmp x4, x13
+    ccmp x5, x13, #4, ne
+    ccmp x6, x13, #4, ne
+    b.ne 9f
+    mov w16, #0x05                      /* + infinity, - infinity */
+    mov w17, #0x09
+    cmp x10, #0
+    csel w16, w17, w16, lt
+8:  mov w11, #0
+    cmp w11, #0
+    ret
+9:  cmp x13, #0
+    ret
+
+/* ppc_fp_special for an op of two operands at [1] and [2], or of three: [frA][frC][frB] */
+.macro fp_special2 single, done
+    ldp x9, x10, [_ip, #8]
+    ldr x1, [_cpu, x9]
+    ldr x2, [_cpu, x10]
+    mov x3, x2
+    mov w7, #\single
+    bl ppc_fp_special
+    b.eq \done
+.endm
+.macro fp_special3 single, done
+    ldp x9, x10, [_ip, #8]
+    ldr x11, [_ip, #24]
+    ldr x1, [_cpu, x9]
+    ldr x3, [_cpu, x10]
+    ldr x2, [_cpu, x11]
+    mov w7, #\single
+    bl ppc_fp_special
+    b.eq \done
+.endm
+
+/*
+ * To \slow unless \r is a zero that \a or \c being one makes: that zero is
+ * exact, as a product's underflow to one is not. w11 = 0.
+ */
+.macro fp_zero_of r, a, c, slow
+    fcmp \r, #0.0
+    b.ne \slow
+    fcmp \a, #0.0
+    b.eq 0f
+    fcmp \c, #0.0
+    b.ne \slow
+0:  mov w11, #0
+.endm
+
+/*
+ * A quotient that is a zero: exact if the dividend is one, or the divisor
+ * (d2) an infinity; else an underflow. To \done with w11 = 0, or \slow.
+ */
+.macro fp_zero_quotient a, done, special, slow
+    fcmp d0, #0.0
+    b.ne \special
+    mov w11, #0
+    fcmp \a, #0.0
+    b.eq \done
+    fmov x13, d2
+    lsl x13, x13, #1
+    mov x14, #0xffe0000000000000
+    cmp x13, x14
+    b.eq \done
+    b \slow
+.endm
+
+/*
  * fadd, fsub: [frD][frA][frB][word]. A sum is exact when it is tiny, so only
  * a denormal one is the slow path's; TwoSum is exact wherever the sum is
  * finite.
  */
 .macro fp_addsub name, sub
 .gadget ppc_\name
-    fp_check 8f
+    fp_check 9f
     ldp x9, x10, [_ip, #8]
     ldr d1, [_cpu, x9]
     ldr d2, [_cpu, x10]
@@ -1011,9 +1135,10 @@ _addr   .req x7
     fcmp d6, #0.0
     cset w11, ne
     fp_class 8f
-    fp_store
+1:  fp_store
     gret 4
-8:  fp_slow 24
+8:  fp_special2 0, 1b
+9:  fp_slow 24
     gret 4
 .endm
     fp_addsub fadd, 0
@@ -1021,38 +1146,43 @@ _addr   .req x7
 
 /* fmul: [frD][frA][frC][word]; the error of a product is a*c - r, exact for r >= 2^-969 */
 .gadget ppc_fmul
-    fp_check 8f
+    fp_check 9f
     ldp x9, x10, [_ip, #8]
     ldr d1, [_cpu, x9]
     ldr d2, [_cpu, x10]
     fmul d0, d1, d2
-    exp_in d0, 54, 2046, 8f
+    exp_in d0, 54, 2046, 7f
     fnmsub d4, d1, d2, d0
     fcmp d4, #0.0
     cset w11, ne
-    fp_class 8f
-    fp_store
+2:  fp_class 8f
+1:  fp_store
     gret 4
-8:  fp_slow 24
+7:  fp_zero_of d0, d1, d2, 8f
+    b 2b
+8:  fp_special2 0, 1b
+9:  fp_slow 24
     gret 4
 
 /* fdiv: [frD][frA][frB][word]; a quotient is exact if its remainder a - q*b is 0 */
 .gadget ppc_fdiv
-    fp_check 8f
+    fp_check 9f
     ldp x9, x10, [_ip, #8]
     ldr d1, [_cpu, x9]
     ldr d2, [_cpu, x10]
     fdiv d0, d1, d2
-    exp_in d0, 54, 2046, 8f
-    exp_in d1, 110, 2046, 8f
-    exp_in d2, 54, 2046, 8f
+    exp_in d0, 54, 2046, 7f
+    exp_in d1, 110, 2046, 9f
+    exp_in d2, 54, 2046, 9f
     fmsub d4, d0, d2, d1
     fcmp d4, #0.0
     cset w11, ne
-    fp_class 8f
-    fp_store
+2:  fp_class 8f
+1:  fp_store
     gret 4
-8:  fp_slow 24
+7:  fp_zero_quotient d1, 2b, 8f, 9f
+8:  fp_special2 0, 1b
+9:  fp_slow 24
     gret 4
 
 /* fsqrt: [frD][frB][word]; a square root is exact if x - s*s is 0 */
@@ -1080,10 +1210,18 @@ _addr   .req x7
  * pl = fma(A, C, -ph)), r - B' = d + ed (TwoSum). fnmadd and fnmsub negate
  * the rounded result, as QEMU's float_muladd_negate_result does: so the sign
  * of a zero is theirs.
+ *
+ * Outside the range where that holds three results are still known. Where A
+ * or C is a zero the product is one, and r is B' or a zero, exactly. Where
+ * the product is not zero but under 2^-969, and B' is 2^-913 or more, it is
+ * less than half the distance from B' to a neighbour: r is B', and inexact.
+ * And where r is a zero and the product is in range, the two cancelled: the
+ * product is then a multiple of the smallest denormal, as B' is, so their
+ * sum is, and a sum that small is a double.
  */
 .macro fp_fma name, sub, neg
 .gadget ppc_\name
-    fp_check 8f
+    fp_check 9f
     ldp x9, x10, [_ip, #8]
     ldr x11, [_ip, #24]
     ldr d1, [_cpu, x9]
@@ -1093,9 +1231,9 @@ _addr   .req x7
     fneg d3, d3
     .endif
     fmadd d0, d1, d2, d3
-    exp_in d0, 54, 2046, 8f
     fmul d4, d1, d2             /* ph */
-    exp_in d4, 54, 2045, 8f
+    exp_in d0, 54, 2046, 7f
+    exp_in d4, 54, 2045, 7f
     fnmsub d5, d1, d2, d4       /* pl */
     fsub d6, d0, d3             /* d = r - B' */
     fsub d7, d6, d0
@@ -1106,19 +1244,215 @@ _addr   .req x7
     fcmp d4, d6
     fccmp d5, d17, #0, eq
     cset w11, ne
+2:
     .if \neg
     fneg d0, d0
     .endif
     fp_class 8f
-    fp_store
+1:  fp_store
     gret 5
-8:  fp_slow 32
+7:  fmov x13, d4
+    ubfx x13, x13, #52, #11
+    cmp x13, #54
+    b.hs 0f
+    mov w11, #0                 /* a zero of a zero operand */
+    fcmp d1, #0.0
+    b.eq 2b
+    fcmp d2, #0.0
+    b.eq 2b
+    exp_in d3, 110, 2046, 7f    /* tiny, under a B' it cannot move */
+    mov w11, #1
+    b 2b
+0:  fcmp d0, #0.0               /* cancelled */
+    b.ne 7f
+    cmp x13, #2045
+    b.hi 9f
+    mov w11, #0
+    b 2b
+7:
+    .if \neg
+    fneg d0, d0
+    .endif
+8:  fp_special3 0, 1b
+9:  fp_slow 32
     gret 5
 .endm
     fp_fma fmadd, 0, 0
     fp_fma fmsub, 1, 0
     fp_fma fnmadd, 0, 1
     fp_fma fnmsub, 1, 1
+
+/*
+ * The single-precision ops (fadds and the rest). QEMU's float64r32 helpers
+ * round the exact result once, to a single. Where the operands are singles
+ * (as doubles: a round trip through a single gives each back, which a NaN
+ * fails as well) the host's single arithmetic does the same, and the
+ * error-free transformations above hold in it as they do in double, in the
+ * same ranges scaled to a single's 24 bits. The result goes back to a
+ * double, which is exact, and FPRF is that double's class, as QEMU's is. A
+ * bound below is a double's biased exponent: a single's and 896, so 921 is a
+ * single's 25, 948 its 52, and 1150 its largest, 254. The single result is
+ * kept in s20: d0, where the macros want the double, is s0's register. d0 is
+ * a zero until there is a result, for ppc_fp_special not to take an infinity
+ * some other insn left there.
+ */
+.macro fp_single dreg, sreg, slow
+    fcvt \sreg, \dreg
+    fcvt d24, \sreg
+    fcmp d24, \dreg
+    b.ne \slow
+.endm
+
+/* fadds, fsubs: [frD][frA][frB][word] */
+.macro fp_addsub_s name, sub
+.gadget ppc_\name
+    fp_check 9f
+    ldp x9, x10, [_ip, #8]
+    ldr d1, [_cpu, x9]
+    ldr d2, [_cpu, x10]
+    movi d0, #0
+    fp_single d1, s21, 8f
+    fp_single d2, s22, 8f
+    .if \sub
+    fneg s22, s22
+    .endif
+    fadd s20, s21, s22
+    fsub s4, s20, s21           /* TwoSum's error */
+    fsub s5, s20, s4
+    fsub s6, s21, s5
+    fsub s7, s22, s4
+    fadd s6, s6, s7
+    fcmp s6, #0.0
+    cset w11, ne
+    fcvt d0, s20
+    fp_class 8f
+1:  fp_store
+    gret 4
+8:  fp_special2 1, 1b
+9:  fp_slow 24
+    gret 4
+.endm
+    fp_addsub_s fadds, 0
+    fp_addsub_s fsubs, 1
+
+/* fmuls: [frD][frA][frC][word] */
+.gadget ppc_fmuls
+    fp_check 9f
+    ldp x9, x10, [_ip, #8]
+    ldr d1, [_cpu, x9]
+    ldr d2, [_cpu, x10]
+    movi d0, #0
+    fp_single d1, s21, 8f
+    fp_single d2, s22, 8f
+    fmul s20, s21, s22
+    fcvt d0, s20
+    exp_in d0, 921, 1150, 7f
+    fnmsub s4, s21, s22, s20
+    fcmp s4, #0.0
+    cset w11, ne
+2:  fp_class 8f
+1:  fp_store
+    gret 4
+7:  fp_zero_of d0, d1, d2, 8f
+    b 2b
+8:  fp_special2 1, 1b
+9:  fp_slow 24
+    gret 4
+
+/* fdivs: [frD][frA][frB][word] */
+.gadget ppc_fdivs
+    fp_check 9f
+    ldp x9, x10, [_ip, #8]
+    ldr d1, [_cpu, x9]
+    ldr d2, [_cpu, x10]
+    movi d0, #0
+    fp_single d1, s21, 8f
+    fp_single d2, s22, 8f
+    fdiv s20, s21, s22
+    fcvt d0, s20
+    exp_in d0, 921, 1150, 7f
+    exp_in d1, 948, 1150, 9f
+    exp_in d2, 921, 1150, 9f
+    fmsub s4, s20, s22, s21
+    fcmp s4, #0.0
+    cset w11, ne
+2:  fp_class 8f
+1:  fp_store
+    gret 4
+7:  fp_zero_quotient d1, 2b, 8f, 9f
+8:  fp_special2 1, 1b
+9:  fp_slow 24
+    gret 4
+
+/* fmadds and the rest: [frD][frA][frC][frB][word], as fp_fma */
+.macro fp_fma_s name, sub, neg
+.gadget ppc_\name
+    fp_check 9f
+    ldp x9, x10, [_ip, #8]
+    ldr x11, [_ip, #24]
+    ldr d1, [_cpu, x9]
+    ldr d2, [_cpu, x10]
+    ldr d3, [_cpu, x11]
+    movi d0, #0
+    fp_single d1, s21, 8f
+    fp_single d2, s22, 8f
+    fp_single d3, s23, 8f
+    .if \sub
+    fneg s23, s23
+    .endif
+    fmadd s20, s21, s22, s23
+    fmul s4, s21, s22           /* ph */
+    fcvt d0, s20
+    fcvt d25, s4
+    exp_in d0, 921, 1150, 7f
+    exp_in d25, 921, 1149, 7f
+    fnmsub s5, s21, s22, s4     /* pl */
+    fsub s6, s20, s23           /* d = r - B' */
+    fsub s7, s6, s20
+    fsub s16, s6, s7
+    fsub s17, s20, s16
+    fadd s18, s23, s7
+    fsub s17, s17, s18          /* ed */
+    fcmp s4, s6
+    fccmp s5, s17, #0, eq
+    cset w11, ne
+2:
+    .if \neg
+    fneg d0, d0
+    .endif
+    fp_class 8f
+1:  fp_store
+    gret 5
+7:  fmov x13, d25
+    ubfx x13, x13, #52, #11
+    cmp x13, #921
+    b.hs 0f
+    mov w11, #0
+    fcmp d1, #0.0
+    b.eq 2b
+    fcmp d2, #0.0
+    b.eq 2b
+    exp_in d3, 948, 1150, 7f
+    mov w11, #1
+    b 2b
+0:  fcmp d0, #0.0
+    b.ne 7f
+    cmp x13, #1149
+    b.hi 9f
+    mov w11, #0
+    b 2b
+7:
+    .if \neg
+    fneg d0, d0
+    .endif
+8:  fp_special3 1, 1b
+9:  fp_slow 32
+    gret 5
+.endm
+    fp_fma_s fmadds, 0, 0
+    fp_fma_s fmsubs, 1, 0
+    fp_fma_s fnmadds, 0, 1
+    fp_fma_s fnmsubs, 1, 1
 
 /*
  * frsp: [frD][frB][word] -- to a single and back, which is exact; inexact if

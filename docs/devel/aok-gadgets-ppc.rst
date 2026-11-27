@@ -18,10 +18,10 @@ size, update and indexed form and the byte-reversed ones, ``lmw`` and
 CTR or on both, ``blr`` (also on a CR bit), ``bctr`` and their linking forms,
 ``sync`` in user mode, ``eieio``, ``dcbt`` and ``dcbtst``, traps with TO 0
 (which do nothing); and floating point: the loads and stores, ``fmr``,
-``fneg``, ``fabs``, ``fnabs``, ``fsel``, the double-precision arithmetic, the
-fused multiply-adds, ``fsqrt``, ``frsp``, ``fctiw``, ``fctiwz``, ``fcmpu``,
-``fcmpo``, ``mffs``, and as calls to C the single-precision arithmetic, the
-estimates and the FPSCR's other insns.
+``fneg``, ``fabs``, ``fnabs``, ``fsel``, the arithmetic and the fused
+multiply-adds in double and in single precision, ``fsqrt``, ``frsp``,
+``fctiw``, ``fctiwz``, ``fcmpu``, ``fcmpo``, ``mffs``, and as calls to C
+``fsqrts``, the estimates and the FPSCR's other insns.
 
 * ``lmw``, ``stmw``, ``dcbz`` and ``mftb`` are one call to C, QEMU's own
   helpers. ``lwarx`` and ``stwcx.`` are one call each, what TCG generates
@@ -115,6 +115,33 @@ host's) could disagree, and operands outside that range, all go to C.
 ``float_muladd_negate_result`` does, so that the sign of a zero is theirs.
 ``fctiw`` returns the word sign-extended, as QEMU's helper does.
 
+The single-precision ops (``fadds`` and the rest) are QEMU's ``float64r32``
+helpers: the exact result rounded once, to a single. Where the operands are
+singles (a round trip through a single gives each back) the host's single
+arithmetic is that, the same transformations hold in it in the same ranges
+scaled to 24 bits, and the result is widened again, which is exact. An
+operand that is no single goes to C.
+
+Some results outside those ranges are settled by the values alone, and the
+gadgets finish them too, since programs meet them in loops (Xbench's FP
+tests under Mac OS X did 43 million insns in C until these were added, and
+87 thousand after, nearly all of them ``fctiw`` with FPSCR's RN set):
+
+* A product with a zero operand is an exact zero, and a fused op with one is
+  its addend, or a zero. A zero quotient of a zero dividend or of an infinite
+  divisor is exact. (A zero that is an underflow stays C's.)
+* A fused op whose product is not zero but under 2^-969 (2^-102 for a
+  single), and whose addend is 2^-913 or more (2^-75), gives the addend,
+  inexact.
+* A fused op whose result is a zero while its product is in range cancelled
+  exactly: the product is then a multiple of the smallest denormal.
+* A quiet NaN operand is passed on, PowerPC's choice of them: frA, then frB,
+  then frC, and a single op clears the 29 bits a single has no room for, as
+  ``float64r32`` does. A signalling NaN, or infinity times zero beside a
+  quiet one, is invalid and stays C's.
+* An infinite result of an infinite operand is exact; any other infinity is
+  an overflow or a zero divide.
+
 For iSH-AOK
 ===========
 
@@ -156,7 +183,15 @@ without pairs.
 ``fpstress`` (aok-vm's ``aok/bench-pm/stress``) runs two million FP ops on
 operands chosen to sit where the gadgets draw their lines: exponents near
 the bottom and top of the range, zeros, denormals, infinities, NaNs, values
-with few mantissa bits so that many results are exact, in random rounding
+with few mantissa bits so that many results are exact, and for one op in
+eight an addend that is the product or its negative, in random rounding
 modes and with random sticky bits in FPSCR, and hashes the result and
-FPSCR after each. Its ten hashes are identical; with XX left unset on an
-inexact result, all ten differ.
+FPSCR after each; then two million of the single-precision ops, on operands
+that are mostly singles. Its twenty hashes are identical with
+``QEMU_AOK=0`` and with the gadgets. Eighteen faults put into the gadgets
+one at a time (aok-vm's ``aok/bench-pm/fp``: a result called exact that is
+not, operands swapped, a NaN taken from the wrong operand or with its low
+bits kept, a signalling NaN let through, an overflow taken for an infinite
+operand's, a zero's sign) each change ten or all twenty. The cancelled sums
+needed the addends above: before the test had them, a wrong sign there
+changed no hash.

@@ -55,6 +55,8 @@ LDST(stfd) LDST(stfdu) DECL(stfiwx)
 DECL(fmr) DECL(fneg) DECL(fabs) DECL(fnabs) DECL(fsel) DECL(cr1)
 DECL(fadd) DECL(fsub) DECL(fmul) DECL(fdiv) DECL(fsqrt)
 DECL(fmadd) DECL(fmsub) DECL(fnmadd) DECL(fnmsub)
+DECL(fadds) DECL(fsubs) DECL(fmuls) DECL(fdivs)
+DECL(fmadds) DECL(fmsubs) DECL(fnmadds) DECL(fnmsubs)
 DECL(frsp) DECL(fctiw) DECL(fctiwz) DECL(fcmp) DECL(mffs)
 
 typedef void (*Gadget)(void);
@@ -206,6 +208,137 @@ FSTORE_HELPER(fstore64, cpu_stq_mmu, MO_BEUQ)
  * single-precision ops and the estimates. A record form's CR1 is the gadget
  * after this one.
  */
+/*
+ * QEMU_AOK_STATS: the FP insns done by QEMU's helpers, by [double, single,
+ * the compares and conversions][low five bits of the extended opcode], and
+ * how many of them came with FPSCR in a state no gadget takes (RN, NI or an
+ * enable). The rest were a gadget's slow path, or an insn that has none.
+ */
+static uint64_t aok_ppc_fp_helped[3][32], aok_ppc_fp_helped_slow;
+
+/*
+ * Why an arithmetic insn was not a gadget's to finish, the first of these
+ * that holds: FPSCR; an operand a signalling NaN, a quiet one, an infinity,
+ * a zero, a denormal; (single ops) an operand that is no single; the result
+ * zero; the result a NaN or an infinity; and where the gadget's check of
+ * exactness does not hold: the product tiny, or huge, or the result tiny
+ * (a denormal too); or something else.
+ */
+enum { WHY_FPSCR, WHY_SNAN, WHY_QNAN, WHY_INF, WHY_ZERO, WHY_DENORMAL,
+       WHY_NOT_SINGLE, WHY_RESULT_ZERO, WHY_RESULT_NONFINITE,
+       WHY_PRODUCT_TINY, WHY_PRODUCT_HUGE, WHY_RESULT_TINY, WHY_RANGE,
+       WHY_NB };
+static uint64_t aok_ppc_fp_why[2][32][WHY_NB];
+
+static int aok_ppc_fp_class(uint64_t v)
+{
+    unsigned e = (v >> 52) & 0x7ff;
+
+    return e == 0x7ff ? ((v << 12) == 0 ? WHY_INF
+                         : (v >> 51) & 1 ? WHY_QNAN : WHY_SNAN)
+           : (v << 1) == 0 ? WHY_ZERO : e == 0 ? WHY_DENORMAL : -1;
+}
+
+static bool aok_ppc_fp_is_single(uint64_t v)
+{
+    union { double d; uint64_t u; } x = { .u = v }, y;
+
+    y.d = (float)x.d;
+    return y.u == x.u;
+}
+
+static void aok_ppc_fp_note_why(CPUPPCState *env, bool s, unsigned xo5,
+                                uint64_t fa, uint64_t fb, uint64_t fc,
+                                uint64_t r, bool fpscr_slow)
+{
+    /* which of frA, frB, frC the insn reads: A-form's bits */
+    bool ra = xo5 != 22 && xo5 != 24 && xo5 != 26;
+    bool rb = xo5 != 25, rc = xo5 == 25 || xo5 >= 28;
+    int why = -1, k;
+
+    if (fpscr_slow) {
+        why = WHY_FPSCR;
+    }
+    for (int rank = WHY_SNAN; why < 0 && rank <= WHY_DENORMAL; rank++) {
+        if ((ra && aok_ppc_fp_class(fa) == rank) ||
+            (rb && aok_ppc_fp_class(fb) == rank) ||
+            (rc && aok_ppc_fp_class(fc) == rank)) {
+            why = rank;
+        }
+    }
+    if (why < 0 && s && ((ra && !aok_ppc_fp_is_single(fa)) ||
+                         (rb && !aok_ppc_fp_is_single(fb)) ||
+                         (rc && !aok_ppc_fp_is_single(fc)))) {
+        why = WHY_NOT_SINGLE;
+    }
+    if (why < 0) {
+        union { uint64_t u; double d; } x = { .u = fa }, y = { .u = fc }, p;
+        unsigned lo = s ? 921 : 54, hi = s ? 1149 : 2045, e;
+
+        p.d = x.d * y.d;
+        e = (p.u >> 52) & 0x7ff;
+        k = aok_ppc_fp_class(r);
+        why = k == WHY_ZERO ? WHY_RESULT_ZERO
+              : k >= WHY_SNAN && k <= WHY_INF ? WHY_RESULT_NONFINITE
+              : rc && e < lo ? WHY_PRODUCT_TINY
+              : rc && e > hi ? WHY_PRODUCT_HUGE
+              : ((r >> 52) & 0x7ff) < lo ? WHY_RESULT_TINY : WHY_RANGE;
+    }
+    aok_ppc_fp_why[s][xo5][why]++;
+}
+
+static void __attribute__((destructor)) aok_ppc_fp_stats(void)
+{
+    static const char *const kind[3] = { "double", "single", "cmp/conv" };
+    uint64_t all = 0;
+
+    for (int k = 0; k < 3; k++) {
+        for (int i = 0; i < 32; i++) {
+            all += aok_ppc_fp_helped[k][i];
+        }
+    }
+    if (!aok_stats_enabled || !all) {
+        return;
+    }
+    fprintf(stderr, "aok: ppc: %" PRIu64 " FP insns by QEMU's helpers, %"
+            PRIu64 " of them with FPSCR's RN, NI or an enable set:", all,
+            aok_ppc_fp_helped_slow);
+    for (int k = 0; k < 3; k++) {
+        for (int i = 0; i < 32; i++) {
+            if (aok_ppc_fp_helped[k][i]) {
+                fprintf(stderr, " %s/%d:%" PRIu64, kind[k], i,
+                        aok_ppc_fp_helped[k][i]);
+            }
+        }
+    }
+    fprintf(stderr, "\n");
+    for (int k = 0; k < 2; k++) {
+        for (int i = 0; i < 32; i++) {
+            static const char *const why[WHY_NB] = {
+                "fpscr", "snan", "qnan", "inf", "zero", "denormal",
+                "not-a-single", "result-zero", "result-nan-or-inf",
+                "product-tiny", "product-huge", "result-tiny", "range"
+            };
+            uint64_t n = 0;
+
+            for (int w = 0; w < WHY_NB; w++) {
+                n += aok_ppc_fp_why[k][i][w];
+            }
+            if (!n) {
+                continue;
+            }
+            fprintf(stderr, "aok: ppc: %s/%d, why:", kind[k], i);
+            for (int w = 0; w < WHY_NB; w++) {
+                if (aok_ppc_fp_why[k][i][w]) {
+                    fprintf(stderr, " %s %" PRIu64, why[w],
+                            aok_ppc_fp_why[k][i][w]);
+                }
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+}
+
 void aok_ppc_helper_fp(CPUPPCState *env, uint64_t pc, uint64_t insn);
 void aok_ppc_helper_fp(CPUPPCState *env, uint64_t pc, uint64_t insn)
 {
@@ -215,10 +348,15 @@ void aok_ppc_helper_fp(CPUPPCState *env, uint64_t pc, uint64_t insn)
     uint64_t fb = *cpu_fpr_ptr(env, (insn >> 11) & 31);
     uint64_t fc = *cpu_fpr_ptr(env, (insn >> 6) & 31);
     bool s = op == 59, fprf = true;
+    bool fpscr_slow = (env->fpscr & AOK_PPC_FPSCR_SLOW) != 0;
     uint64_t r;
 
     aok_no_retaddr();
     env->nip = pc;
+    if (unlikely(aok_stats_enabled)) {
+        aok_ppc_fp_helped[op == 63 && xo5 < 16 ? 2 : s][xo5]++;
+        aok_ppc_fp_helped_slow += fpscr_slow;
+    }
     helper_reset_fpstatus(env);
     if (op == 63 && xo5 < 16) {
         switch (xo) {
@@ -270,6 +408,9 @@ void aok_ppc_helper_fp(CPUPPCState *env, uint64_t pc, uint64_t insn)
         default:
             g_assert_not_reached();
         }
+    }
+    if (unlikely(aok_stats_enabled) && !(op == 63 && xo5 < 16)) {
+        aok_ppc_fp_note_why(env, s, xo5, fa, fb, fc, r, fpscr_slow);
     }
     *cpu_fpr_ptr(env, t) = r;
     if (fprf) {
@@ -661,14 +802,35 @@ static int fp_op(Ctx *c, unsigned op)
         return rc1(c);
     }
     if (op == 59) {
-        /* single precision, and fres: QEMU's helpers (aok_ppc_helper_fp) */
+        /* single precision: the operand words of the double forms */
         switch (xo5) {
-        case 18: case 20: case 21: case 22: case 24: case 25:
-        case 28: case 29: case 30: case 31:
-            call(c, aok_ppc_helper_fp);
+        case 18: gadget = G(fdivs); break;
+        case 20: gadget = G(fsubs); break;
+        case 21: gadget = G(fadds); break;
+        case 25:
+            emit3(c, G(fmuls), fpr(t), fpr(a), fpr(cc));
+            aok_emit(&c->g, mem_word(c));
+            return rc1(c);
+        case 28: case 29: case 30: case 31: {
+            static const Gadget m[4] = {
+                G(fmsubs), G(fmadds), G(fnmsubs), G(fnmadds)
+            };
+
+            emit3(c, m[xo5 - 28], fpr(t), fpr(a), fpr(cc));
+            aok_emit(&c->g, fpr(b));
+            aok_emit(&c->g, mem_word(c));
             return rc1(c);
         }
-        return UNKNOWN;
+        case 22: case 24:
+            /* fsqrts and fres: QEMU's helpers (aok_ppc_helper_fp) */
+            call(c, aok_ppc_helper_fp);
+            return rc1(c);
+        default:
+            return UNKNOWN;
+        }
+        emit3(c, gadget, fpr(t), fpr(a), fpr(b));
+        aok_emit(&c->g, mem_word(c));
+        return rc1(c);
     }
     switch (xo5) {
     case 18: gadget = G(fdiv); break;

@@ -26,7 +26,9 @@ also what sent Mac OS X's and Mac OS 9's streams to TCG most (below): the
 OE forms, ``bcctr`` on a CR bit, ``mfocrf`` and ``mtocrf``, AltiVec's
 ``lvx`` and ``stvx`` and its hints, ``lswi`` and ``stswi``, the cache insns,
 and for a supervisor ``mfmsr``, ``mtmsr``, the segment register moves,
-``isync``, ``sync`` and ``rfi``; and AltiVec (below).
+``isync``, ``sync`` and ``rfi``; AltiVec (below); and ``sc``, the
+decrementer's ``mfspr`` and ``mtspr``, ``tlbie`` and ``tlbsync``, ``lswx``
+and ``stswx``.
 
 * ``lmw``, ``stmw``, ``dcbz`` and ``mftb`` are one call to C, QEMU's own
   helpers. ``lwarx`` and ``stwcx.`` are one call each, what TCG generates
@@ -40,13 +42,11 @@ and for a supervisor ``mfmsr``, ``mtmsr``, the segment register moves,
 * Where the architecture leaves a result undefined, the gadgets give QEMU's:
   ``divw`` and ``divwu`` by zero, and ``0x80000000 / -1``, leave rA in rD;
   ``sraw`` writes CA32 as QEMU's helper does, ``srawi`` does not.
-* Left to TCG, where its TB ends or an exception is due: ``sc``, traps
-  that test something, the
-  forms QEMU takes for illegal (an update load whose rA is 0 or rD, an
-  update store whose rA is 0, ``lwbrx.``), ``mcrfs``, ``bclrl`` on a CR
-  bit, a ``bcctr`` that counts, ``lswx``, ``tlbie``, the decrementer, and
-  every FP insn while MSR[FP] is clear and every AltiVec one while MSR[VR]
-  is.
+* Left to TCG, where its TB ends or an exception is due: traps that test
+  something, the forms QEMU takes for illegal (an update load whose rA is 0
+  or rD, an update store whose rA is 0, ``lwbrx.``), ``mcrfs``, ``bclrl`` on
+  a CR bit, a ``bcctr`` that counts, the BAT registers' ``mtspr``, and every
+  FP insn while MSR[FP] is clear and every AltiVec one while MSR[VR] is.
 
 A TB is translated only for a big-endian guest (MSR[LE] clear) that is not
 single-stepping or tracing branches (MSR[SE], MSR[BE]), which TCG turns into
@@ -193,6 +193,9 @@ truncates, saturates and gives 0 for a NaN, and a lane has saturated where
 the scaled value is outside the integer's range (for ``vctuxs``, at -1 or
 below: QEMU truncates before it looks).
 
+``QEMU_AOK_NO_ALTIVEC`` in the environment leaves AltiVec to TCG again, for
+a comparison in one binary.
+
 Xbench 1.3 under Mac OS X 10.4.11, this engine beside the one before, on an
 Apple M5 Max: vecLib FFT 4.42 to 50.60 (0.146 to 1.67 Gflop/s), and with it
 the CPU test 17.45 to 62.82; the other lines of the CPU, thread and memory
@@ -329,10 +332,23 @@ about 30 s where it took about 50 (two machines side by side, a picture
 every ten seconds). Xbench under Mac OS X, alone, before and
 after: Memory test 38.3 to 128.6 (Fill 23.9 to 254, Copy 47.9 to 284, the
 AltiVec stream tests 46.9 to 202); the CPU and thread tests as they were.
-What still begins TCG's TBs, of 3.4 million entries in that run once AltiVec
-had gadgets: ``sc`` (half), the decrementer's ``mfspr`` (a third) and
-``mtspr``, ``tlbie`` and ``tlbsync``, ``lswx``, and in Mac OS 9 the trap
-``twi 31``.
+Once AltiVec had gadgets TCG's code was entered 3.4 million times in that
+run: for ``sc`` (half), the decrementer's ``mfspr`` (a third) and ``mtspr``,
+``tlbie`` and ``tlbsync``, and ``lswx``. Those are in the streams too:
+
+* ``sc`` is a call that raises the exception from the insn's own address,
+  as TCG's code does, and does not return: one pass of the main loop where
+  there were two and a TB of one insn.
+* The decrementer's moves are QEMU's helpers, for a supervisor on a CPU
+  that registers DEC with QEMU's callbacks. ``tlbie`` is its helper and the
+  flush it asks of the next ``sync`` or ``isync``; ``tlbsync`` is nothing
+  (on a CPU that is not BookE); ``lswx`` and ``stswx`` are the helpers
+  ``lswi`` and ``stswi`` have.
+
+After: 45 thousand entries, the BAT registers' ``mtspr`` and insns that trap
+because MSR[FP] or MSR[VR] is clear. Xbench's lines did not move with it,
+side by side: its tests are loops of a user's code. In Mac OS 9 the trap
+``twi 31`` is still TCG's.
 
 For iSH-AOK
 ===========
@@ -394,8 +410,12 @@ alignment, by a page's end and into a page that is not there, ``mfocrf``
 and ``mtocrf`` with every kind of mask, the OE forms from every state of
 XER, ``bcctr`` on a CR bit, ``lswi`` and ``stswi`` of every length, the
 hints and cache insns; forty-two lines, the same with and without the
-gadgets. ``ctxtest`` covers the supervisor's. Seventeen faults put into
-these gadgets one at a time are each seen by one or the other.
+gadgets. ``ctxtest`` covers the supervisor's, and since the insns above the
+decrementer set and read twice, an ``sc`` whose handler returns to the insn
+after it, ``tlbsync``, and ``lswx`` and ``stswx`` of seven bytes. Seventeen
+faults put into the first gadgets one at a time are each seen by one or the
+other, and eight put into the later ones by ``ctxtest``, each in the test
+written for it.
 
 ``avstress`` (aok-vm's ``aok/bench-pm/av``) has a function for every AltiVec
 insn and every value of its immediate, 719 of them with the forms that write

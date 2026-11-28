@@ -158,10 +158,13 @@ static const AokPair ppc_pair_list[] = {
 
 static AokPairSet ppc_pairs = { ppc_pair_list, ARRAY_SIZE(ppc_pair_list) };
 static bool ppc_pairs_on;
+/* QEMU_AOK_NO_ALTIVEC: AltiVec's own opcode and lvsl, lvsr and the element loads and stores are TCG's again */
+static bool ppc_altivec_on;
 
 static void __attribute__((constructor)) ppc_pairs_init(void)
 {
     ppc_pairs_on = !getenv("QEMU_AOK_NO_PAIRS");
+    ppc_altivec_on = !getenv("QEMU_AOK_NO_ALTIVEC");
     ppc_pairs.forward = !getenv("QEMU_AOK_NO_FWD");
     aok_pair_set_init(&ppc_pairs);
 }
@@ -809,6 +812,49 @@ static void aok_ppc_vc(CPUPPCState *env, uint64_t pc, uint64_t insn)
     aok_ppc_helper_vfp(env, insn);
 }
 
+/* lswx, stswx: QEMU's helpers, at (rA|0) + rB, XER's low seven bits the count */
+static void aok_ppc_lswx(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    unsigned rt = (insn >> 21) & 31;
+    target_ulong ea = ea_x(env, insn);
+
+    aok_ppc_sync(env, pc);
+    if (((insn >> 1) & 0x3ff) == 533) {
+        /* (raises a program exception itself where rA or rB would be loaded) */
+        helper_lswx(env, ea, rt, (insn >> 16) & 31, (insn >> 11) & 31);
+    } else {
+        helper_stsw(env, ea, env->xer & 0x7f, rt);
+    }
+}
+
+/*
+ * sc: the exception, from the insn's own address (delivering it moves nip
+ * on), as gen_exception_err() raises it. It does not return.
+ */
+static void aok_ppc_sc(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    env->nip = pc;
+    raise_exception_err_ra(env, POWERPC_EXCP_SYSCALL, (insn >> 5) & 1, 0);
+}
+
+/* mfspr and mtspr of the decrementer: QEMU's helpers, as spr_read_decr and spr_write_decr call them */
+static void aok_ppc_mfdec(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    env->gpr[(insn >> 21) & 31] = helper_load_decr(env);
+}
+
+static void aok_ppc_mtdec(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    helper_store_decr(env, env->gpr[(insn >> 21) & 31]);
+}
+
+/* tlbie: QEMU's helper, and the flush it asks of the next sync or isync, as do_tlbie() generates */
+static void aok_ppc_tlbie(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    helper_tlbie(env, env->gpr[(insn >> 11) & 31]);
+    env->tlb_need_flush |= TLB_NEED_GLOBAL_FLUSH;
+}
+
 /* lmw, stmw: QEMU's own helpers, at (rA|0) + d (TCG checks no form of them). */
 static void aok_ppc_lmw(CPUPPCState *env, uint64_t pc, uint64_t insn)
 {
@@ -837,6 +883,7 @@ typedef struct Ctx {
     bool pr;                /* user mode (MSR[PR]) */
     bool fp;                /* the FPU on (MSR[FP]); else FP insns are TCG's to trap */
     bool vr;                /* AltiVec on (MSR[VR]); likewise */
+    bool hv;                /* HFLAGS_HV: on a CPU without a hypervisor mode, always */
     CPUPPCState *env;
     /* Where each gadget of the current insn began: the steps aok_gen_pair takes. */
     uint64_t *gs[8];
@@ -1074,7 +1121,7 @@ static int altivec(Ctx *c)
     unsigned e = (insn >> 6) & 31, xo = insn & 0x7ff;
     uint64_t sat = offsetof(CPUPPCState, vscr_sat);
 
-    if (!c->vr || !has(c, PPC_ALTIVEC)) {
+    if (!c->vr || !has(c, PPC_ALTIVEC) || !ppc_altivec_on) {
         return UNKNOWN;
     }
     if ((insn & 0x3f) >= 32) {
@@ -1719,6 +1766,10 @@ static int op31(Ctx *c)
             emit2(c, G(mov), gpr(d), offsetof(CPUPPCState, spr[spr(insn)]));
             return NEXT;
         }
+        if (spr(insn) == SPR_DECR && !c->pr && c->hv &&
+            c->env->spr_cb[SPR_DECR].hea_read == spr_read_decr) {
+            return call(c, aok_ppc_mfdec);
+        }
         return UNKNOWN;
     case 467:   /* mtspr (Rc is ignored) */
         switch (spr(insn)) {
@@ -1736,6 +1787,10 @@ static int op31(Ctx *c)
         if (spr_generic(c, spr(insn), true)) {
             emit2(c, G(mov), offsetof(CPUPPCState, spr[spr(insn)]), gpr(d));
             return NEXT;
+        }
+        if (spr(insn) == SPR_DECR && !c->pr && c->hv &&
+            c->env->spr_cb[SPR_DECR].hea_write == spr_write_decr) {
+            return call(c, aok_ppc_mtdec);
         }
         return UNKNOWN;
 
@@ -1807,18 +1862,30 @@ static int op31(Ctx *c)
     case 725:
         return (insn & 1) || !has(c, PPC_STRING) ? UNKNOWN
                                                   : call(c, aok_ppc_lsw);
+    case 533: case 661:     /* lswx, stswx */
+        return (insn & 1) || !has(c, PPC_STRING) ? UNKNOWN
+                                                  : call(c, aok_ppc_lswx);
+    case 306:               /* tlbie: its reserved fields are ignored */
+        if (c->pr || !c->hv || !has(c, PPC_MEM_TLBIE) ||
+            (c->env->insns_flags2 & PPC2_ISA300)) {
+            return UNKNOWN;
+        }
+        return call(c, aok_ppc_tlbie);
+    case 566:               /* tlbsync: nothing, but on a BookE CPU */
+        return (insn & 0x03fff801) || c->pr || !c->hv ||
+               !has(c, PPC_MEM_TLBSYNC) || has(c, PPC_BOOKE) ? UNKNOWN : NEXT;
     /* AltiVec's aligned loads and stores (the l forms hint at the cache) */
     case 103: case 359:
         return vldst(c, G(lvx), d, a, b);
     case 6: case 38:        /* lvsl, lvsr */
-        if (!c->vr || !has(c, PPC_ALTIVEC) || (insn & 1)) {
+        if (!c->vr || !has(c, PPC_ALTIVEC) || (insn & 1) || !ppc_altivec_on) {
             return UNKNOWN;
         }
         emit3(c, xo == 6 ? G(lvsl) : G(lvsr), avr(d), base(a), gpr(b));
         return NEXT;
     case 7: case 39: case 71: case 135: case 167: case 199:
         /* lvebx, lvehx, lvewx, stvebx, stvehx, stvewx */
-        if (!c->vr || !has(c, PPC_ALTIVEC) || (insn & 1)) {
+        if (!c->vr || !has(c, PPC_ALTIVEC) || (insn & 1) || !ppc_altivec_on) {
             return UNKNOWN;
         }
         return call(c, aok_ppc_vc);
@@ -1885,6 +1952,11 @@ static int insn32(Ctx *c)
         return a ? ri(c, G(addi), d, a, (uint32_t)simm << 16)
                  : li(c, d, (uint32_t)simm << 16);
     case 16: return bc(c);
+    case 17:    /* sc */
+        if ((insn & 0x03fff01d) || !(insn & 2) || !has(c, PPC_FLOW)) {
+            return UNKNOWN;
+        }
+        return call_as(c, G(call_exit), aok_ppc_sc, END);
     case 18: return branch(c);
     case 19: return op19(c);
     case 20: case 21: {
@@ -2001,6 +2073,7 @@ int ppc_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     c.pr = flags & (1 << HFLAGS_PR);
     c.fp = flags & (1 << HFLAGS_FP);
     c.vr = flags & (1 << HFLAGS_VR);
+    c.hv = flags & (1 << HFLAGS_HV);
     c.env = cpu_env(cs);
     c.no_goto_ptr = cflags & CF_NO_GOTO_PTR;
     aok_gen_begin(&c.g, cs, tb, *max_insns, (flags >> HFLAGS_DMMU_IDX) & 7);

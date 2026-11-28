@@ -65,6 +65,65 @@ DECL(fadds) DECL(fsubs) DECL(fmuls) DECL(fdivs)
 DECL(fmadds) DECL(fmsubs) DECL(fnmadds) DECL(fnmsubs)
 DECL(frsp) DECL(fctiw) DECL(fctiwz) DECL(fcmp) DECL(mffs)
 
+/*
+ * AltiVec's VX forms by their extended opcode, eleven bits: RR is [vD][vA]
+ * [vB], SAT has the offset of vscr_sat after it, R1 is [vD][vB] (vA's field
+ * is zero), FP and FP1 are RR and R1 with the insn after them, for C.
+ */
+#define VX_LIST(X) \
+    X(0, RR, vaddubm) X(64, RR, vadduhm) X(128, RR, vadduwm) \
+    X(384, RR, vaddcuw) X(1024, RR, vsububm) X(1088, RR, vsubuhm) \
+    X(1152, RR, vsubuwm) X(1408, RR, vsubcuw) \
+    X(2, RR, vmaxub) X(66, RR, vmaxuh) X(130, RR, vmaxuw) \
+    X(258, RR, vmaxsb) X(322, RR, vmaxsh) X(386, RR, vmaxsw) \
+    X(514, RR, vminub) X(578, RR, vminuh) X(642, RR, vminuw) \
+    X(770, RR, vminsb) X(834, RR, vminsh) X(898, RR, vminsw) \
+    X(1026, RR, vavgub) X(1090, RR, vavguh) X(1154, RR, vavguw) \
+    X(1282, RR, vavgsb) X(1346, RR, vavgsh) X(1410, RR, vavgsw) \
+    X(4, RR, vrlb) X(68, RR, vrlh) X(132, RR, vrlw) \
+    X(260, RR, vslb) X(324, RR, vslh) X(388, RR, vslw) X(452, RR, vsl) \
+    X(516, RR, vsrb) X(580, RR, vsrh) X(644, RR, vsrw) X(708, RR, vsr) \
+    X(772, RR, vsrab) X(836, RR, vsrah) X(900, RR, vsraw) \
+    X(1028, RR, vand) X(1092, RR, vandc) X(1156, RR, vor) \
+    X(1220, RR, vxor) X(1284, RR, vnor) \
+    X(8, RR, vmuloub) X(72, RR, vmulouh) X(264, RR, vmulosb) \
+    X(328, RR, vmulosh) X(520, RR, vmuleub) X(584, RR, vmuleuh) \
+    X(776, RR, vmulesb) X(840, RR, vmulesh) \
+    X(12, RR, vmrghb) X(76, RR, vmrghh) X(140, RR, vmrghw) \
+    X(268, RR, vmrglb) X(332, RR, vmrglh) X(396, RR, vmrglw) \
+    X(1036, RR, vslo) X(1100, RR, vsro) \
+    X(14, RR, vpkuhum) X(78, RR, vpkuwum) \
+    X(512, SAT, vaddubs) X(576, SAT, vadduhs) X(640, SAT, vadduws) \
+    X(768, SAT, vaddsbs) X(832, SAT, vaddshs) X(896, SAT, vaddsws) \
+    X(1536, SAT, vsububs) X(1600, SAT, vsubuhs) X(1664, SAT, vsubuws) \
+    X(1792, SAT, vsubsbs) X(1856, SAT, vsubshs) X(1920, SAT, vsubsws) \
+    X(1544, SAT, vsum4ubs) X(1800, SAT, vsum4sbs) X(1608, SAT, vsum4shs) \
+    X(1672, SAT, vsum2sws) X(1928, SAT, vsumsws) \
+    X(142, SAT, vpkuhus) X(206, SAT, vpkuwus) X(270, SAT, vpkshus) \
+    X(334, SAT, vpkswus) X(398, SAT, vpkshss) X(462, SAT, vpkswss) \
+    X(526, R1, vupkhsb) X(590, R1, vupkhsh) \
+    X(654, R1, vupklsb) X(718, R1, vupklsh) \
+    X(10, FP, vaddfp) X(74, FP, vsubfp) X(1034, FP, vmaxfp) \
+    X(1098, FP, vminfp) \
+    X(266, FP1, vrefp) X(330, FP1, vrsqrtefp) X(522, FP1, vrfin) \
+    X(586, FP1, vrfiz) X(650, FP1, vrfip) X(714, FP1, vrfim)
+#define VX_DECL(xo, kind, name) DECL(name)
+VX_LIST(VX_DECL)
+/* The compares, by ten bits; the record form is the eleventh */
+#define VC_LIST(X) \
+    X(6, vcmpequb) X(70, vcmpequh) X(134, vcmpequw) \
+    X(518, vcmpgtub) X(582, vcmpgtuh) X(646, vcmpgtuw) \
+    X(774, vcmpgtsb) X(838, vcmpgtsh) X(902, vcmpgtsw) \
+    X(198, vcmpeqfp) X(454, vcmpgefp) X(710, vcmpgtfp)
+#define VC_DECL(xo, name) DECL(name) DECL(name##_rc)
+VC_LIST(VC_DECL)
+DECL(vspltb) DECL(vsplth) DECL(vspltw) DECL(vli) DECL(vmr)
+DECL(vsldoi) DECL(vperm) DECL(vsel) DECL(vmladduhm)
+DECL(vmhaddshs) DECL(vmhraddshs) DECL(vmsumubm) DECL(vmsummbm)
+DECL(vmsumuhm) DECL(vmsumshm) DECL(vmsumuhs) DECL(vmsumshs)
+DECL(vmaddfp) DECL(vnmsubfp) DECL(vcfsx) DECL(vcfux) DECL(vctsxs)
+DECL(vctuxs) DECL(mfvscr) DECL(lvsl) DECL(lvsr)
+
 typedef void (*Gadget)(void);
 
 /*
@@ -663,6 +722,93 @@ void aok_ppc_helper_stvx(CPUPPCState *env, uint64_t addr, uint64_t pc,
     cpu_stq_mmu(env, (uint32_t)addr + 8, v->VsrD(1), oi, 0);
 }
 
+/*
+ * An AltiVec FP insn whose operands or result the host's arithmetic would
+ * not give QEMU's for (a NaN, a denormal, a result under the least normal
+ * number), and the few that are always QEMU's helpers: its own for the
+ * insn. None of them can trap.
+ */
+static uint64_t aok_ppc_vfp_helped;
+
+static void __attribute__((destructor)) aok_ppc_vfp_stats(void)
+{
+    if (aok_stats_enabled && aok_ppc_vfp_helped) {
+        fprintf(stderr, "aok: ppc: %" PRIu64 " AltiVec FP insns by QEMU's "
+                "helpers\n", aok_ppc_vfp_helped);
+    }
+}
+
+void aok_ppc_helper_vfp(CPUPPCState *env, uint64_t insn);
+void aok_ppc_helper_vfp(CPUPPCState *env, uint64_t insn)
+{
+    ppc_avr_t *d = cpu_avr_ptr(env, (insn >> 21) & 31);
+    ppc_avr_t *a = cpu_avr_ptr(env, (insn >> 16) & 31);
+    ppc_avr_t *b = cpu_avr_ptr(env, (insn >> 11) & 31);
+    ppc_avr_t *c = cpu_avr_ptr(env, (insn >> 6) & 31);
+    bool rc = insn & 0x400;
+
+    aok_ppc_vfp_helped++;
+    switch (insn & 0x3f) {
+    case 46: helper_vmaddfp(env, d, a, b, c); return;
+    case 47: helper_vnmsubfp(env, d, a, b, c); return;
+    }
+    switch (insn & 0x3ff) {
+    case 198: (rc ? helper_vcmpeqfp_dot : helper_vcmpeqfp)(env, d, a, b); return;
+    case 454: (rc ? helper_vcmpgefp_dot : helper_vcmpgefp)(env, d, a, b); return;
+    case 710: (rc ? helper_vcmpgtfp_dot : helper_vcmpgtfp)(env, d, a, b); return;
+    case 966: (rc ? helper_vcmpbfp_dot : helper_vcmpbfp)(env, d, a, b); return;
+    }
+    switch (insn & 0x7ff) {
+    case 10: helper_vaddfp(env, d, a, b); return;
+    case 74: helper_vsubfp(env, d, a, b); return;
+    case 1034: helper_vmaxfp(env, d, a, b); return;
+    case 1098: helper_vminfp(env, d, a, b); return;
+    case 266: helper_vrefp(env, d, b); return;
+    case 330: helper_vrsqrtefp(env, d, b); return;
+    case 394: helper_vexptefp(env, d, b); return;
+    case 458: helper_vlogefp(env, d, b); return;
+    case 522: helper_vrfin(env, d, b); return;
+    case 586: helper_vrfiz(env, d, b); return;
+    case 650: helper_vrfip(env, d, b); return;
+    case 714: helper_vrfim(env, d, b); return;
+    }
+    g_assert_not_reached();
+}
+
+/*
+ * The AltiVec insns that are a call: vcmpbfp, the two estimates QEMU has
+ * its own series for, the pixel packs, mtvscr (which changes vec_status),
+ * and the element loads and stores, which may fault.
+ */
+static void aok_ppc_vc(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    ppc_avr_t *d = cpu_avr_ptr(env, (insn >> 21) & 31);
+    ppc_avr_t *a = cpu_avr_ptr(env, (insn >> 16) & 31);
+    ppc_avr_t *b = cpu_avr_ptr(env, (insn >> 11) & 31);
+
+    if ((insn >> 26) == 31) {
+        target_ulong ea = ea_x(env, insn);
+
+        aok_ppc_sync(env, pc);
+        switch ((insn >> 1) & 0x3ff) {
+        case 7: helper_LVEBX(env, d, ea); return;
+        case 39: helper_LVEHX(env, d, ea & ~1); return;
+        case 71: helper_LVEWX(env, d, ea & ~3); return;
+        case 135: helper_STVEBX(env, d, ea); return;
+        case 167: helper_STVEHX(env, d, ea & ~1); return;
+        case 199: helper_STVEWX(env, d, ea & ~3); return;
+        }
+        g_assert_not_reached();
+    }
+    switch (insn & 0x7ff) {
+    case 782: helper_vpkpx(d, a, b); return;
+    case 846: helper_vupkhpx(d, b); return;
+    case 974: helper_vupklpx(d, b); return;
+    case 1604: helper_mtvscr(env, b->VsrW(3)); return;
+    }
+    aok_ppc_helper_vfp(env, insn);
+}
+
 /* lmw, stmw: QEMU's own helpers, at (rA|0) + d (TCG checks no form of them). */
 static void aok_ppc_lmw(CPUPPCState *env, uint64_t pc, uint64_t insn)
 {
@@ -896,6 +1042,172 @@ static int vldst(Ctx *c, Gadget gadget, unsigned vt, unsigned ra, unsigned rb)
     aok_emit(&c->g, gpr(rb));
     aok_emit(&c->g, mem_word(c));
     return NEXT;
+}
+
+static inline uint64_t avr(unsigned r)
+{
+    return avr_full_offset(r);
+}
+
+/* AltiVec's own opcode, 4 */
+static int altivec(Ctx *c)
+{
+    enum { RR, SAT, R1, FP, FP1 };
+    static const struct {
+        uint16_t xo;
+        uint8_t kind;
+        Gadget gadget;
+    } vx[] = {
+#define VX_ROW(xo, kind, name) { xo, kind, G(name) },
+        VX_LIST(VX_ROW)
+    };
+    static const struct {
+        uint16_t xo;
+        Gadget gadget[2];
+        bool fp;
+    } vc[] = {
+#define VC_ROW(xo, name) { xo, { G(name), G(name##_rc) }, xo == 198 || xo == 454 || xo == 710 },
+        VC_LIST(VC_ROW)
+    };
+    uint32_t insn = c->insn;
+    unsigned d = (insn >> 21) & 31, a = (insn >> 16) & 31, b = (insn >> 11) & 31;
+    unsigned e = (insn >> 6) & 31, xo = insn & 0x7ff;
+    uint64_t sat = offsetof(CPUPPCState, vscr_sat);
+
+    if (!c->vr || !has(c, PPC_ALTIVEC)) {
+        return UNKNOWN;
+    }
+    if ((insn & 0x3f) >= 32) {
+        /* the VA forms: vD, vA, vB and vC (or vsldoi's SH) */
+        Gadget g = NULL;
+        int extra = 0;      /* 1: vscr_sat after; 2: the insn after */
+
+        switch (insn & 0x3f) {
+        case 32: g = G(vmhaddshs); extra = 1; break;
+        case 33: g = G(vmhraddshs); extra = 1; break;
+        case 34: g = G(vmladduhm); break;
+        case 36: g = G(vmsumubm); break;
+        case 37: g = G(vmsummbm); break;
+        case 38: g = G(vmsumuhm); break;
+        case 39: g = G(vmsumuhs); extra = 1; break;
+        case 40: g = G(vmsumshm); break;
+        case 41: g = G(vmsumshs); extra = 1; break;
+        case 42: g = G(vsel); break;
+        case 43: g = G(vperm); break;
+        case 46: g = G(vmaddfp); extra = 2; break;
+        case 47: g = G(vnmsubfp); extra = 2; break;
+        case 44:
+            if (insn & 0x400) {
+                return UNKNOWN;
+            }
+            if ((e & 15) == 0) {
+                emit2(c, G(vmr), avr(d), avr(a));
+            } else {
+                emit3(c, G(vsldoi), avr(d), avr(a), avr(b));
+                aok_emit(&c->g, 16 - (e & 15));
+            }
+            return NEXT;
+        default:
+            return UNKNOWN;
+        }
+        emit3(c, g, avr(d), avr(a), avr(b));
+        aok_emit(&c->g, avr(e));
+        if (extra) {
+            aok_emit(&c->g, extra == 1 ? sat : insn);
+        }
+        return NEXT;
+    }
+    if ((xo & 0x3f) == 6) {
+        if ((xo & 0x3ff) == 966) {
+            return call(c, aok_ppc_vc);     /* vcmpbfp */
+        }
+        for (int i = 0; i < ARRAY_SIZE(vc); i++) {
+            if (vc[i].xo == (xo & 0x3ff)) {
+                emit3(c, vc[i].gadget[xo >> 10], avr(d), avr(a), avr(b));
+                if (vc[i].fp) {
+                    aok_emit(&c->g, insn);
+                }
+                return NEXT;
+            }
+        }
+        return UNKNOWN;
+    }
+    switch (xo) {
+    case 524: case 588: case 652: {     /* vspltb, vsplth, vspltw */
+        static const Gadget g[3] = { G(vspltb), G(vsplth), G(vspltw) };
+        int vece = (xo - 524) / 64;
+        /* the element's bytes in the state, as gen_vsplt finds them */
+        int at = (((a << vece) & 15) ^ 15) & ~((1 << vece) - 1);
+
+        emit2(c, g[vece], avr(d), avr(b) + at);
+        return NEXT;
+    }
+    case 780: case 844: case 908: {     /* vspltisb, vspltish, vspltisw */
+        int32_t simm = (int32_t)(a << 27) >> 27;
+        uint64_t v = xo == 780 ? (uint8_t)simm * 0x0101010101010101ull
+                   : xo == 844 ? (uint16_t)simm * 0x0001000100010001ull
+                   : (uint32_t)simm * 0x0000000100000001ull;
+
+        if (b) {
+            return UNKNOWN;
+        }
+        emit3(c, G(vli), avr(d), v, v);
+        return NEXT;
+    }
+    case 778: case 842:                 /* vcfux, vcfsx: times 2^-UIMM */
+        emit3(c, xo == 778 ? G(vcfux) : G(vcfsx), avr(d), avr(b),
+              (uint64_t)(127 - a) << 23);
+        return NEXT;
+    case 906: case 970:                 /* vctuxs, vctsxs: times 2^UIMM */
+        emit3(c, xo == 906 ? G(vctuxs) : G(vctsxs), avr(d), avr(b),
+              (uint64_t)(127 + a) << 23);
+        aok_emit(&c->g, sat);
+        return NEXT;
+    case 1540:                          /* mfvscr */
+        if (a || b) {
+            return UNKNOWN;
+        }
+        emit3(c, G(mfvscr), avr(d), offsetof(CPUPPCState, vscr), sat);
+        return NEXT;
+    case 1604:                          /* mtvscr */
+        return d || a ? UNKNOWN : call(c, aok_ppc_vc);
+    case 782:                           /* vpkpx */
+        return call(c, aok_ppc_vc);
+    case 394: case 458:                 /* vexptefp, vlogefp */
+    case 846: case 974:                 /* vupkhpx, vupklpx */
+        return a ? UNKNOWN : call(c, aok_ppc_vc);
+    }
+    for (int i = 0; i < ARRAY_SIZE(vx); i++) {
+        if (vx[i].xo != xo) {
+            continue;
+        }
+        switch (vx[i].kind) {
+        case RR:
+            emit3(c, vx[i].gadget, avr(d), avr(a), avr(b));
+            return NEXT;
+        case SAT:
+            emit3(c, vx[i].gadget, avr(d), avr(a), avr(b));
+            aok_emit(&c->g, sat);
+            return NEXT;
+        case FP:
+            emit3(c, vx[i].gadget, avr(d), avr(a), avr(b));
+            aok_emit(&c->g, insn);
+            return NEXT;
+        case R1:
+            if (a) {
+                return UNKNOWN;
+            }
+            emit2(c, vx[i].gadget, avr(d), avr(b));
+            return NEXT;
+        case FP1:
+            if (a) {
+                return UNKNOWN;
+            }
+            emit3(c, vx[i].gadget, avr(d), avr(b), insn);
+            return NEXT;
+        }
+    }
+    return UNKNOWN;
 }
 
 /* A record form's CR1, from FPSCR */
@@ -1498,6 +1810,18 @@ static int op31(Ctx *c)
     /* AltiVec's aligned loads and stores (the l forms hint at the cache) */
     case 103: case 359:
         return vldst(c, G(lvx), d, a, b);
+    case 6: case 38:        /* lvsl, lvsr */
+        if (!c->vr || !has(c, PPC_ALTIVEC) || (insn & 1)) {
+            return UNKNOWN;
+        }
+        emit3(c, xo == 6 ? G(lvsl) : G(lvsr), avr(d), base(a), gpr(b));
+        return NEXT;
+    case 7: case 39: case 71: case 135: case 167: case 199:
+        /* lvebx, lvehx, lvewx, stvebx, stvehx, stvewx */
+        if (!c->vr || !has(c, PPC_ALTIVEC) || (insn & 1)) {
+            return UNKNOWN;
+        }
+        return call(c, aok_ppc_vc);
     case 231: case 487:
         return vldst(c, G(stvx), d, a, b);
     case 371:   /* mftb, of TBL or TBU (any other number reads that SPR) */
@@ -1539,6 +1863,7 @@ static int insn32(Ctx *c)
     switch (op) {
     case 3:     /* twi: with TO 0, nothing */
         return d ? UNKNOWN : NEXT;
+    case 4: return altivec(c);
     case 7: return ri(c, G(mulli), d, a, simm);
     case 8: return ri(c, G(subfic), d, a, simm);
     case 10:

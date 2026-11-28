@@ -2038,3 +2038,848 @@ SYM(aok_ppc_lookup_pc):
     f2_cmpbc cmpli, ri, lo, hi, \bc, 0
     .endif
 .endr
+
+/* ---- AltiVec ---------------------------------------------------------------
+ *
+ * A vector register is sixteen bytes of CPUPPCState, one 128-bit number of
+ * the host's (QEMU's ppc_avr_t): the guest's element i of n is the host's
+ * lane n-1-i, each lane's bytes in the host's order. What treats the
+ * elements alike needs nothing done to it. What names an element by its
+ * place (the merges, packs and unpacks, the splats, vperm, vsldoi, the
+ * shifts by octets, lvsl and lvsr, the even and odd multiplies, the sums
+ * across) is turned round here.
+ *
+ * Streams: [vD][vA][vB], [vD][vA][vB][vC] and [vD][vB], the registers'
+ * offsets. A saturating op has one more word, the offset of vscr_sat, which
+ * is VSCR[SAT] while any bit of it is set: the op ORs into it the lanes in
+ * which its result is not the wrapped one, or not the unnarrowed one (as
+ * TCG's code does). A floating-point op's last word is the insn, for C.
+ */
+.macro vrr
+    ldp x9, x10, [_ip]
+    ldr x11, [_ip, #16]
+    ldr q0, [_cpu, x10]
+    ldr q1, [_cpu, x11]
+.endm
+.macro vrrr
+    vrr
+    ldr x12, [_ip, #24]
+    ldr q2, [_cpu, x12]
+.endm
+.macro vr1
+    ldp x9, x10, [_ip]
+    ldr q0, [_cpu, x10]
+.endm
+.macro vput words, reg=0
+    str q\reg, [_cpu, x9]
+    gret \words
+.endm
+/* VSCR[SAT]: the set bits of v\reg into vscr_sat, whose offset is word \word */
+.macro vsat reg, word
+    ldr x12, [_ip, #(8 * \word)]
+    ldr q7, [_cpu, x12]
+    orr v7.16b, v7.16b, v\reg\().16b
+    str q7, [_cpu, x12]
+.endm
+/* CR6 of a compare's result in v\reg: all lanes true, no lane true */
+.macro cr6 reg
+    uminv b16, v\reg\().16b
+    umaxv b17, v\reg\().16b
+    fmov w10, s16
+    fmov w11, s17
+    cmp w10, #0xff
+    cset w10, eq
+    cmp w11, #0
+    cset w11, eq
+    lsl w11, w11, #1
+    orr w10, w11, w10, lsl #3
+    str w10, [_cpu, #(AOK_PPC_ENV_CRF + 24)]
+.endm
+
+/* The host's lane numbers, and the guest's byte numbers of them */
+    .balign 16
+ppc_viota:
+    .byte 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+ppc_vrev:
+    .byte 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0
+
+/* One host insn on lanes of \arr */
+.macro v_rr name, insn, arr
+.gadget ppc_\name
+    vrr
+    \insn v0.\arr, v0.\arr, v1.\arr
+    vput 3
+.endm
+    v_rr vaddubm, add, 16b
+    v_rr vadduhm, add, 8h
+    v_rr vadduwm, add, 4s
+    v_rr vsububm, sub, 16b
+    v_rr vsubuhm, sub, 8h
+    v_rr vsubuwm, sub, 4s
+    v_rr vmaxub, umax, 16b
+    v_rr vmaxuh, umax, 8h
+    v_rr vmaxuw, umax, 4s
+    v_rr vmaxsb, smax, 16b
+    v_rr vmaxsh, smax, 8h
+    v_rr vmaxsw, smax, 4s
+    v_rr vminub, umin, 16b
+    v_rr vminuh, umin, 8h
+    v_rr vminuw, umin, 4s
+    v_rr vminsb, smin, 16b
+    v_rr vminsh, smin, 8h
+    v_rr vminsw, smin, 4s
+    /* the averages round up: (a + b + 1) >> 1 */
+    v_rr vavgub, urhadd, 16b
+    v_rr vavguh, urhadd, 8h
+    v_rr vavguw, urhadd, 4s
+    v_rr vavgsb, srhadd, 16b
+    v_rr vavgsh, srhadd, 8h
+    v_rr vavgsw, srhadd, 4s
+    v_rr vand, and, 16b
+    v_rr vandc, bic, 16b
+    v_rr vor, orr, 16b
+    v_rr vxor, eor, 16b
+.gadget ppc_vnor
+    vrr
+    orr v0.16b, v0.16b, v1.16b
+    mvn v0.16b, v0.16b
+    vput 3
+/* vaddcuw: the carry out of each word's sum; vsubcuw: 1 where there is no borrow */
+.gadget ppc_vaddcuw
+    vrr
+    add v2.4s, v0.4s, v1.4s
+    cmhi v0.4s, v0.4s, v2.4s
+    ushr v0.4s, v0.4s, #31
+    vput 3
+.gadget ppc_vsubcuw
+    vrr
+    cmhs v0.4s, v0.4s, v1.4s
+    ushr v0.4s, v0.4s, #31
+    vput 3
+
+/* The saturating sums and differences: [vD][vA][vB][vscr_sat] */
+.macro v_sat name, insn, wrap, arr
+.gadget ppc_\name
+    vrr
+    \wrap v2.\arr, v0.\arr, v1.\arr
+    \insn v0.\arr, v0.\arr, v1.\arr
+    eor v2.16b, v2.16b, v0.16b
+    vsat 2, 3
+    vput 4
+.endm
+    v_sat vaddubs, uqadd, add, 16b
+    v_sat vadduhs, uqadd, add, 8h
+    v_sat vadduws, uqadd, add, 4s
+    v_sat vaddsbs, sqadd, add, 16b
+    v_sat vaddshs, sqadd, add, 8h
+    v_sat vaddsws, sqadd, add, 4s
+    v_sat vsububs, uqsub, sub, 16b
+    v_sat vsubuhs, uqsub, sub, 8h
+    v_sat vsubuws, uqsub, sub, 4s
+    v_sat vsubsbs, sqsub, sub, 16b
+    v_sat vsubshs, sqsub, sub, 8h
+    v_sat vsubsws, sqsub, sub, 4s
+
+/* The compares, and their record forms, which set CR6 */
+.macro v_cmp name, insn, arr
+.gadget ppc_\name
+    vrr
+    \insn v0.\arr, v0.\arr, v1.\arr
+    vput 3
+.gadget ppc_\name\()_rc
+    vrr
+    \insn v0.\arr, v0.\arr, v1.\arr
+    cr6 0
+    vput 3
+.endm
+    v_cmp vcmpequb, cmeq, 16b
+    v_cmp vcmpequh, cmeq, 8h
+    v_cmp vcmpequw, cmeq, 4s
+    v_cmp vcmpgtub, cmhi, 16b
+    v_cmp vcmpgtuh, cmhi, 8h
+    v_cmp vcmpgtuw, cmhi, 4s
+    v_cmp vcmpgtsb, cmgt, 16b
+    v_cmp vcmpgtsh, cmgt, 8h
+    v_cmp vcmpgtsw, cmgt, 4s
+
+/*
+ * The shifts and rotates of each element by the low bits of vB's: the
+ * host's ushl and sshl shift left by a count that is signed, so a right
+ * shift is a negative one, and a rotate the OR of n left and n - \bits.
+ */
+.macro v_shift name, kind, arr, bits
+.gadget ppc_\name
+    vrr
+    movi v2.\arr, #(\bits - 1)
+    and v1.16b, v1.16b, v2.16b
+    .ifc \kind, l
+    ushl v0.\arr, v0.\arr, v1.\arr
+    .endif
+    .ifc \kind, r
+    neg v1.\arr, v1.\arr
+    ushl v0.\arr, v0.\arr, v1.\arr
+    .endif
+    .ifc \kind, a
+    neg v1.\arr, v1.\arr
+    sshl v0.\arr, v0.\arr, v1.\arr
+    .endif
+    .ifc \kind, rot
+    movi v2.\arr, #\bits
+    sub v2.\arr, v1.\arr, v2.\arr
+    ushl v3.\arr, v0.\arr, v1.\arr
+    ushl v0.\arr, v0.\arr, v2.\arr
+    orr v0.16b, v0.16b, v3.16b
+    .endif
+    vput 3
+.endm
+    v_shift vslb, l, 16b, 8
+    v_shift vslh, l, 8h, 16
+    v_shift vslw, l, 4s, 32
+    v_shift vsrb, r, 16b, 8
+    v_shift vsrh, r, 8h, 16
+    v_shift vsrw, r, 4s, 32
+    v_shift vsrab, a, 16b, 8
+    v_shift vsrah, a, 8h, 16
+    v_shift vsraw, a, 4s, 32
+    v_shift vrlb, rot, 16b, 8
+    v_shift vrlh, rot, 8h, 16
+    v_shift vrlw, rot, 4s, 32
+
+/* vsl, vsr: all 128 bits by the low three bits of vB (QEMU reads its last byte's) */
+.gadget ppc_vsl
+    ldp x9, x10, [_ip]
+    ldr x11, [_ip, #16]
+    add x10, _cpu, x10
+    ldr x11, [_cpu, x11]
+    ldp x12, x13, [x10]
+    and x11, x11, #7
+    mov w14, #63
+    sub w14, w14, w11
+    lsr x15, x12, #1
+    lsr x15, x15, x14
+    lsl x13, x13, x11
+    lsl x12, x12, x11
+    orr x13, x13, x15
+    add x9, _cpu, x9
+    stp x12, x13, [x9]
+    gret 3
+.gadget ppc_vsr
+    ldp x9, x10, [_ip]
+    ldr x11, [_ip, #16]
+    add x10, _cpu, x10
+    ldr x11, [_cpu, x11]
+    ldp x12, x13, [x10]
+    and x11, x11, #7
+    mov w14, #63
+    sub w14, w14, w11
+    lsl x15, x13, #1
+    lsl x15, x15, x14
+    lsr x12, x12, x11
+    lsr x13, x13, x11
+    orr x12, x12, x15
+    add x9, _cpu, x9
+    stp x12, x13, [x9]
+    gret 3
+
+/*
+ * vslo, vsro: by octets, the count in bits 121-124 of vB. A table lookup
+ * with each lane's number less or plus the count: a lane out of the table
+ * reads as zero.
+ */
+.macro v_octets name, op
+.gadget ppc_\name
+    vrr
+    adr x12, ppc_viota
+    umov w13, v1.b[0]
+    ldr q2, [x12]
+    ubfx w13, w13, #3, #4
+    dup v3.16b, w13
+    \op v2.16b, v2.16b, v3.16b
+    tbl v0.16b, {v0.16b}, v2.16b
+    vput 3
+.endm
+    v_octets vslo, sub
+    v_octets vsro, add
+
+/* The merges: the guest's high half is the host's upper lanes, and vA's element comes first */
+    .macro v_mrg name, insn, arr
+.gadget ppc_\name
+    vrr
+    \insn v0.\arr, v1.\arr, v0.\arr
+    vput 3
+    .endm
+    v_mrg vmrghb, zip2, 16b
+    v_mrg vmrghh, zip2, 8h
+    v_mrg vmrghw, zip2, 4s
+    v_mrg vmrglb, zip1, 16b
+    v_mrg vmrglh, zip1, 8h
+    v_mrg vmrglw, zip1, 4s
+
+/* vspltb, vsplth, vspltw: [vD][the element's offset in the state] */
+.macro v_splt name, arr
+.gadget ppc_\name
+    ldp x9, x10, [_ip]
+    add x10, _cpu, x10
+    ld1r {v0.\arr}, [x10]
+    vput 2
+.endm
+    v_splt vspltb, 16b
+    v_splt vsplth, 8h
+    v_splt vspltw, 4s
+
+/* [vD][low doubleword][high doubleword]: a constant (vspltisb, vspltish, vspltisw) */
+.gadget ppc_vli
+    ldp x9, x10, [_ip]
+    ldr x11, [_ip, #16]
+    add x9, _cpu, x9
+    stp x10, x11, [x9]
+    gret 3
+
+/* [vD][vS]: a move (vsldoi by 0) */
+.gadget ppc_vmr
+    vr1
+    vput 2
+
+/*
+ * vsldoi: [vD][vA][vB][16 - SH] -- sixteen bytes from vA:vB, which as the
+ * host's number is vB below vA.
+ */
+.gadget ppc_vsldoi
+    ldp x9, x10, [_ip]
+    ldp x11, x12, [_ip, #16]
+    adr x13, ppc_viota
+    ldr q17, [_cpu, x10]
+    ldr q16, [_cpu, x11]
+    ldr q2, [x13]
+    dup v1.16b, w12
+    add v2.16b, v2.16b, v1.16b
+    tbl v0.16b, {v16.16b, v17.16b}, v2.16b
+    vput 4
+
+/*
+ * vperm: the guest's byte n of vA:vB is the host's byte 31 - n of the same
+ * table, and 31 - n is n's low five bits inverted.
+ */
+.gadget ppc_vperm
+    ldp x9, x10, [_ip]
+    ldp x11, x12, [_ip, #16]
+    ldr q17, [_cpu, x10]
+    ldr q16, [_cpu, x11]
+    ldr q2, [_cpu, x12]
+    movi v3.16b, #31
+    bic v2.16b, v3.16b, v2.16b
+    tbl v0.16b, {v16.16b, v17.16b}, v2.16b
+    vput 4
+
+/* vsel: vB's bits where vC has a 1, vA's elsewhere */
+.gadget ppc_vsel
+    vrrr
+    bsl v2.16b, v1.16b, v0.16b
+    vput 4, 2
+
+/*
+ * The packs: vA's elements narrowed are the guest's first half, the host's
+ * upper lanes. A saturating one widens its result again, as it narrowed it,
+ * and a lane that is not what it was has saturated.
+ */
+.macro v_pk name, lo, hi, from, half, full, wide=, wide2=
+.gadget ppc_\name
+    vrr
+    \lo v2.\half, v1.\from
+    \hi v2.\full, v0.\from
+    .ifnb \wide
+    \wide v3.\from, v2.\half, #0
+    \wide2 v4.\from, v2.\full, #0
+    cmeq v3.\from, v3.\from, v1.\from
+    cmeq v4.\from, v4.\from, v0.\from
+    and v3.16b, v3.16b, v4.16b
+    mvn v3.16b, v3.16b
+    vsat 3, 3
+    vput 4, 2
+    .else
+    vput 3, 2
+    .endif
+.endm
+    v_pk vpkuhum, xtn, xtn2, 8h, 8b, 16b
+    v_pk vpkuwum, xtn, xtn2, 4s, 4h, 8h
+    v_pk vpkuhus, uqxtn, uqxtn2, 8h, 8b, 16b, ushll, ushll2
+    v_pk vpkuwus, uqxtn, uqxtn2, 4s, 4h, 8h, ushll, ushll2
+    v_pk vpkshus, sqxtun, sqxtun2, 8h, 8b, 16b, ushll, ushll2
+    v_pk vpkswus, sqxtun, sqxtun2, 4s, 4h, 8h, ushll, ushll2
+    v_pk vpkshss, sqxtn, sqxtn2, 8h, 8b, 16b, sshll, sshll2
+    v_pk vpkswss, sqxtn, sqxtn2, 4s, 4h, 8h, sshll, sshll2
+
+/* The unpacks: [vD][vB], the guest's high half being the host's upper lanes */
+.gadget ppc_vupkhsb
+    vr1
+    sshll2 v0.8h, v0.16b, #0
+    vput 2
+.gadget ppc_vupklsb
+    vr1
+    sshll v0.8h, v0.8b, #0
+    vput 2
+.gadget ppc_vupkhsh
+    vr1
+    sshll2 v0.4s, v0.8h, #0
+    vput 2
+.gadget ppc_vupklsh
+    vr1
+    sshll v0.4s, v0.4h, #0
+    vput 2
+
+/*
+ * The even and odd multiplies: the guest's even element of a pair is the
+ * high half of the host's wider lane, its odd one the low half.
+ */
+.macro v_mule name, shr, arr, bits
+.gadget ppc_\name
+    vrr
+    \shr v0.\arr, v0.\arr, #\bits
+    \shr v1.\arr, v1.\arr, #\bits
+    mul v0.\arr, v0.\arr, v1.\arr
+    vput 3
+.endm
+.macro v_mulo name, shr, arr, bits
+.gadget ppc_\name
+    vrr
+    shl v0.\arr, v0.\arr, #\bits
+    shl v1.\arr, v1.\arr, #\bits
+    \shr v0.\arr, v0.\arr, #\bits
+    \shr v1.\arr, v1.\arr, #\bits
+    mul v0.\arr, v0.\arr, v1.\arr
+    vput 3
+.endm
+    v_mule vmuleub, ushr, 8h, 8
+    v_mule vmulesb, sshr, 8h, 8
+    v_mule vmuleuh, ushr, 4s, 16
+    v_mule vmulesh, sshr, 4s, 16
+    v_mulo vmuloub, ushr, 8h, 8
+    v_mulo vmulosb, sshr, 8h, 8
+    v_mulo vmulouh, ushr, 4s, 16
+    v_mulo vmulosh, sshr, 4s, 16
+
+/* vmladduhm: [vD][vA][vB][vC], the low halves of vA * vB + vC */
+.gadget ppc_vmladduhm
+    vrrr
+    mul v0.8h, v0.8h, v1.8h
+    add v0.8h, v0.8h, v2.8h
+    vput 4
+
+/*
+ * vmhaddshs, vmhraddshs: [vD][vA][vB][vC][vscr_sat] -- the product (rounded,
+ * for the second) shifted right fifteen, plus vC, saturated to a halfword.
+ */
+.macro v_mhadd name, round
+.gadget ppc_\name
+    vrrr
+    smull v3.4s, v0.4h, v1.4h
+    smull2 v4.4s, v0.8h, v1.8h
+    .if \round
+    movi v5.4s, #0x40, lsl #8
+    add v3.4s, v3.4s, v5.4s
+    add v4.4s, v4.4s, v5.4s
+    .endif
+    sshr v3.4s, v3.4s, #15
+    sshr v4.4s, v4.4s, #15
+    saddw v3.4s, v3.4s, v2.4h
+    saddw2 v4.4s, v4.4s, v2.8h
+    sqxtn v0.4h, v3.4s
+    sqxtn2 v0.8h, v4.4s
+    sshll v5.4s, v0.4h, #0
+    sshll2 v6.4s, v0.8h, #0
+    cmeq v5.4s, v5.4s, v3.4s
+    cmeq v6.4s, v6.4s, v4.4s
+    and v5.16b, v5.16b, v6.16b
+    mvn v5.16b, v5.16b
+    vsat 5, 4
+    vput 5
+.endm
+    v_mhadd vmhaddshs, 0
+    v_mhadd vmhraddshs, 1
+
+/* The multiply-sums: [vD][vA][vB][vC], each word vC's plus its elements' products */
+.gadget ppc_vmsumubm
+    vrrr
+    umull v3.8h, v0.8b, v1.8b
+    umull2 v4.8h, v0.16b, v1.16b
+    uaddlp v3.4s, v3.8h
+    uaddlp v4.4s, v4.8h
+    addp v0.4s, v3.4s, v4.4s
+    add v0.4s, v0.4s, v2.4s
+    vput 4
+/* vmsummbm: vA's bytes signed, vB's unsigned */
+.gadget ppc_vmsummbm
+    vrrr
+    sshll v3.8h, v0.8b, #0
+    ushll v5.8h, v1.8b, #0
+    sshll2 v4.8h, v0.16b, #0
+    ushll2 v6.8h, v1.16b, #0
+    mul v3.8h, v3.8h, v5.8h
+    mul v4.8h, v4.8h, v6.8h
+    saddlp v3.4s, v3.8h
+    saddlp v4.4s, v4.8h
+    addp v0.4s, v3.4s, v4.4s
+    add v0.4s, v0.4s, v2.4s
+    vput 4
+.gadget ppc_vmsumuhm
+    vrrr
+    umull v3.4s, v0.4h, v1.4h
+    umull2 v4.4s, v0.8h, v1.8h
+    addp v0.4s, v3.4s, v4.4s
+    add v0.4s, v0.4s, v2.4s
+    vput 4
+.gadget ppc_vmsumshm
+    vrrr
+    smull v3.4s, v0.4h, v1.4h
+    smull2 v4.4s, v0.8h, v1.8h
+    addp v0.4s, v3.4s, v4.4s
+    add v0.4s, v0.4s, v2.4s
+    vput 4
+/* the saturating ones sum in doublewords: [..][vscr_sat] */
+.macro v_msums name, mull, mull2, addlp, addw, addw2, xtn, xtn2, wide, wide2
+.gadget ppc_\name
+    vrrr
+    \mull v3.4s, v0.4h, v1.4h
+    \mull2 v4.4s, v0.8h, v1.8h
+    \addlp v3.2d, v3.4s
+    \addlp v4.2d, v4.4s
+    \addw v3.2d, v3.2d, v2.2s
+    \addw2 v4.2d, v4.2d, v2.4s
+    \xtn v0.2s, v3.2d
+    \xtn2 v0.4s, v4.2d
+    \wide v5.2d, v0.2s, #0
+    \wide2 v6.2d, v0.4s, #0
+    cmeq v5.2d, v5.2d, v3.2d
+    cmeq v6.2d, v6.2d, v4.2d
+    and v5.16b, v5.16b, v6.16b
+    mvn v5.16b, v5.16b
+    vsat 5, 4
+    vput 5
+.endm
+    v_msums vmsumuhs, umull, umull2, uaddlp, uaddw, uaddw2, uqxtn, uqxtn2, ushll, ushll2
+    v_msums vmsumshs, smull, smull2, saddlp, saddw, saddw2, sqxtn, sqxtn2, sshll, sshll2
+
+/* The sums across: [vD][vA][vB][vscr_sat] */
+.gadget ppc_vsum4ubs
+    vrr
+    uaddlp v2.8h, v0.16b
+    uaddlp v2.4s, v2.8h
+    add v3.4s, v2.4s, v1.4s
+    uqadd v0.4s, v2.4s, v1.4s
+    eor v3.16b, v3.16b, v0.16b
+    vsat 3, 3
+    vput 4
+.gadget ppc_vsum4sbs
+    vrr
+    saddlp v2.8h, v0.16b
+    saddlp v2.4s, v2.8h
+    add v3.4s, v2.4s, v1.4s
+    sqadd v0.4s, v2.4s, v1.4s
+    eor v3.16b, v3.16b, v0.16b
+    vsat 3, 3
+    vput 4
+.gadget ppc_vsum4shs
+    vrr
+    saddlp v2.4s, v0.8h
+    add v3.4s, v2.4s, v1.4s
+    sqadd v0.4s, v2.4s, v1.4s
+    eor v3.16b, v3.16b, v0.16b
+    vsat 3, 3
+    vput 4
+/* vsum2sws: each doubleword's two words of vA and the low word of vB's, into its low word */
+.gadget ppc_vsum2sws
+    vrr
+    saddlp v2.2d, v0.4s
+    shl v3.2d, v1.2d, #32
+    sshr v3.2d, v3.2d, #32
+    add v2.2d, v2.2d, v3.2d
+    sqxtn v3.2s, v2.2d
+    sshll v4.2d, v3.2s, #0
+    ushll v0.2d, v3.2s, #0
+    cmeq v4.2d, v4.2d, v2.2d
+    mvn v4.16b, v4.16b
+    vsat 4, 3
+    vput 4
+/* vsumsws: vA's four words and vB's last, into the last */
+.gadget ppc_vsumsws
+    vrr
+    saddlv d2, v0.4s
+    smov x12, v1.s[0]
+    fmov x10, d2
+    add x10, x10, x12
+    mov x13, #0x7fffffff
+    cmp x10, x13
+    csel x11, x13, x10, gt
+    mov x13, #0xffffffff80000000
+    cmp x11, x13
+    csel x11, x13, x11, lt
+    cmp x11, x10
+    cset w14, ne
+    mov w11, w11
+    add x9, _cpu, x9
+    stp x11, xzr, [x9]
+    ldr x13, [_ip, #24]
+    ldr w15, [_cpu, x13]
+    orr w15, w15, w14
+    str w15, [_cpu, x13]
+    gret 4
+
+/*
+ * Floating point. QEMU computes each lane with softfloat under
+ * env->vec_status: to nearest, PowerPC's choice among NaNs, and with
+ * VSCR[NJ] set (as Mac OS X runs) denormal operands taken for zeros and a
+ * result under the least normal number made a zero. The host's arithmetic
+ * with FPCR zero gives the same wherever no operand is a NaN or a denormal
+ * and the result is a zero, an infinity or a normal number above the least;
+ * a vector with any other lane is done again in C by QEMU's helper
+ * (aok_ppc_helper_vfp), which the last word, the insn, names.
+ */
+/* v\m = the lanes of v\v that are a zero, an infinity or above the least normal (v30) */
+.macro fp_ok m, v, t
+    facgt v\m\().4s, v\v\().4s, v30.4s
+    fcmeq v\t\().4s, v\v\().4s, #0.0
+    orr v\m\().16b, v\m\().16b, v\t\().16b
+.endm
+/* to 8f unless every lane of v\m is set */
+.macro fp_all m
+    uminv s\m, v\m\().4s
+    fmov w12, s\m
+    cbz w12, 8f
+.endm
+.macro fp_least
+    movi v30.4s, #0x80, lsl #16
+.endm
+.macro vfp_slow words
+8:  aok_fp_end
+    ldr x1, [_ip, #(8 * (\words - 1))]
+    mov x0, _cpu
+    bl SYM(aok_ppc_helper_vfp)
+    gret \words
+.endm
+
+/* [vD][vA][vB][insn] */
+.macro v_fp2 name, insn
+.gadget ppc_\name
+    vrr
+    fp_least
+    \insn v2.4s, v0.4s, v1.4s
+    fp_ok 3, 0, 6
+    fp_ok 4, 1, 6
+    fp_ok 5, 2, 6
+    and v3.16b, v3.16b, v4.16b
+    and v3.16b, v3.16b, v5.16b
+    fp_all 3
+    vput 4, 2
+    vfp_slow 4
+.endm
+    v_fp2 vaddfp, fadd
+    v_fp2 vsubfp, fsub
+    v_fp2 vmaxfp, fmax
+    v_fp2 vminfp, fmin
+
+/*
+ * vmaddfp, vnmsubfp: [vD][vA][vB][vC][insn] -- vA * vC + vB fused, and
+ * -(vA * vC - vB), which negates the rounded result so that a zero's sign
+ * is QEMU's (float_muladd_negate_result).
+ */
+.macro v_fma name, neg
+.gadget ppc_\name
+    vrrr
+    fp_least
+    .if \neg
+    fneg v7.4s, v1.4s
+    .else
+    mov v7.16b, v1.16b
+    .endif
+    fmla v7.4s, v0.4s, v2.4s
+    .if \neg
+    fneg v7.4s, v7.4s
+    .endif
+    fp_ok 3, 0, 6
+    fp_ok 4, 1, 6
+    fp_ok 5, 2, 6
+    and v3.16b, v3.16b, v4.16b
+    fp_ok 4, 7, 6
+    and v3.16b, v3.16b, v5.16b
+    and v3.16b, v3.16b, v4.16b
+    fp_all 3
+    vput 5, 7
+    vfp_slow 5
+.endm
+    v_fma vmaddfp, 0
+    v_fma vnmsubfp, 1
+
+/* The compares: [vD][vA][vB][insn]; a NaN compares false, which the host's do too, but goes to C */
+.macro v_fcmp name, insn
+.gadget ppc_\name
+    vrr
+    fp_least
+    \insn v2.4s, v0.4s, v1.4s
+    fp_ok 3, 0, 6
+    fp_ok 4, 1, 6
+    and v3.16b, v3.16b, v4.16b
+    fp_all 3
+    vput 4, 2
+    vfp_slow 4
+.gadget ppc_\name\()_rc
+    vrr
+    fp_least
+    \insn v2.4s, v0.4s, v1.4s
+    fp_ok 3, 0, 6
+    fp_ok 4, 1, 6
+    and v3.16b, v3.16b, v4.16b
+    fp_all 3
+    cr6 2
+    vput 4, 2
+    vfp_slow 4
+.endm
+    v_fcmp vcmpeqfp, fcmeq
+    v_fcmp vcmpgefp, fcmge
+    v_fcmp vcmpgtfp, fcmgt
+
+/* [vD][vB][insn]: the roundings to an integer, and the two estimates, which QEMU computes exactly */
+.macro v_fp1 name, result
+.gadget ppc_\name
+    vr1
+    fp_least
+    op_\name
+    fp_ok 3, 0, 6
+    .if \result
+    fp_ok 4, 2, 6
+    and v3.16b, v3.16b, v4.16b
+    .endif
+    fp_all 3
+    vput 3, 2
+    vfp_slow 3
+.endm
+.macro op_vrfin
+    frintn v2.4s, v0.4s
+.endm
+.macro op_vrfiz
+    frintz v2.4s, v0.4s
+.endm
+.macro op_vrfip
+    frintp v2.4s, v0.4s
+.endm
+.macro op_vrfim
+    frintm v2.4s, v0.4s
+.endm
+.macro op_vrefp
+    fmov v2.4s, #1.0
+    fdiv v2.4s, v2.4s, v0.4s
+.endm
+.macro op_vrsqrtefp
+    fsqrt v2.4s, v0.4s
+    fmov v4.4s, #1.0
+    fdiv v2.4s, v4.4s, v2.4s
+.endm
+    v_fp1 vrfin, 0
+    v_fp1 vrfiz, 0
+    v_fp1 vrfip, 0
+    v_fp1 vrfim, 0
+    v_fp1 vrefp, 1
+    v_fp1 vrsqrtefp, 1
+
+/*
+ * vcfsx, vcfux: [vD][vB][2^-UIMM, a single's bits] -- the conversion rounds
+ * and the scaling is exact, as in QEMU's two steps.
+ */
+.gadget ppc_vcfsx
+    ldp x9, x10, [_ip]
+    ldr x11, [_ip, #16]
+    ldr q0, [_cpu, x10]
+    dup v1.4s, w11
+    scvtf v0.4s, v0.4s
+    fmul v0.4s, v0.4s, v1.4s
+    vput 3
+.gadget ppc_vcfux
+    ldp x9, x10, [_ip]
+    ldr x11, [_ip, #16]
+    ldr q0, [_cpu, x10]
+    dup v1.4s, w11
+    ucvtf v0.4s, v0.4s
+    fmul v0.4s, v0.4s, v1.4s
+    vput 3
+
+/*
+ * vctsxs, vctuxs: [vD][vB][2^UIMM, a single's bits][vscr_sat] -- the
+ * scaling is exact or an infinity, the host's conversion truncates and
+ * saturates and gives 0 for a NaN, and a lane has saturated where the
+ * scaled value is outside the integer's range (below -1 for the unsigned:
+ * QEMU truncates before it looks).
+ */
+.gadget ppc_vctsxs
+    ldp x9, x10, [_ip]
+    ldr x11, [_ip, #16]
+    ldr q0, [_cpu, x10]
+    dup v1.4s, w11
+    movi v3.4s, #0x4f, lsl #24
+    fmul v1.4s, v0.4s, v1.4s
+    fcvtzs v0.4s, v1.4s
+    fcmge v4.4s, v1.4s, v3.4s
+    fneg v3.4s, v3.4s
+    fcmgt v5.4s, v3.4s, v1.4s
+    orr v4.16b, v4.16b, v5.16b
+    vsat 4, 3
+    vput 4
+.gadget ppc_vctuxs
+    ldp x9, x10, [_ip]
+    ldr x11, [_ip, #16]
+    ldr q0, [_cpu, x10]
+    dup v1.4s, w11
+    mov w13, #0x4f800000
+    fmul v1.4s, v0.4s, v1.4s
+    dup v3.4s, w13
+    fmov v5.4s, #-1.0
+    fcvtzu v0.4s, v1.4s
+    fcmge v4.4s, v1.4s, v3.4s
+    fcmge v5.4s, v5.4s, v1.4s
+    orr v4.16b, v4.16b, v5.16b
+    vsat 4, 3
+    vput 4
+
+/* mfvscr: [vD][vscr][vscr_sat] -- VSCR with SAT in its last bit, in the last word */
+.gadget ppc_mfvscr
+    ldp x9, x10, [_ip]
+    ldr x11, [_ip, #16]
+    ldr w10, [_cpu, x10]
+    add x11, _cpu, x11
+    ldp x12, x13, [x11]
+    orr x12, x12, x13
+    cmp x12, #0
+    cset w12, ne
+    orr w10, w10, w12
+    add x9, _cpu, x9
+    stp x10, xzr, [x9]
+    gret 3
+
+/*
+ * lvsl, lvsr: [vD][rA][rB] -- the guest's bytes sh, sh+1 ... sh+15 of
+ * 0..31, sh the address's low four bits, and 16-sh ... 31-sh.
+ */
+.gadget ppc_lvsl
+    ldp x9, x10, [_ip]
+    ldr x11, [_ip, #16]
+    ldr w10, [_cpu, x10]
+    ldr w11, [_cpu, x11]
+    adr x12, ppc_vrev
+    add w10, w10, w11
+    ldr q1, [x12]
+    and w10, w10, #15
+    dup v0.16b, w10
+    add v0.16b, v1.16b, v0.16b
+    vput 3
+.gadget ppc_lvsr
+    ldp x9, x10, [_ip]
+    ldr x11, [_ip, #16]
+    ldr w10, [_cpu, x10]
+    ldr w11, [_cpu, x11]
+    adr x12, ppc_vrev
+    add w10, w10, w11
+    ldr q1, [x12]
+    and w10, w10, #15
+    mov w11, #16
+    sub w10, w11, w10
+    dup v0.16b, w10
+    add v0.16b, v1.16b, v0.16b
+    vput 3

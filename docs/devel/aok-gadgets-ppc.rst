@@ -26,7 +26,7 @@ also what sent Mac OS X's and Mac OS 9's streams to TCG most (below): the
 OE forms, ``bcctr`` on a CR bit, ``mfocrf`` and ``mtocrf``, AltiVec's
 ``lvx`` and ``stvx`` and its hints, ``lswi`` and ``stswi``, the cache insns,
 and for a supervisor ``mfmsr``, ``mtmsr``, the segment register moves,
-``isync``, ``sync`` and ``rfi``.
+``isync``, ``sync`` and ``rfi``; and AltiVec (below).
 
 * ``lmw``, ``stmw``, ``dcbz`` and ``mftb`` are one call to C, QEMU's own
   helpers. ``lwarx`` and ``stwcx.`` are one call each, what TCG generates
@@ -40,8 +40,8 @@ and for a supervisor ``mfmsr``, ``mtmsr``, the segment register moves,
 * Where the architecture leaves a result undefined, the gadgets give QEMU's:
   ``divw`` and ``divwu`` by zero, and ``0x80000000 / -1``, leave rA in rD;
   ``sraw`` writes CA32 as QEMU's helper does, ``srawi`` does not.
-* Left to TCG, where its TB ends or an exception is due: AltiVec but for
-  ``lvx``, ``stvx`` and the hints, ``sc``, traps that test something, the
+* Left to TCG, where its TB ends or an exception is due: ``sc``, traps
+  that test something, the
   forms QEMU takes for illegal (an update load whose rA is 0 or rD, an
   update store whose rA is 0, ``lwbrx.``), ``mcrfs``, ``bclrl`` on a CR
   bit, a ``bcctr`` that counts, ``lswx``, ``tlbie``, the decrementer, and
@@ -146,6 +146,58 @@ tests under Mac OS X did 43 million insns in C until these were added, and
   quiet one, is invalid and stays C's.
 * An infinite result of an infinite operand is exact; any other infinity is
   an overflow or a zero divide.
+
+AltiVec
+=======
+
+Every AltiVec insn of a G4 (the 7400's set; none of the later ones) is a
+gadget on the host's vector unit, but for these, which are calls to QEMU's
+own helpers from the stream: ``vexptefp`` and ``vlogefp`` (softfloat's own
+series), ``vcmpbfp``, ``vpkpx``, ``vupkhpx`` and ``vupklpx``, ``mtvscr``
+(which changes the float status), and the loads and stores of one element
+(``lvebx`` and the rest), which may fault.
+
+A vector register is sixteen bytes of the state, one 128-bit number of the
+host's: the guest's element *i* of *n* is the host's lane *n*-1-*i*, each
+lane's bytes in the host's order. What treats the elements alike (the sums,
+the logic, the compares, the shifts of each element) is the host's insn as
+it is. What names an element by its place is turned round: a merge of high
+halves is the host's ``zip2`` with the operands exchanged, a pack narrows vB
+into the low half and vA into the high, ``vperm`` looks up the inverse of
+each index's low five bits in vB below vA, ``vsldoi`` by SH is a lookup of
+sixteen bytes from 16-SH on in the same table, ``lvsl`` is fifteen down to
+zero plus the address's low four bits, and an even multiply takes the high
+half of each wider lane.
+
+VSCR[SAT] is ``vscr_sat``, set while any bit of it is: a saturating op ORs
+into it the lanes in which its result is not the wrapped one, or, for a pack
+or a sum in a wider lane, not what it was before it was narrowed. That is
+what TCG's code does, and costs nothing to read back.
+
+Floating point. QEMU computes each lane with softfloat under
+``vec_status``: to nearest, PowerPC's choice among NaNs, and with VSCR[NJ]
+set, as Mac OS X runs, a denormal operand taken for a zero and a result
+under the least normal number made one. The host's arithmetic with FPCR
+zero gives the same wherever no operand is a NaN or a denormal and the
+result is a zero, an infinity or a normal number above the least (a result
+of exactly the least may have been rounded up to it). Each gadget tests its
+operands and its result for that, three host insns a vector, and a vector
+with any other lane is done again by QEMU's helper. The compares go to C
+for a NaN too, though the host's answer is the same. ``vnmsubfp`` negates
+vB, adds the product fused and negates the result, so that a zero's sign is
+that of ``float_muladd_negate_result``. ``vrefp`` and ``vrsqrtefp`` are an
+exact quotient in QEMU and so here. The conversions need no second path:
+``vcfsx`` is the host's conversion and an exact scaling, as QEMU's two steps
+are; ``vctsxs`` scales exactly (or to an infinity), the host's conversion
+truncates, saturates and gives 0 for a NaN, and a lane has saturated where
+the scaled value is outside the integer's range (for ``vctuxs``, at -1 or
+below: QEMU truncates before it looks).
+
+Xbench 1.3 under Mac OS X 10.4.11, this engine beside the one before, on an
+Apple M5 Max: vecLib FFT 4.42 to 50.60 (0.146 to 1.67 Gflop/s), and with it
+the CPU test 17.45 to 62.82; the other lines of the CPU, thread and memory
+tests as they were. No vector went to C in that run. The main loop entered
+TCG's code 3.4 million times where it was 6.6 million.
 
 Segment registers and the TLB
 =============================
@@ -265,9 +317,10 @@ They are gadgets now:
 
 A stream that would stop at an insn inside a loop, with the loop's branch
 back in TCG's part, would trade a loop that TCG links to itself for two
-passes of the main loop at every turn (a loop of AltiVec arithmetic
-between an ``lvx`` and a ``stvx``). ``tail_loops_back()`` looks ahead to
-the block's branch, and such a TB is left whole to TCG.
+passes of the main loop at every turn (as a loop of AltiVec arithmetic
+between an ``lvx`` and a ``stvx`` was, before AltiVec had gadgets).
+``tail_loops_back()`` looks ahead to the block's branch, and such a TB is
+left whole to TCG.
 
 After: the main loop entered streams 24 million times and TCG's code 6.7
 million over the Mac OS X run (99.7% of TBs are streams), and 12 and 7.7
@@ -276,8 +329,10 @@ about 30 s where it took about 50 (two machines side by side, a picture
 every ten seconds). Xbench under Mac OS X, alone, before and
 after: Memory test 38.3 to 128.6 (Fill 23.9 to 254, Copy 47.9 to 284, the
 AltiVec stream tests 46.9 to 202); the CPU and thread tests as they were.
-What still begins TCG's TBs: ``sc``, the decrementer's ``mfspr``, ``lvsl``,
-``mfvscr`` and ``mtvscr``, and in Mac OS 9 the trap ``twi 31`` and ``lswx``.
+What still begins TCG's TBs, of 3.4 million entries in that run once AltiVec
+had gadgets: ``sc`` (half), the decrementer's ``mfspr`` (a third) and
+``mtspr``, ``tlbie`` and ``tlbsync``, ``lswx``, and in Mac OS 9 the trap
+``twi 31``.
 
 For iSH-AOK
 ===========
@@ -341,3 +396,20 @@ XER, ``bcctr`` on a CR bit, ``lswi`` and ``stswi`` of every length, the
 hints and cache insns; forty-two lines, the same with and without the
 gadgets. ``ctxtest`` covers the supervisor's. Seventeen faults put into
 these gadgets one at a time are each seen by one or the other.
+
+``avstress`` (aok-vm's ``aok/bench-pm/av``) has a function for every AltiVec
+insn and every value of its immediate, 719 of them with the forms that write
+over an operand: it loads three operands, VSCR (NJ three times in four) and
+CR6, runs the insn into a register that held something, and stores every
+register, VSCR and the CR. Each runs four thousand times, on operands where
+the gadgets draw their lines (NaNs of both kinds, denormals, the least
+normal number and its neighbours, operands that cancel, products and sums on
+both sides of the least normal, values around 2^31 and 2^32, integers at
+every width's limits), every other round without NaNs and denormals so that
+the gadgets' own arithmetic is what runs, and a hash of all it left is
+printed, a line an insn. The lines are identical with ``QEMU_AOK=0`` and
+with the gadgets. Thirty-eight faults put into the gadgets one at a time (a
+result under the least normal kept, denormal or NaN operands kept, a zero's
+sign, operands exchanged, an index not inverted, saturation unrecorded, a
+bound of a conversion, CR6's bits, an arithmetic shift made logical, and
+more) each change the lines of the insns they are in.

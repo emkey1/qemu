@@ -24,6 +24,7 @@
 #include "kvm_ppc.h"
 #include "mmu-hash64.h"
 #include "mmu-hash32.h"
+#include "mmu-books.h"
 #include "exec/cputlb.h"
 #include "exec/page-protection.h"
 #include "exec/target_page.h"
@@ -278,6 +279,7 @@ void ppc_tlb_invalidate_all(CPUPPCState *env)
     case POWERPC_MMU_32B:
         env->tlb_need_flush = 0;
         tlb_flush(env_cpu(env));
+        ppc_tlb_sr_sync(env);
         break;
     default:
         /* XXX: TODO */
@@ -377,7 +379,8 @@ void helper_store_sr(CPUPPCState *env, target_ulong srnum, target_ulong value)
             }
         }
 #else
-        env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+        env->tlb_need_flush |= ppc_tlb_sr_contexts(env) ? TLB_NEED_SR_SWITCH
+                                                        : TLB_NEED_LOCAL_FLUSH;
 #endif
     }
 }
@@ -1368,6 +1371,17 @@ bool ppc_cpu_tlb_fill(CPUState *cs, vaddr eaddr, int size,
 
     if (ppc_xlate(cpu, eaddr, access_type, &raddr,
                   &page_size, &prot, mmu_idx, !probe)) {
+        CPUPPCState *env = &cpu->env;
+        unsigned seg = (eaddr >> 28) & 15;
+
+        /*
+         * An entry made under a segment register the TLB is not kept
+         * under (check_tlb_flush()): the TLB goes at the next event.
+         */
+        if (unlikely((uint32_t)env->sr[seg] != env->sr_tlb[seg]) &&
+            !mmuidx_real(mmu_idx) && ppc_tlb_sr_contexts(env)) {
+            env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+        }
         tlb_set_page(cs, eaddr & TARGET_PAGE_MASK, raddr & TARGET_PAGE_MASK,
                      prot, mmu_idx, 1UL << page_size);
         return true;

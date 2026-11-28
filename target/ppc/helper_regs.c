@@ -373,6 +373,52 @@ void store_40x_sler(CPUPPCState *env, uint32_t val)
     env->spr[SPR_405_SLER] = val;
 }
 
+/*
+ * A TLB context for each set of segment registers (tlb_context_switch()).
+ *
+ * The hardware's TLB is tagged with VSIDs: writing a segment register
+ * invalidates nothing in it, and an OS changes them as it likes. Mac OS X
+ * gives its kernel an address space of its own and loads other segment
+ * registers on every way in and out, some four thousand times a second,
+ * and each cost a flush of the whole TLB and of the jump cache here, and
+ * every translation found again afterwards.
+ *
+ * Instead, with the 32-bit hash MMU, an mtsr that changes a register asks
+ * for a switch (TLB_NEED_SR_SWITCH) where it asked for a flush, and at the
+ * next context-synchronizing event the TLB filled under the old sixteen
+ * values is set aside and the one filled under the new ones taken up
+ * again. What a context holds is as valid as the hardware's entries of
+ * those VSIDs would be: a guest that changes a PTE must tlbie, and that
+ * (like a BAT write, and all else that flushes) discards every context.
+ *
+ * sr_tlb[] is the set the TLB in use was filled under. Between an mtsr and
+ * the event, old entries go on being used, as they always were; a fill
+ * then, in a segment whose register has changed, makes an entry that is
+ * not of that set, and ppc_cpu_tlb_fill() asks for the flush after all.
+ * The same check catches every other way the registers and sr_tlb[] could
+ * come apart (a reset, a loaded snapshot).
+ *
+ * QEMU_AOK_NO_TLB_CONTEXTS in the environment: a flush for every change, as
+ * before.
+ */
+bool ppc_tlb_sr_contexts(CPUPPCState *env)
+{
+    static int on = -1;
+
+    if (unlikely(on < 0)) {
+        on = getenv("QEMU_AOK_NO_TLB_CONTEXTS") == NULL;
+    }
+    return on && env->mmu_model == POWERPC_MMU_32B;
+}
+
+/* After a flush: what goes into the TLB from here on is of these. */
+void ppc_tlb_sr_sync(CPUPPCState *env)
+{
+    for (int i = 0; i < 16; i++) {
+        env->sr_tlb[i] = env->sr[i];
+    }
+}
+
 void check_tlb_flush(CPUPPCState *env, bool global)
 {
     CPUState *cs = env_cpu(env);
@@ -387,8 +433,18 @@ void check_tlb_flush(CPUPPCState *env, bool global)
 
     /* Then handle local ones */
     if (env->tlb_need_flush & TLB_NEED_LOCAL_FLUSH) {
-        env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
+        env->tlb_need_flush &= ~(TLB_NEED_LOCAL_FLUSH | TLB_NEED_SR_SWITCH);
         tlb_flush(cs);
+        ppc_tlb_sr_sync(env);
+    } else if (env->tlb_need_flush & TLB_NEED_SR_SWITCH) {
+        uint32_t sr[16];
+
+        env->tlb_need_flush &= ~TLB_NEED_SR_SWITCH;
+        for (int i = 0; i < 16; i++) {
+            sr[i] = env->sr[i];
+        }
+        tlb_context_switch(cs, env->sr_tlb, sr, sizeof(sr));
+        memcpy(env->sr_tlb, sr, sizeof(sr));
     }
 }
 #endif /* !CONFIG_USER_ONLY */

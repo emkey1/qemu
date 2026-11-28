@@ -142,6 +142,84 @@ tests under Mac OS X did 43 million insns in C until these were added, and
 * An infinite result of an infinite operand is exact; any other infinity is
   an overflow or a zero divide.
 
+Segment registers and the TLB
+=============================
+
+Not a gadget, but found beside them. A 32-bit PowerPC's TLB is tagged with
+VSIDs, so writing a segment register invalidates nothing in it, and an OS
+writes them as it likes. Mac OS X gives its kernel an address space of its
+own: it loads other segment registers on every way into the kernel and out
+again. QEMU's TLB has no tags, so ``target/ppc`` flushed all of it at the
+context-synchronizing event after such a write, and with it the jump cache:
+1.17 million times over a boot of Mac OS X 10.4 and one run of Xbench, some
+four thousand a second, against 41 thousand flushes that a ``tlbie`` asked
+for. A sample of the vCPU thread in a system-heavy stretch had 15% in
+``tcg_flush_jmp_cache()`` and 21% finding translations and TBs again.
+
+``tlb_context_switch()`` (``accel/tcg/cputlb.c``) sets the TLB and the jump
+cache aside under a key and takes up the pair last set aside under another
+key, or an empty pair; eight are kept. ``check_tlb_flush()`` calls it, with
+the sixteen segment registers as the key, where it flushed for a segment
+register (``TLB_NEED_SR_SWITCH``; the 32-bit hash MMU only). What makes it
+sound:
+
+* A context is as valid as the hardware's entries of those VSIDs would be:
+  a guest that changes a PTE must ``tlbie``. Every flush that is not a
+  switch (a ``tlbie``, a BAT or SDR1 write, a reset, a change to the memory
+  map, a watchpoint) discards all that is set aside. So does ``tb_flush()``,
+  for the jump caches.
+* Between an ``mtsr`` and the event, QEMU goes on using what is in the TLB
+  and translates what is not with the new value. Such an entry is not of
+  the set the TLB is kept under (``sr_tlb[]``), so ``ppc_cpu_tlb_fill()``
+  asks for the flush after all. The same check catches any other way the
+  registers and ``sr_tlb[]`` could come apart, a loaded snapshot for one.
+* ``tlb_reset_dirty()`` reaches the contexts set aside: an entry there must
+  learn that its page now holds code.
+
+A TLB's tables are resized when they are flushed, by how full they were, and
+a context is flushed far less often than the one TLB was. Left at that, a
+context's tables stayed small while they filled over a long time: Xbench's
+copy of one large buffer to another, whose pages then shared entries of a
+direct-mapped table, lost 16%. So a context taken up again whose table is
+more than 70% full is flushed there and then, to grow (its entries are lost
+once per doubling; the jump cache stays), and a CPU with contexts stops at
+8192 entries a table, since it has several of each.
+
+A stream keeps the jump cache's address in a register (``_jc``) from the
+time the main loop enters it, and a switch gives the CPU another jump cache.
+No gadget calls ``check_tlb_flush()`` and goes on (``isync``, ``rfi``,
+``mtmsr`` and a supervisor's ``sync`` are TCG's, and an exception leaves the
+stream); one that did would have to return to the main loop afterwards.
+
+``QEMU_AOK_NO_TLB_CONTEXTS`` in the environment gives the flushes back.
+``QEMU_AOK_STATS`` prints how many switches found their contents.
+
+Over that boot and run, 1.07 million switches found their contents and 72
+thousand did not; 25 thousand flushes discarded contexts; tables flushed
+fell from 2.33 million to 0.46 million. Xbench 1.3 under Mac OS X 10.4.11,
+one binary with the contexts and with ``QEMU_AOK_NO_TLB_CONTEXTS``, each
+machine alone, two runs with and three without: Memory test 38.3 against
+30.8 (Allocate 33.2 against 15.2, Copy 47.9 against 45.9), Thread test 62.6
+against 60.7; and side by side, Quartz Graphics 23.6 against 18.0. The CPU
+test's lines are within what identical runs differ by, but for one: its GCD
+loop read 362 to 411 with the contexts over four runs and 413 to 443 without
+over three, and no cause was found. The kit's Linux uses the contexts too
+(its kernel changes segment registers around every access to user memory):
+213 thousand switches found over the PowerPC gates.
+
+``ctxtest`` (aok-vm's ``aok/bench-pm/ctx``) is a firmware for ``-M mac99
+-bios`` that builds a page table in which one address means different pages
+under different VSIDs and walks a segment register through them: data and
+code after switching there and back, a ``tlbie`` while a context is set
+aside, an access between an ``mtsr`` and its ``isync``, a store to code
+through an entry that was set aside when the code was first run, and more
+sets than there are contexts. It gives the same results on QEMU 11.1 as
+released, and here with and without the contexts and the gadgets. Six
+faults put into the code one at a time (a flush that spares the contexts,
+the entry made before the ``isync`` kept, the jump cache not exchanged,
+``tlb_reset_dirty()`` stopping at the TLB in use, a context reused
+unflushed, a key compared in part) each fail the test written for it.
+
 For iSH-AOK
 ===========
 

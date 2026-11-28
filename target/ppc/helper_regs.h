@@ -32,6 +32,8 @@ int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv);
 static inline void check_tlb_flush(CPUPPCState *env, bool global) { }
 #else
 void check_tlb_flush(CPUPPCState *env, bool global);
+bool ppc_tlb_sr_contexts(CPUPPCState *env);
+void ppc_tlb_sr_sync(CPUPPCState *env);
 #endif
 
 #endif /* HELPER_REGS_H */

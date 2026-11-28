@@ -519,6 +519,8 @@ struct CPUState {
     MemoryRegion *memory;
 
     struct CPUJumpCache *tb_jmp_cache;
+    /* TLBs and jump caches set aside by tlb_context_switch() (cputlb.c). */
+    struct CPUTLBContexts *tlb_contexts;
 #ifdef CONFIG_AOK_GADGETS
     /* Host FPSR flags raised by AOK FP gadgets, not yet folded (aok.h). */
     uint32_t aok_host_fpsr;

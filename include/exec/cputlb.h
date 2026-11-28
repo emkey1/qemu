@@ -116,6 +116,40 @@ void tlb_flush_page(CPUState *cpu, vaddr addr);
 void tlb_flush_page_all_cpus_synced(CPUState *src, vaddr addr);
 
 /**
+ * tlb_context_switch:
+ * @cpu: CPU whose TLB to exchange; the caller is its thread
+ * @old_key: what names the TLB's contents as they are
+ * @new_key: what names the contents wanted
+ * @len: the size of a key, at most TLB_CONTEXT_KEY_MAX
+ *
+ * For a target whose translations depend on state it can name, and whose
+ * guest changes that state back and forth (a 32-bit PowerPC's segment
+ * registers: the hardware's TLB is tagged with what they hold, so a guest
+ * changes them freely). Instead of a flush at each change: the TLB and the
+ * jump cache are set aside under @old_key, and those set aside under
+ * @new_key take their place if there are any, an empty pair if not. A few
+ * are kept, the least recently used giving way.
+ *
+ * Any flush of this CPU's TLB by another function, of all of it or of a
+ * page, discards everything set aside: so a caller need only see that what
+ * it flushes for is not a change of key. tlb_reset_dirty() reaches the
+ * contexts set aside too.
+ *
+ * Returns whether contents were found.
+ */
+#define TLB_CONTEXT_KEY_MAX 64
+bool tlb_context_switch(CPUState *cpu, const void *old_key,
+                        const void *new_key, size_t len);
+
+/**
+ * tlb_contexts_drop:
+ * @cpu: CPU whose contexts set aside to discard
+ *
+ * For what empties the jump cache without flushing the TLB (tb_flush()).
+ */
+void tlb_contexts_drop(CPUState *cpu);
+
+/**
  * tlb_flush:
  * @cpu: CPU whose TLB should be flushed
  *

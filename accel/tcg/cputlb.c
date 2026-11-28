@@ -45,6 +45,7 @@
 #include "tb-internal.h"
 #include "trace.h"
 #include "tb-hash.h"
+#include "tb-jmp-cache.h"
 #include "tlb-bounds.h"
 #include "internal-common.h"
 #include "system-page-protection.h"
@@ -203,7 +204,7 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
  * conflict misses.
  */
 static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
-                                  int64_t now)
+                                  int64_t now, size_t max_size)
 {
     size_t old_size = tlb_n_entries(fast);
     size_t rate;
@@ -218,7 +219,7 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
     rate = desc->window_max_entries * 100 / old_size;
 
     if (rate > 70) {
-        new_size = MIN(old_size << 1, 1 << CPU_TLB_DYN_MAX_BITS);
+        new_size = MAX(MIN(old_size << 1, max_size), old_size);
     } else if (rate < 30 && window_expired) {
         size_t ceil = pow2ceil(desc->window_max_entries);
         size_t expected_rate = desc->window_max_entries * 100 / ceil;
@@ -287,14 +288,35 @@ static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
     memset(desc->vtable, -1, sizeof(desc->vtable));
 }
 
+/* QEMU_AOK_STATS: tables flushed, their entries in all, the largest */
+static uint64_t tlb_flush_stats[3];
+
+/*
+ * How large a table may grow. A CPU that keeps TLB contexts
+ * (tlb_context_switch()) has several of each, and they are flushed, which
+ * is when a table is resized, far less often than a single TLB would be:
+ * the entries of a long time count as in use. So theirs stop growing sooner.
+ */
+#define TLB_CONTEXT_DYN_MAX_BITS 13
+
+static inline size_t tlb_max_entries(CPUState *cpu)
+{
+    return (size_t)1 << (cpu->tlb_contexts
+                         ? MIN(TLB_CONTEXT_DYN_MAX_BITS, CPU_TLB_DYN_MAX_BITS)
+                         : CPU_TLB_DYN_MAX_BITS);
+}
+
 static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
                                         int64_t now)
 {
     CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
     CPUTLBDescFast *fast = cpu_tlb_fast(cpu, mmu_idx);
 
-    tlb_mmu_resize_locked(desc, fast, now);
+    tlb_mmu_resize_locked(desc, fast, now, tlb_max_entries(cpu));
     tlb_mmu_flush_locked(desc, fast);
+    tlb_flush_stats[0]++;
+    tlb_flush_stats[1] += tlb_n_entries(fast);
+    tlb_flush_stats[2] = MAX(tlb_flush_stats[2], tlb_n_entries(fast));
 }
 
 static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now)
@@ -334,9 +356,208 @@ void tlb_init(CPUState *cpu)
     }
 }
 
+/*
+ * TLB contexts: see tlb_context_switch() in exec/cputlb.h.
+ *
+ * One of the contexts is the one in use: its d[], f[], dirty and jc here are
+ * stale, the CPU's own being current, and it is neither valid nor looked
+ * up. The others own their tables. A context that is not valid may still
+ * hold entries (and its jump cache TBs, perhaps freed ones): it is flushed
+ * when it is next put to use, and not read before.
+ */
+#define TLB_CONTEXTS 8
+
+typedef struct CPUTLBContext {
+    bool allocated;             /* the tables and the jump cache exist */
+    bool valid;                 /* and hold what key names */
+    uint64_t used;              /* when it was set aside: the oldest goes */
+    uint8_t key[TLB_CONTEXT_KEY_MAX];
+    MMUIdxMap dirty;
+    CPUTLBDesc d[NB_MMU_MODES];
+    CPUTLBDescFast f[NB_MMU_MODES];
+    CPUJumpCache *jc;
+} CPUTLBContext;
+
+typedef struct CPUTLBContexts {
+    int cur;
+    uint64_t clock;
+    CPUTLBContext c[TLB_CONTEXTS];
+} CPUTLBContexts;
+
+/* QEMU_AOK_STATS: switches that found their contents, that did not; drops; tables grown */
+static uint64_t tlb_context_stats[4];
+
+static void __attribute__((destructor)) tlb_context_stats_print(void)
+{
+    if (getenv("QEMU_AOK_STATS") && tlb_flush_stats[0]) {
+        fprintf(stderr, "aok: tlb: %" PRIu64 " tables flushed, of %" PRIu64
+                " entries on average, the largest of %" PRIu64 "\n",
+                tlb_flush_stats[0], tlb_flush_stats[1] / tlb_flush_stats[0],
+                tlb_flush_stats[2]);
+    }
+    if (getenv("QEMU_AOK_STATS") &&
+        (tlb_context_stats[0] | tlb_context_stats[1])) {
+        fprintf(stderr, "aok: tlb contexts: %" PRIu64 " switches found their "
+                "contents, %" PRIu64 " did not; %" PRIu64 " flushes "
+                "discarded contexts; %" PRIu64 " tables flushed to grow\n",
+                tlb_context_stats[0], tlb_context_stats[1],
+                tlb_context_stats[2], tlb_context_stats[3]);
+    }
+}
+
+/* Called with tlb_c.lock held, or where no other thread can run. */
+static void tlb_contexts_drop_locked(CPUState *cpu)
+{
+    CPUTLBContexts *cs = cpu->tlb_contexts;
+    bool any = false;
+
+    if (likely(!cs)) {
+        return;
+    }
+    for (int i = 0; i < TLB_CONTEXTS; i++) {
+        any |= cs->c[i].valid;
+        cs->c[i].valid = false;
+    }
+    tlb_context_stats[2] += any;
+}
+
+void tlb_contexts_drop(CPUState *cpu)
+{
+    if (cpu->tlb_contexts) {
+        qemu_spin_lock(&cpu->neg.tlb.c.lock);
+        tlb_contexts_drop_locked(cpu);
+        qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+    }
+}
+
+bool tlb_context_switch(CPUState *cpu, const void *old_key,
+                        const void *new_key, size_t len)
+{
+    CPUTLBContexts *cs = cpu->tlb_contexts;
+    CPUTLBContext *from, *to = NULL;
+    int64_t now = get_clock_realtime();
+    bool found = false, fresh = false;
+
+    assert_cpu_is_self(cpu);
+    assert(len <= TLB_CONTEXT_KEY_MAX);
+    if (!memcmp(old_key, new_key, len)) {
+        return true;
+    }
+
+    if (unlikely(!cs)) {
+        cs = g_new0(CPUTLBContexts, 1);
+        cs->c[0].allocated = true;
+    }
+
+    qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    cpu->tlb_contexts = cs;
+
+    /* What is in use is set aside... */
+    from = &cs->c[cs->cur];
+    memcpy(from->d, cpu->neg.tlb.d, sizeof(from->d));
+    memcpy(from->f, cpu->neg.tlb.f, sizeof(from->f));
+    from->dirty = cpu->neg.tlb.c.dirty;
+    from->jc = cpu->tb_jmp_cache;
+    memset(from->key, 0, sizeof(from->key));
+    memcpy(from->key, old_key, len);
+    from->used = ++cs->clock;
+    from->valid = true;
+
+    /*
+     * ... for the one with the new key; or else one to start empty: one
+     * that was discarded, one not yet allocated, the one set aside longest
+     * ago, in that order.
+     */
+    for (int i = 0; i < TLB_CONTEXTS; i++) {
+        CPUTLBContext *c = &cs->c[i];
+        int rank, to_rank;
+
+        if (c == from) {
+            continue;
+        }
+        if (c->valid && !memcmp(c->key, new_key, len)) {
+            to = c;
+            found = true;
+            break;
+        }
+        rank = c->valid ? 2 : c->allocated ? 0 : 1;
+        to_rank = !to ? 3 : to->valid ? 2 : to->allocated ? 0 : 1;
+        if (rank < to_rank || (rank == to_rank && c->used < to->used)) {
+            to = c;
+        }
+    }
+    if (!found && !to->allocated) {
+        for (int i = 0; i < NB_MMU_MODES; i++) {
+            tlb_mmu_init(&to->d[i], &to->f[mmuidx_to_fast_index(i)], now);
+        }
+        to->dirty = 0;
+        to->jc = g_new0(CPUJumpCache, 1);
+        to->allocated = true;
+        fresh = true;
+    }
+    to->valid = false;
+
+    memcpy(cpu->neg.tlb.d, to->d, sizeof(to->d));
+    memcpy(cpu->neg.tlb.f, to->f, sizeof(to->f));
+    cpu->neg.tlb.c.dirty = to->dirty;
+    qatomic_set(&cpu->tb_jmp_cache, to->jc);
+    cs->cur = to - cs->c;
+
+    if (!found && !fresh) {
+        /* It holds what it was discarded with, or lost its turn with. */
+        for (MMUIdxMap work = cpu->neg.tlb.c.dirty; work; work &= work - 1) {
+            tlb_flush_one_mmuidx_locked(cpu, ctz32(work), now);
+        }
+        cpu->neg.tlb.c.dirty = 0;
+    } else if (found) {
+        /*
+         * A table is resized when it is flushed, and this one has not been
+         * since it was last in use: one that is full enough to grow is
+         * flushed now, for that. (Its entries are lost once for each
+         * doubling. The jump cache stays: nothing is invalid.) A direct-
+         * mapped table left small sends a copy between two buffers a
+         * megabyte apart through the slow path at every access.
+         */
+        for (MMUIdxMap work = cpu->neg.tlb.c.dirty; work; work &= work - 1) {
+            int mmu_idx = ctz32(work);
+            size_t n = tlb_n_entries(cpu_tlb_fast(cpu, mmu_idx));
+
+            if (cpu->neg.tlb.d[mmu_idx].n_used_entries * 100 > n * 70 &&
+                n < tlb_max_entries(cpu)) {
+                tlb_flush_one_mmuidx_locked(cpu, mmu_idx, now);
+                cpu->neg.tlb.c.dirty &= ~((MMUIdxMap)1 << mmu_idx);
+                tlb_context_stats[3]++;
+            }
+        }
+    }
+    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+
+    if (!found && !fresh) {
+        tcg_flush_jmp_cache(cpu);
+    }
+    tlb_context_stats[!found]++;
+    return found;
+}
+
 void tlb_destroy(CPUState *cpu)
 {
+    CPUTLBContexts *cs = cpu->tlb_contexts;
     int i;
+
+    for (int k = 0; cs && k < TLB_CONTEXTS; k++) {
+        CPUTLBContext *c = &cs->c[k];
+
+        if (k == cs->cur || !c->allocated) {
+            continue;
+        }
+        for (i = 0; i < NB_MMU_MODES; i++) {
+            g_free(c->f[i].table);
+            g_free(c->d[i].fulltlb);
+        }
+        g_free_rcu(c->jc, rcu);
+    }
+    g_free(cs);
+    cpu->tlb_contexts = NULL;
 
     qemu_spin_destroy(&cpu->neg.tlb.c.lock);
     for (i = 0; i < NB_MMU_MODES; i++) {
@@ -378,6 +599,7 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
     tlb_debug("mmu_idx:0x%04" PRIx16 "\n", asked);
 
     qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    tlb_contexts_drop_locked(cpu);
 
     all_dirty = cpu->neg.tlb.c.dirty;
     to_clean = asked & all_dirty;
@@ -539,6 +761,7 @@ static void tlb_flush_page_by_mmuidx_async_0(CPUState *cpu,
     tlb_debug("page addr: %016" VADDR_PRIx " mmu_map:0x%x\n", addr, idxmap);
 
     qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    tlb_contexts_drop_locked(cpu);
     for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
         if ((idxmap >> mmu_idx) & 1) {
             tlb_flush_page_locked(cpu, mmu_idx, addr);
@@ -729,6 +952,7 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
               d.addr, d.bits, d.len, d.idxmap);
 
     qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    tlb_contexts_drop_locked(cpu);
     for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
         if ((d.idxmap >> mmu_idx) & 1) {
             tlb_flush_range_locked(cpu, mmu_idx, d.addr, d.len, d.bits);
@@ -935,6 +1159,29 @@ void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length)
         for (i = 0; i < CPU_VTLB_SIZE; i++) {
             tlb_reset_dirty_range_locked(&desc->vfulltlb[i], &desc->vtable[i],
                                          start, length);
+        }
+    }
+    /* The contexts set aside: one that is valid, in the modes it used. */
+    for (int k = 0; cpu->tlb_contexts && k < TLB_CONTEXTS; k++) {
+        CPUTLBContext *c = &cpu->tlb_contexts->c[k];
+
+        if (!c->valid) {
+            continue;
+        }
+        for (MMUIdxMap work = c->dirty; work != 0; work &= work - 1) {
+            CPUTLBDesc *desc = &c->d[ctz32(work)];
+            CPUTLBDescFast *fast = &c->f[mmuidx_to_fast_index(ctz32(work))];
+            unsigned int n = tlb_n_entries(fast);
+            unsigned int i;
+
+            for (i = 0; i < n; i++) {
+                tlb_reset_dirty_range_locked(&desc->fulltlb[i],
+                                             &fast->table[i], start, length);
+            }
+            for (i = 0; i < CPU_VTLB_SIZE; i++) {
+                tlb_reset_dirty_range_locked(&desc->vfulltlb[i],
+                                             &desc->vtable[i], start, length);
+            }
         }
     }
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);

@@ -1087,6 +1087,10 @@ void tb_flush__exclusive_or_serial(void)
 
     CPU_FOREACH(cpu) {
         tcg_flush_jmp_cache(cpu);
+#ifndef CONFIG_USER_ONLY
+        /* Their jump caches hold TBs too, about to be freed. */
+        tlb_contexts_drop(cpu);
+#endif
     }
 
     qht_reset_size(&tb_ctx.htable, CODE_GEN_HTABLE_SIZE);

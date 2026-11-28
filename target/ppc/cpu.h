@@ -1349,6 +1349,8 @@ struct CPUArchState {
     uint32_t tlb_need_flush; /* Delayed flush needed */
 #define TLB_NEED_LOCAL_FLUSH   0x1
 #define TLB_NEED_GLOBAL_FLUSH  0x2
+/* A segment register changed, and nothing else: see check_tlb_flush() */
+#define TLB_NEED_SR_SWITCH     0x4
 #endif
 
     /* Other registers */
@@ -1370,6 +1372,11 @@ struct CPUArchState {
     float_status vec_status;
     float_status fp_status; /* Floating point execution context */
     target_ulong fpscr;     /* Floating point status and control register */
+    /*
+     * The segment registers every entry now in the TLB was made under
+     * (check_tlb_flush()). Here, past what the AOK gadgets know the place of.
+     */
+    uint32_t sr_tlb[16];
 
     /* Internal devices resources */
     ppc_tb_t *tb_env;      /* Time base and decrementer */

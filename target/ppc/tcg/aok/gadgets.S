@@ -252,6 +252,124 @@
     ca_out
     put1
 
+/*
+ * The OE forms: XER[OV] is whether the result overflowed, and SO gathers
+ * it. The host's V after adds, adcs, subs and sbcs is that overflow
+ * (QEMU's gen_op_arith_compute_ov, from the operands' and the result's
+ * signs); a record form's CR0 comes after, and reads the new SO.
+ */
+.macro ov_store reg
+    ldr w14, [_cpu, #AOK_PPC_ENV_SO]
+    str \reg, [_cpu, #AOK_PPC_ENV_OV]
+    orr w14, w14, \reg
+    str w14, [_cpu, #AOK_PPC_ENV_SO]
+.endm
+.macro ov_out
+    cset w13, vs
+    ov_store w13
+.endm
+.gadget ppc_addo
+    rr
+    adds w10, w10, w11
+    ov_out
+    put
+.gadget ppc_addco
+    rr
+    adds w10, w10, w11
+    ca_out
+    ov_out
+    put
+.gadget ppc_addeo
+    rr
+    ca_in
+    adcs w10, w10, w11
+    ca_out
+    ov_out
+    put
+.gadget ppc_addmeo
+    r1
+    ca_in
+    mov w11, #-1
+    adcs w10, w10, w11
+    ca_out
+    ov_out
+    put1
+.gadget ppc_addzeo
+    r1
+    ca_in
+    adcs w10, w10, wzr
+    ca_out
+    ov_out
+    put1
+.gadget ppc_subfo
+    rr
+    subs w10, w11, w10
+    ov_out
+    put
+.gadget ppc_subfco
+    rr
+    subs w10, w11, w10
+    ca_out
+    ov_out
+    put
+.gadget ppc_subfeo
+    rr
+    ca_in
+    sbcs w10, w11, w10
+    ca_out
+    ov_out
+    put
+.gadget ppc_subfmeo
+    r1
+    ca_in
+    mov w11, #-1
+    sbcs w10, w11, w10
+    ca_out
+    ov_out
+    put1
+.gadget ppc_subfzeo
+    r1
+    ca_in
+    sbcs w10, wzr, w10
+    ca_out
+    ov_out
+    put1
+.gadget ppc_nego
+    r1
+    negs w10, w10
+    ov_out
+    put1
+/* mullwo: overflow if the product is not the 32 bits kept, sign-extended */
+.gadget ppc_mullwo
+    rr
+    smull x12, w10, w11
+    cmp x12, w12, sxtw
+    mov w10, w12
+    cset w13, ne
+    ov_store w13
+    put
+/* divwo, divwuo: overflow where divw and divwu leave rA in rD */
+.gadget ppc_divwo
+    rr
+    sdiv w12, w10, w11
+    mov w14, #0x80000000
+    cmp w10, w14
+    ccmn w11, #1, #0, eq
+    cset w13, eq
+    cmp w11, #0
+    csinc w13, w13, wzr, ne
+    csel w10, w10, w12, eq
+    ov_store w13
+    put
+.gadget ppc_divwuo
+    rr
+    udiv w12, w10, w11
+    cmp w11, #0
+    cset w13, eq
+    csel w10, w10, w12, eq
+    ov_store w13
+    put
+
     g_rr mullw
     g_ri mulli, mullw
 .gadget ppc_mulhw
@@ -471,6 +589,15 @@
     orr w10, w10, w13
     str w10, [_cpu, x9]
     gret 1
+
+/* mfocrf: [rD][crf offset][shift] -- the one field in its place, the rest of rD zero */
+.gadget ppc_mfocrf
+    ldp x9, x10, [_ip]
+    ldr x11, [_ip, #16]
+    ldr w10, [_cpu, x10]
+    lsl w10, w10, w11
+    str w10, [_cpu, x9]
+    gret 3
 
 /* mtcrf: [rS][CRM] -- field 7 - n from rS bits 4n+3..4n where CRM bit n is set */
 .gadget ppc_mtcrf
@@ -700,6 +827,44 @@ _addr   .req x7
     load lwbrx, 32, ldr, , , x, 0, _le
     store sthbrx, 16, strh, , x, 0, _le
     store stwbrx, 32, str, , x, 0, _le
+
+/*
+ * lvx, lvxl, stvx, stvxl: [vD/vS offset][rA offset][rB offset][word] --
+ * sixteen bytes at the address less its low four bits, so within a page. A
+ * vector register is one 128-bit number of the host's (QEMU's ppc_avr_t): the
+ * guest's sixteen bytes in the opposite order.
+ */
+.gadget ppc_lvx
+    ea_x
+    and w7, w7, #0xfffffff0
+    tlb_probe 8, AOK_TLBE_READ, 8f
+    ldr q0, [_addr]
+    ldr x9, [_ip]
+    rev64 v0.16b, v0.16b
+    ext v0.16b, v0.16b, v0.16b, #8
+    add x9, _cpu, x9
+    str q0, [x9]
+    gret 4
+8:  aok_fp_end
+    slow_args 2, 3
+    bl SYM(aok_ppc_helper_lvx)
+    gret 4
+
+.gadget ppc_stvx
+    ea_x
+    ldr x6, [_ip]
+    and w7, w7, #0xfffffff0
+    add x6, _cpu, x6
+    tlb_probe 8, AOK_TLBE_WRITE, 8f
+    ldr q0, [x6]
+    rev64 v0.16b, v0.16b
+    ext v0.16b, v0.16b, v0.16b, #8
+    str q0, [_addr]
+    gret 4
+8:  aok_fp_end
+    slow_args 2, 3
+    bl SYM(aok_ppc_helper_stvx)
+    gret 4
 
 /* ---- Floating point --------------------------------------------------------
  *
@@ -1697,7 +1862,7 @@ ppc_fp_special:
  * bclr on a CR bit, without LK (beqlr, bnelr ...): [crf offset][bit]
  * [fall-through way][flags | cflags << 32][cs_base].
  */
-.macro bclrc name, set
+.macro bclrc name, set, src=AOK_PPC_ENV_LR
 .gadget ppc_\name
     ldp x9, x10, [_ip]
     ldr w9, [_cpu, x9]
@@ -1707,7 +1872,7 @@ ppc_fp_special:
     .else
     b.ne 1f
     .endif
-    ldr w10, [_cpu, #AOK_PPC_ENV_LR]
+    ldr w10, [_cpu, #\src]
     and w10, w10, #0xfffffffc
     str w10, [_pcp]
     add _ip, _ip, #32
@@ -1716,6 +1881,8 @@ ppc_fp_special:
 .endm
     bclrc bclr_t, 1
     bclrc bclr_f, 0
+    bclrc bcctr_t, 1, AOK_PPC_ENV_CTR
+    bclrc bcctr_f, 0, AOK_PPC_ENV_CTR
 
 /*
  * [flags | cflags << 32][cs_base] -- aok_gadget_lookup with tb_lookup()'s
@@ -1743,6 +1910,50 @@ SYM(aok_ppc_lookup_pc):
     add w1, w19, w1
     blr x9
     gret 3
+
+/*
+ * The same, for an insn after which the stream may not go on as it is: the
+ * CPU may have another TLB and another jump cache (check_tlb_flush(); _jc is
+ * the one the stream was entered with), or other flags. The main loop looks
+ * again, from the next insn.
+ *
+ * call_sync: only if the function returns nonzero (isync, sync).
+ * call_leave: always (mtmsr).
+ * call_exit: always, and from wherever the function left nip (rfi).
+ */
+.macro call_c
+    aok_fp_end
+    ldp x9, x1, [_ip]
+    ldr x2, [_ip, #16]
+    mov x0, _cpu
+    add w1, w19, w1
+    blr x9
+.endm
+.macro next_pc
+    ldr x9, [_ip, #8]
+    add w9, w19, w9
+    add w9, w9, #4
+    str w9, [_pcp]
+.endm
+
+.gadget ppc_call_sync
+    call_c
+    cbnz x0, 1f
+    gret 3
+1:  next_pc
+    mov x0, #0
+    b SYM(aok_exit)
+
+.gadget ppc_call_leave
+    call_c
+    next_pc
+    mov x0, #0
+    b SYM(aok_exit)
+
+.gadget ppc_call_exit
+    call_c
+    mov x0, #0
+    b SYM(aok_exit)
 
 /* ---- Fused pairs -----------------------------------------------------------
  *

@@ -21,7 +21,12 @@ CTR or on both, ``blr`` (also on a CR bit), ``bctr`` and their linking forms,
 ``fneg``, ``fabs``, ``fnabs``, ``fsel``, the arithmetic and the fused
 multiply-adds in double and in single precision, ``fsqrt``, ``frsp``,
 ``fctiw``, ``fctiwz``, ``fcmpu``, ``fcmpo``, ``mffs``, and as calls to C
-``fsqrts``, the estimates and the FPSCR's other insns.
+``fsqrts``, the estimates and the FPSCR's other insns. Since 2026-11-28
+also what sent Mac OS X's and Mac OS 9's streams to TCG most (below): the
+OE forms, ``bcctr`` on a CR bit, ``mfocrf`` and ``mtocrf``, AltiVec's
+``lvx`` and ``stvx`` and its hints, ``lswi`` and ``stswi``, the cache insns,
+and for a supervisor ``mfmsr``, ``mtmsr``, the segment register moves,
+``isync``, ``sync`` and ``rfi``.
 
 * ``lmw``, ``stmw``, ``dcbz`` and ``mftb`` are one call to C, QEMU's own
   helpers. ``lwarx`` and ``stwcx.`` are one call each, what TCG generates
@@ -35,13 +40,13 @@ multiply-adds in double and in single precision, ``fsqrt``, ``frsp``,
 * Where the architecture leaves a result undefined, the gadgets give QEMU's:
   ``divw`` and ``divwu`` by zero, and ``0x80000000 / -1``, leave rA in rD;
   ``sraw`` writes CA32 as QEMU's helper does, ``srawi`` does not.
-* Left to TCG, where its TB ends or an exception is due: the OE forms,
-  AltiVec, ``sc``, ``rfi``, ``isync``, ``mtmsr`` and ``mfmsr``, ``sync`` in
-  supervisor mode, ``dcbf``, ``dcbst`` and ``icbi``, traps that test
-  something, the forms QEMU takes for illegal (an update load whose rA is 0
-  or rD, an update store whose rA is 0, ``lwbrx.``), ``mfocrf`` and
-  ``mtocrf``, ``mcrfs``, a conditional ``bcctr``, and every FP insn while
-  MSR[FP] is clear.
+* Left to TCG, where its TB ends or an exception is due: AltiVec but for
+  ``lvx``, ``stvx`` and the hints, ``sc``, traps that test something, the
+  forms QEMU takes for illegal (an update load whose rA is 0 or rD, an
+  update store whose rA is 0, ``lwbrx.``), ``mcrfs``, ``bclrl`` on a CR
+  bit, a ``bcctr`` that counts, ``lswx``, ``tlbie``, the decrementer, and
+  every FP insn while MSR[FP] is clear and every AltiVec one while MSR[VR]
+  is.
 
 A TB is translated only for a big-endian guest (MSR[LE] clear) that is not
 single-stepping or tracing branches (MSR[SE], MSR[BE]), which TCG turns into
@@ -187,9 +192,9 @@ once per doubling; the jump cache stays), and a CPU with contexts stops at
 
 A stream keeps the jump cache's address in a register (``_jc``) from the
 time the main loop enters it, and a switch gives the CPU another jump cache.
-No gadget calls ``check_tlb_flush()`` and goes on (``isync``, ``rfi``,
-``mtmsr`` and a supervisor's ``sync`` are TCG's, and an exception leaves the
-stream); one that did would have to return to the main loop afterwards.
+So a gadget that calls ``check_tlb_flush()`` returns to the main loop if it
+did anything (``call_sync``: ``isync`` and ``sync``; ``call_exit``:
+``rfi``). ``ctxtest`` fails if one goes on instead.
 
 ``QEMU_AOK_NO_TLB_CONTEXTS`` in the environment gives the flushes back.
 ``QEMU_AOK_STATS`` prints how many switches found their contents.
@@ -219,6 +224,60 @@ faults put into the code one at a time (a flush that spares the contexts,
 the entry made before the ``isync`` kept, the jump cache not exchanged,
 ``tlb_reset_dirty()`` stopping at the TLB in use, a context reused
 unflushed, a key compared in part) each fail the test written for it.
+
+Streams that hand over to TCG
+=============================
+
+A TB is a stream as far as its insns are gadgets; from the first that is
+not, TCG's TB runs to the end of the block. The two are not linked: each
+change goes through the main loop, twice for a block that is entered from
+a stream and left for one. Counted with ``QEMU_AOK_STATS=2``, which lists
+TCG's TBs by how often the main loop entered them: over a boot of Mac OS X
+10.4 and an Xbench run the main loop entered streams 115 million times and
+TCG's code 122 million, and nine kinds of insn began 88% of those TBs:
+``dst`` 17% (a hint: nothing to do), ``mtocrf`` 14%, ``isync`` 11%,
+``stvx`` and ``lvx`` 17% (the copy and fill loops), ``mfmsr`` 8%,
+``mtsrin`` 7%, ``mtmsr`` 7%, ``icbi`` and ``dcbf`` 8%. Mac OS 9 was three
+kinds for 96% of 203 million in ninety seconds, all in its 68k emulator:
+``addco``, ``subfco`` and ``bcctr`` on a CR bit.
+
+They are gadgets now:
+
+* The OE forms set XER[OV] from the host's V flag, which after ``adds``,
+  ``adcs``, ``subs`` and ``sbcs`` is the overflow QEMU computes from the
+  signs, and add it to SO; ``mullwo`` compares the product with its low
+  word sign-extended; ``divwo`` and ``divwuo`` overflow where QEMU leaves
+  rA in rD.
+* ``mfocrf`` and ``mtocrf`` move the one field of a mask of one bit, and
+  with any other mask do nothing, as QEMU's do.
+* ``lvx``, ``lvxl``, ``stvx`` and ``stvxl`` are a sixteen-byte load or
+  store at the address less its low four bits (so within a page), the bytes
+  reversed: a vector register is one 128-bit number of the host's. ``dst``,
+  ``dstst``, ``dss`` and ``dcba`` are nothing; ``dcbf``, ``dcbst`` and
+  ``icbi`` a load in C for the fault it may raise; ``lswi`` and ``stswi``
+  QEMU's helpers.
+* ``mfmsr`` is a move, and the segment register insns QEMU's helpers.
+  ``isync`` and a supervisor's ``sync`` call ``check_tlb_flush()`` where a
+  flush is due, and then leave for the main loop, since the CPU may have
+  another jump cache than the stream holds (above); with nothing due, which
+  is ten times in eleven, the stream goes on. ``mtmsr`` and ``rfi`` always
+  leave: flags have changed.
+
+A stream that would stop at an insn inside a loop, with the loop's branch
+back in TCG's part, would trade a loop that TCG links to itself for two
+passes of the main loop at every turn (a loop of AltiVec arithmetic
+between an ``lvx`` and a ``stvx``). ``tail_loops_back()`` looks ahead to
+the block's branch, and such a TB is left whole to TCG.
+
+After: the main loop entered streams 24 million times and TCG's code 6.7
+million over the Mac OS X run (99.7% of TBs are streams), and 12 and 7.7
+million in Mac OS 9's ninety seconds, which now reaches its desktop in
+about 30 s where it took about 50 (two machines side by side, a picture
+every ten seconds). Xbench under Mac OS X, alone, before and
+after: Memory test 38.3 to 128.6 (Fill 23.9 to 254, Copy 47.9 to 284, the
+AltiVec stream tests 46.9 to 202); the CPU and thread tests as they were.
+What still begins TCG's TBs: ``sc``, the decrementer's ``mfspr``, ``lvsl``,
+``mfvscr`` and ``mtvscr``, and in Mac OS 9 the trap ``twi 31`` and ``lswx``.
 
 For iSH-AOK
 ===========
@@ -273,3 +332,12 @@ bits kept, a signalling NaN let through, an overflow taken for an infinite
 operand's, a zero's sign) each change ten or all twenty. The cancelled sums
 needed the addends above: before the test had them, a wrong sign there
 changed no hash.
+
+``vectest`` (aok-vm's ``aok/bench-pm/i3``) does the same for the insns of
+2026-11-28 that a user program has: the vector loads and stores at every
+alignment, by a page's end and into a page that is not there, ``mfocrf``
+and ``mtocrf`` with every kind of mask, the OE forms from every state of
+XER, ``bcctr`` on a CR bit, ``lswi`` and ``stswi`` of every length, the
+hints and cache insns; forty-two lines, the same with and without the
+gadgets. ``ctxtest`` covers the supervisor's. Seventeen faults put into
+these gadgets one at a time are each seen by one or the other.

@@ -15,6 +15,7 @@
 #include "qemu/osdep.h"
 #include "cpu.h"
 #include "internal.h"
+#include "helper_regs.h"
 #include "spr_common.h"
 #include "exec/helper-proto.h"
 #include "exec/target_page.h"
@@ -32,6 +33,10 @@ DECL(add) DECL(addi) DECL(subf) DECL(neg)
 DECL(addc) DECL(addic) DECL(adde) DECL(addme) DECL(addze)
 DECL(subfc) DECL(subfic) DECL(subfe) DECL(subfme) DECL(subfze)
 DECL(mullw) DECL(mulli) DECL(mulhw) DECL(mulhwu) DECL(divw) DECL(divwu)
+DECL(addo) DECL(addco) DECL(addeo) DECL(addmeo) DECL(addzeo)
+DECL(subfo) DECL(subfco) DECL(subfeo) DECL(subfmeo) DECL(subfzeo)
+DECL(nego) DECL(mullwo) DECL(divwo) DECL(divwuo)
+DECL(bcctr_t) DECL(bcctr_f)
 DECL(and) DECL(andi) DECL(andc) DECL(or) DECL(ori) DECL(orc)
 DECL(xor) DECL(xori) DECL(nand) DECL(nor) DECL(eqv)
 DECL(extsb) DECL(extsh) DECL(cntlzw)
@@ -44,7 +49,8 @@ DECL(mfcr) DECL(mtcrf) DECL(mfxer) DECL(mtxer) DECL(mcrxr) DECL(sync)
 DECL(b) DECL(bl) DECL(set_lr) DECL(bc_t) DECL(bc_f) DECL(bdnz) DECL(bdz)
 DECL(blr) DECL(blrl) DECL(bctr) DECL(bctrl)
 DECL(blr_exit) DECL(blrl_exit) DECL(bctr_exit) DECL(bctrl_exit)
-DECL(lookup) DECL(call)
+DECL(lookup) DECL(call) DECL(call_sync) DECL(call_leave) DECL(call_exit)
+DECL(mfocrf) DECL(lvx) DECL(stvx)
 #define LDST(n) DECL(n##_d) DECL(n##_x)
 LDST(lbz) LDST(lhz) LDST(lha) LDST(lwz) LDST(lbzu) LDST(lhzu) LDST(lhau)
 LDST(lwzu) LDST(stb) LDST(sth) LDST(stw) LDST(stbu) LDST(sthu) LDST(stwu)
@@ -528,6 +534,135 @@ static void aok_ppc_stwcx(CPUPPCState *env, uint64_t pc, uint64_t insn)
     env->reserve_addr = -1;
 }
 
+/* lswi, stswi: QEMU's helpers, at (rA|0); NB 0 is 32 bytes */
+static void aok_ppc_lsw(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    unsigned rt = (insn >> 21) & 31, ra = (insn >> 16) & 31;
+    unsigned nb = (insn >> 11) & 31 ? (insn >> 11) & 31 : 32;
+    target_ulong ea = ra ? env->gpr[ra] : 0;
+
+    aok_ppc_sync(env, pc);
+    if (((insn >> 1) & 0x3ff) == 597) {
+        helper_lsw(env, ea, nb, rt);
+    } else {
+        helper_stsw(env, ea, nb, rt);
+    }
+}
+
+/* dcbf, dcbst: a byte loaded, for its faults; icbi: a word of the line (helper_icbi) */
+static void aok_ppc_cache(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    target_ulong ea = ea_x(env, insn);
+
+    aok_ppc_sync_as(env, pc, ACCESS_CACHE);
+    if (((insn >> 1) & 0x3ff) == 982) {
+        cpu_ldl_mmu(env, ea & ~(env->dcache_line_size - 1),
+                    OI(env, MO_UL | MO_UNALN), 0);
+    } else {
+        cpu_ldb_mmu(env, ea, OI(env, MO_UB), 0);
+    }
+}
+
+/* mtsr, mtsrin, mfsr, mfsrin: QEMU's helpers. A write waits for the next isync. */
+static void aok_ppc_sr(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    unsigned xo = (insn >> 1) & 0x3ff, t = (insn >> 21) & 31;
+    unsigned n = xo == 210 || xo == 595 ? (insn >> 16) & 15
+                 : (env->gpr[(insn >> 11) & 31] >> 28) & 15;
+
+    if (xo == 210 || xo == 242) {
+        helper_store_sr(env, n, env->gpr[t]);
+    } else {
+        env->gpr[t] = helper_load_sr(env, n);
+    }
+}
+
+/*
+ * isync, and a supervisor's sync: check_tlb_flush(), as TCG's code calls it
+ * where a flush is pending. It may flush the TLB, or give the CPU another
+ * TLB and jump cache (tlb_context_switch()), and a stream holds the jump
+ * cache's address: so these say whether there was anything to do, and the
+ * gadget (call_sync) then leaves for the main loop.
+ */
+static uint64_t aok_ppc_flush(CPUPPCState *env, bool global)
+{
+    if (likely(!env->tlb_need_flush)) {
+        return 0;
+    }
+    check_tlb_flush(env, global);
+    return 1;
+}
+
+static uint64_t aok_ppc_isync(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    return aok_ppc_flush(env, false);
+}
+
+static uint64_t aok_ppc_sync_sv(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    return aok_ppc_flush(env, true);
+}
+
+/* mtmsr, as gen_mtmsr: the main loop looks again afterwards (call_leave) */
+static void aok_ppc_mtmsr(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    target_ulong mask = 0xffffffff, val = env->gpr[(insn >> 21) & 31];
+
+    aok_no_retaddr();
+    if (insn & 0x00010000) {
+        /* the L form: EE and RI alone */
+        mask &= (1ULL << MSR_RI) | (1ULL << MSR_EE);
+    } else {
+        if (likely(!(env->insns_flags2 & PPC2_PPE42))) {
+            mask &= ~((1ULL << MSR_LE) | (1ULL << MSR_ME) | (1ULL << MSR_S));
+        }
+        /* where a CPU put to sleep by this is to wake */
+        env->nip = pc + 4;
+    }
+    helper_store_msr(env, (val & mask) | (env->msr & ~mask));
+}
+
+/* rfi: nip and the MSR from SRR0 and SRR1 (call_exit) */
+static void aok_ppc_rfi(CPUPPCState *env, uint64_t pc, uint64_t insn)
+{
+    aok_no_retaddr();
+    env->nip = pc;
+    helper_rfi(env);
+}
+
+/*
+ * lvx and stvx off the fast path: two doublewords, the high one first, as
+ * TCG's code loads and stores them. @addr is the address less its low four
+ * bits.
+ */
+void aok_ppc_helper_lvx(CPUPPCState *env, uint64_t addr, uint64_t pc,
+                        uint64_t insn);
+void aok_ppc_helper_lvx(CPUPPCState *env, uint64_t addr, uint64_t pc,
+                        uint64_t insn)
+{
+    ppc_avr_t *v = cpu_avr_ptr(env, (insn >> 21) & 31);
+    MemOpIdx oi = OI(env, MO_BEUQ);
+    uint64_t hi;
+
+    aok_ppc_sync(env, pc);
+    hi = cpu_ldq_mmu(env, (uint32_t)addr, oi, 0);
+    v->VsrD(1) = cpu_ldq_mmu(env, (uint32_t)addr + 8, oi, 0);
+    v->VsrD(0) = hi;
+}
+
+void aok_ppc_helper_stvx(CPUPPCState *env, uint64_t addr, uint64_t pc,
+                         uint64_t insn);
+void aok_ppc_helper_stvx(CPUPPCState *env, uint64_t addr, uint64_t pc,
+                         uint64_t insn)
+{
+    ppc_avr_t *v = cpu_avr_ptr(env, (insn >> 21) & 31);
+    MemOpIdx oi = OI(env, MO_BEUQ);
+
+    aok_ppc_sync(env, pc);
+    cpu_stq_mmu(env, (uint32_t)addr, v->VsrD(0), oi, 0);
+    cpu_stq_mmu(env, (uint32_t)addr + 8, v->VsrD(1), oi, 0);
+}
+
 /* lmw, stmw: QEMU's own helpers, at (rA|0) + d (TCG checks no form of them). */
 static void aok_ppc_lmw(CPUPPCState *env, uint64_t pc, uint64_t insn)
 {
@@ -555,6 +690,7 @@ typedef struct Ctx {
     uint32_t insn;
     bool pr;                /* user mode (MSR[PR]) */
     bool fp;                /* the FPU on (MSR[FP]); else FP insns are TCG's to trap */
+    bool vr;                /* AltiVec on (MSR[VR]); likewise */
     CPUPPCState *env;
     /* Where each gadget of the current insn began: the steps aok_gen_pair takes. */
     uint64_t *gs[8];
@@ -727,9 +863,39 @@ static int call(Ctx *c, void (*fn)(CPUPPCState *, uint64_t, uint64_t))
     return NEXT;
 }
 
+/* A call to C that may leave the stream, or always does: the same operands */
+static int call_as(Ctx *c, Gadget gadget, void *fn, int r)
+{
+    emitg(c, gadget);
+    aok_emit(&c->g, (uintptr_t)fn);
+    aok_emit(&c->g, c->off);
+    aok_emit(&c->g, c->insn);
+    return r;
+}
+
+/* Whether the CPU has the insns of @flag: one it lacks is TCG's, to trap. */
+static inline bool has(Ctx *c, uint64_t flag)
+{
+    return (c->env->insns_flags & flag) != 0;
+}
+
 static inline uint64_t fpr(unsigned r)
 {
     return fpr_offset(r);
+}
+
+/* lvx, lvxl, stvx, stvxl: an X-form load's or store's stream, on a vector register */
+static int vldst(Ctx *c, Gadget gadget, unsigned vt, unsigned ra, unsigned rb)
+{
+    if (!c->vr || !has(c, PPC_ALTIVEC) || (c->insn & 1)) {
+        return UNKNOWN;
+    }
+    emitg(c, gadget);
+    aok_emit(&c->g, avr_full_offset(vt));
+    aok_emit(&c->g, base(ra));
+    aok_emit(&c->g, gpr(rb));
+    aok_emit(&c->g, mem_word(c));
+    return NEXT;
 }
 
 /* A record form's CR1, from FPSCR */
@@ -957,11 +1123,20 @@ static int indirect(Ctx *c, bool ctr)
         { G(blr_exit), G(blrl_exit) }, { G(bctr_exit), G(bctrl_exit) },
     };
 
-    if ((bo & 0x14) == 0x04 && !ctr && !lk && !c->no_goto_ptr) {
-        /* beqlr and the like: on a CR bit alone */
+    if ((bo & 0x14) == 0x04 && (ctr || !lk) && !c->no_goto_ptr) {
+        /*
+         * beqlr, beqctr and the like: on a CR bit alone. With LK, bcctr's
+         * LR is written first, taken or not; bclrl's old LR is its target,
+         * and that one is TCG's.
+         */
         unsigned bi = (c->insn >> 16) & 31;
 
-        emitg(c, (bo & 0x08) ? G(bclr_t) : G(bclr_f));
+        if (lk) {
+            emitg(c, G(set_lr));
+            aok_emit(&c->g, (uint32_t)(cia(c) + 4 - c->pc));
+        }
+        emitg(c, ctr ? ((bo & 0x08) ? G(bcctr_t) : G(bcctr_f))
+                     : ((bo & 0x08) ? G(bclr_t) : G(bclr_f)));
         aok_emit(&c->g, crf(bi >> 2));
         aok_emit(&c->g, 8 >> (bi & 3));
         way(c, 1, cia(c) + 4);
@@ -1005,6 +1180,17 @@ static int op19(Ctx *c)
         return indirect(c, false);
     case 528:
         return indirect(c, true);
+    case 150:   /* isync: in user mode a barrier, as sync */
+        if (insn & 0x03fff801) {
+            return UNKNOWN;
+        }
+        emitg(c, G(sync));
+        return c->pr ? NEXT : call_as(c, G(call_sync), aok_ppc_isync, NEXT);
+    case 50:    /* rfi */
+        if ((insn & 0x03ff8001) || c->pr) {
+            return UNKNOWN;
+        }
+        return call_as(c, G(call_exit), aok_ppc_rfi, END);
     case 257: gadget = G(crand); break;
     case 129: gadget = G(crandc); break;
     case 289: gadget = G(creqv); break;
@@ -1059,7 +1245,7 @@ static int op31(Ctx *c)
     unsigned d = (insn >> 21) & 31, a = (insn >> 16) & 31, b = (insn >> 11) & 31;
     bool oe = insn & 0x400;
 
-    /* XO-form arithmetic. With OE set (OV and SO) it is TCG's for now. */
+    /* XO-form arithmetic; with OE, gadgets that set XER[OV] and add it to SO */
     switch (xo9) {
     case 75:    /* mulhw and mulhwu ignore OE */
         return rr(c, G(mulhw), d, a, b);
@@ -1068,7 +1254,22 @@ static int op31(Ctx *c)
     case 266: case 10: case 138: case 234: case 202: case 40: case 8:
     case 136: case 232: case 200: case 104: case 235: case 491: case 459:
         if (oe) {
-            return UNKNOWN;
+            switch (xo9) {
+            case 266: return rr(c, G(addo), d, a, b);
+            case 10: return rr(c, G(addco), d, a, b);
+            case 138: return rr(c, G(addeo), d, a, b);
+            case 234: return r1(c, G(addmeo), d, a);
+            case 202: return r1(c, G(addzeo), d, a);
+            case 40: return rr(c, G(subfo), d, a, b);
+            case 8: return rr(c, G(subfco), d, a, b);
+            case 136: return rr(c, G(subfeo), d, a, b);
+            case 232: return r1(c, G(subfmeo), d, a);
+            case 200: return r1(c, G(subfzeo), d, a);
+            case 104: return r1(c, G(nego), d, a);
+            case 235: return rr(c, G(mullwo), d, a, b);
+            case 491: return rr(c, G(divwo), d, a, b);
+            case 459: return rr(c, G(divwuo), d, a, b);
+            }
         }
         switch (xo9) {
         case 266: return rr(c, G(add), d, a, b);
@@ -1125,19 +1326,58 @@ static int op31(Ctx *c)
         return NEXT;
 
     /* the CR and XER, LR and CTR */
-    case 19:    /* mfcr; the mfocrf form (bit 20) is TCG's */
-        if (insn & 0x00100801) {
+    case 19:    /* mfcr, and mfocrf (bit 20): its one field, or with another mask nothing */
+        if (insn & 0x00000801) {
             return UNKNOWN;
+        }
+        if (insn & 0x00100000) {
+            unsigned crm = (insn >> 12) & 0xff;
+
+            if (crm && !(crm & (crm - 1))) {
+                emit3(c, G(mfocrf), gpr(d), crf(7 - ctz32(crm)),
+                      4 * ctz32(crm));
+            }
+            return NEXT;
         }
         emitg(c, G(mfcr));
         aok_emit(&c->g, gpr(d));
         return NEXT;
-    case 144:   /* mtcrf; mtocrf likewise */
-        if (insn & 0x00100801) {
+    case 144:   /* mtcrf, and mtocrf likewise */
+        if (insn & 0x00000801) {
             return UNKNOWN;
+        }
+        if (insn & 0x00100000) {
+            unsigned crm = (insn >> 12) & 0xff;
+
+            if (crm && !(crm & (crm - 1))) {
+                emit2(c, G(mtcrf), gpr(d), crm);
+            }
+            return NEXT;
         }
         emit2(c, G(mtcrf), gpr(d), (insn >> 12) & 0xff);
         return NEXT;
+    /* the MSR and the segment registers, a supervisor's */
+    case 83:    /* mfmsr */
+        if ((insn & 0x001ff801) || c->pr) {
+            return UNKNOWN;
+        }
+        emit2(c, G(mov), gpr(d), offsetof(CPUPPCState, msr));
+        return NEXT;
+    case 146:   /* mtmsr */
+        if ((insn & 0x001ef801) || c->pr) {
+            return UNKNOWN;
+        }
+        return call_as(c, G(call_leave), aok_ppc_mtmsr, END);
+    case 210: case 595:     /* mtsr, mfsr */
+        if ((insn & 0x0010f801) || c->pr || !has(c, PPC_SEGMENT)) {
+            return UNKNOWN;
+        }
+        return call(c, aok_ppc_sr);
+    case 242: case 659:     /* mtsrin, mfsrin */
+        if ((insn & 0x001f0001) || c->pr || !has(c, PPC_SEGMENT)) {
+            return UNKNOWN;
+        }
+        return call(c, aok_ppc_sr);
     case 512:   /* mcrxr */
         if (insn & 0x007ff801) {
             return UNKNOWN;
@@ -1209,19 +1449,57 @@ static int op31(Ctx *c)
     case 662: return xform(c, G(stwbrx), false, true, d, a, b);
     case 918: return xform(c, G(sthbrx), false, true, d, a, b);
 
-    /* sync in user mode, and eieio: barriers. sync in supervisor mode is TCG's */
+    /* sync and eieio: barriers; a supervisor's sync is also where a flush that is due is done */
     case 598:
-        if (!c->pr) {
+        if (c->pr) {
+            emitg(c, G(sync));
+            return NEXT;
+        }
+        if (!has(c, PPC_MEM_SYNC)) {
             return UNKNOWN;
         }
         emitg(c, G(sync));
-        return NEXT;
+        return call_as(c, G(call_sync), aok_ppc_sync_sv, NEXT);
     case 854:
         emitg(c, G(sync));
         return NEXT;
     /* dcbt, dcbtst: nothing (Rc is illegal) */
     case 278: case 246:
         return insn & 1 ? UNKNOWN : NEXT;
+    /* AltiVec's hints, dst and dstst (illegal with rA 0) and dss; dcba: nothing either */
+    case 342: case 374:
+        return (insn & 0x01800001) || a == 0 || !has(c, PPC_ALTIVEC)
+               ? UNKNOWN : NEXT;
+    case 822:
+        return (insn & 0x019ff801) || !has(c, PPC_ALTIVEC) ? UNKNOWN : NEXT;
+    case 758:
+        return (insn & 0x03e00001) || !has(c, PPC_CACHE_DCBA)
+               ? UNKNOWN : NEXT;
+    /* dcbf, dcbst, icbi: a load, for the faults it may raise */
+    case 86:
+        return (insn & 0x03c00001) || !has(c, PPC_CACHE)
+               ? UNKNOWN : call(c, aok_ppc_cache);
+    case 54:
+        return (insn & 0x03e00001) || !has(c, PPC_CACHE)
+               ? UNKNOWN : call(c, aok_ppc_cache);
+    case 982:
+        return (insn & 0x03e00001) || !has(c, PPC_CACHE_ICBI)
+               ? UNKNOWN : call(c, aok_ppc_cache);
+    /* lswi (illegal where it would load rA: TCG's to say so), stswi */
+    case 597:
+        if ((insn & 1) || !has(c, PPC_STRING) ||
+            lsw_reg_in_range(d, DIV_ROUND_UP(b ? b : 32, 4), a)) {
+            return UNKNOWN;
+        }
+        return call(c, aok_ppc_lsw);
+    case 725:
+        return (insn & 1) || !has(c, PPC_STRING) ? UNKNOWN
+                                                  : call(c, aok_ppc_lsw);
+    /* AltiVec's aligned loads and stores (the l forms hint at the cache) */
+    case 103: case 359:
+        return vldst(c, G(lvx), d, a, b);
+    case 231: case 487:
+        return vldst(c, G(stvx), d, a, b);
     case 371:   /* mftb, of TBL or TBU (any other number reads that SPR) */
         if ((insn & 1) || (spr(insn) != 268 && spr(insn) != 269)) {
             return UNKNOWN;
@@ -1328,6 +1606,50 @@ static int insn32(Ctx *c)
     return UNKNOWN;
 }
 
+/*
+ * A TB stops before an insn that is TCG's, and TCG's TB runs from there to
+ * the end of the block. Where that block ends by branching back into this
+ * TB, the two would take turns through the main loop at every pass of a
+ * loop that TCG's code alone links to itself: then the whole TB is TCG's.
+ * (A loop of AltiVec arithmetic between an lvx and a stvx, for one.)
+ */
+static uint64_t aok_ppc_loops_left;
+
+static void __attribute__((destructor)) aok_ppc_loops_stats(void)
+{
+    if (aok_stats_enabled && aok_ppc_loops_left) {
+        fprintf(stderr, "aok: ppc: %" PRIu64 " TBs left whole to TCG, which "
+                "has an insn of the loop they are in\n", aok_ppc_loops_left);
+    }
+}
+
+static bool tail_loops_back(Ctx *c, const uint8_t *code)
+{
+    for (unsigned off = c->off, n = 0;
+         c->page_off + off < TARGET_PAGE_SIZE && n < 64; off += 4, n++) {
+        uint32_t insn = ldl_be_p(code + off), at = c->pc + off, dest;
+
+        switch (insn >> 26) {
+        case 16:
+            dest = (int16_t)(insn & 0xfffc) + ((insn & 2) ? 0 : at);
+            return dest >= c->pc && dest < c->pc + c->off;
+        case 18:
+            dest = ((int32_t)((insn & 0x03fffffc) << 6) >> 6) +
+                   ((insn & 2) ? 0 : at);
+            return dest >= c->pc && dest < c->pc + c->off;
+        case 17:
+            return false;
+        case 19:
+            switch ((insn >> 1) & 0x3ff) {
+            case 16: case 528: case 50:
+                return false;
+            }
+            break;
+        }
+    }
+    return false;
+}
+
 int ppc_aok_translate_code(CPUState *cs, TranslationBlock *tb,
                            int *max_insns, vaddr pc, void *host_pc)
 {
@@ -1353,6 +1675,7 @@ int ppc_aok_translate_code(CPUState *cs, TranslationBlock *tb,
     c.page_off = pc & ~TARGET_PAGE_MASK;
     c.pr = flags & (1 << HFLAGS_PR);
     c.fp = flags & (1 << HFLAGS_FP);
+    c.vr = flags & (1 << HFLAGS_VR);
     c.env = cpu_env(cs);
     c.no_goto_ptr = cflags & CF_NO_GOTO_PTR;
     aok_gen_begin(&c.g, cs, tb, *max_insns, (flags >> HFLAGS_DMMU_IDX) & 7);
@@ -1367,6 +1690,10 @@ int ppc_aok_translate_code(CPUState *cs, TranslationBlock *tb,
         r = insn32(&c);
         if (r == UNKNOWN) {
             c.g.p = start;
+            if (c.g.n_insns && tail_loops_back(&c, code)) {
+                aok_ppc_loops_left++;
+                return 0;
+            }
             break;
         }
         pair_steps(&c);
